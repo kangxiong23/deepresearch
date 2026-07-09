@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional, Union
 
 
 # ──────────────────────────────────────────────
@@ -52,18 +52,11 @@ class Message:
 
 
 @dataclass
-class Conversation:
-    """对话摘要，用于列表展示。"""
-    id: str
-    title: str = "新对话"
-    last_message_preview: str = ""
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
-
-
-@dataclass
 class ConversationDetail:
-    """完整对话，包含所有消息，用于加载聊天记录。"""
+    """完整对话快照，包含节点元数据和消息列表，用于切换对话时加载聊天记录。
+
+    由 ConversationService.switch_conversation() 从 ConversationNode + Message 组装返回。
+    """
     id: str
     title: str = "新对话"
     messages: list[Message] = field(default_factory=list)
@@ -150,3 +143,106 @@ class SearchResults:
     query: str
     results: list[SearchResult] = field(default_factory=list)
     total: int = 0
+
+
+# ──────────────────────────────────────────────
+# 树形结构（Phase 0 — 新建）
+# ──────────────────────────────────────────────
+
+class NodeType(str, Enum):
+    """树节点类型枚举。"""
+    FOLDER       = "folder"
+    CONVERSATION = "conversation"
+    MESSAGE      = "message"
+
+
+@dataclass
+class TreeNode:
+    """树节点基类，包含文件夹、对话和消息节点的共有字段。
+
+    具体节点类型由子类区分：
+    - FolderNode → NodeType.FOLDER（目录，可包含子节点）
+    - ConversationNode → NodeType.CONVERSATION（对话容器）
+    - MessageNode → NodeType.MESSAGE（消息叶子）
+
+    子节点通过 parent_id 字段引用父节点 id 建立层级关系，
+    同级节点按 sort_order 升序排列。
+    """
+    id: str
+    parent_id: Optional[str] = None
+    sort_order: int = 0
+    enabled: Union[bool, Literal["some"]] = True
+    title: str = ""
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class FolderNode(TreeNode):
+    """目录节点 — 可包含子节点（子文件夹或对话）。
+
+    与 ConversationNode 的区别：
+    - 可嵌套（通过 parent_id 指向另一个 FolderNode）
+    - 不直接关联 messages 表
+    - 可关联上下文块和附件
+    """
+    context_block_ids: list[str] = field(default_factory=list)
+    attachment_paths: list[str] = field(default_factory=list)
+    node_type: NodeType = field(default=NodeType.FOLDER, init=False)
+
+
+@dataclass
+class ConversationNode(TreeNode):
+    """对话容器节点 — 通过 id 与 messages 表的 conversation_id 关联。
+
+    id 沿用原 Conversation.id（UUID 格式），确保 messages 表外键不受影响。
+    作为目录节点，可包含 MessageNode 子节点（每条 message 表记录对应一个 MessageNode）。
+    """
+    summary: str = ""
+    message_count: int = 0
+    node_type: NodeType = field(default=NodeType.CONVERSATION, init=False)
+
+
+@dataclass
+class MessageNode(TreeNode):
+    """消息叶子节点 — 与 messages 表中的一条记录一一对应。
+
+    id 与 message_id 相同，均为 messages 表的主键。
+    parent_id 指向所属 ConversationNode 或 FolderNode。
+    消息节点始终为叶子节点，不可包含子节点。
+    """
+    message_id: str = ""          # FK to messages.id
+    role: str = ""                # "user" | "assistant" | "thinking" | "system"
+    preview: str = ""             # 前 60 字预览，供树节点展示
+    node_type: NodeType = field(default=NodeType.MESSAGE, init=False)
+
+
+# 联合类型别名 — 用于 tree.json 序列化/反序列化
+AnyTreeNode = Union[FolderNode, ConversationNode, MessageNode]
+
+
+@dataclass
+class TreeRoot:
+    """树根容器，对应 tree.json 文件的顶层结构。
+
+    采用扁平邻接表（flat adjacency list）组织：nodes 列表包含树中全部节点
+    （不限深度），节点之间通过 parent_id 引用建立层级关系。同级节点按
+    sort_order 升序排列。
+    """
+    version: str = "1.0"
+    nodes: list[AnyTreeNode] = field(default_factory=list)
+
+
+@dataclass
+class TrashEntry:
+    """回收站条目 — 记录被软删除的节点，支持恢复或彻底删除。
+
+    json_path 使用 "root/子目录/对话" 格式记录原节点在树中的路径，
+    恢复时可根据该路径重新定位插入位置。
+    node_data 保存被删除节点的完整原始数据（dict 形式），
+    彻底删除时一并清除。
+    """
+    id: str
+    json_path: str
+    node_data: dict
+    deleted_at: datetime = field(default_factory=datetime.utcnow)

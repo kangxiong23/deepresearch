@@ -15,7 +15,10 @@ from app.controllers.view_models import (
     ConversationDetailVM,
     MessageVM,
     StreamChunkVM,
+    TreeNodeVM,
+    TrashEntryVM,
 )
+from app.storage.models import FolderNode, ConversationNode, MessageNode
 
 
 class AppController:
@@ -56,15 +59,17 @@ class AppController:
     # 对话生命周期
     # ──────────────────────────────────────────
 
-    def on_new_conversation(self) -> str:
+    def on_new_conversation(self, parent_id: str | None = None) -> str:
         """
         UI 点击"新建对话"时调用。
+
+        Args:
+            parent_id: 可选父节点 ID，None 表示放在默认"未分类"目录下
 
         Returns:
             新对话的 session_id（str），UI 用于标记当前激活会话。
         """
-        conversation = self._conversation_svc.create_conversation()
-        return conversation.id
+        return self._conversation_svc.create_conversation(parent_id=parent_id)
 
     def on_switch_conversation(self, session_id: str) -> ConversationDetailVM:
         """
@@ -89,6 +94,37 @@ class AppController:
         """
         cmd = CommandBuilder.build_delete_command(session_id)
         self._conversation_svc.delete_conversation(**cmd)
+
+    def on_load_messages_for_node(self, node_id: str) -> list[MessageVM]:
+        """
+        以树结构为依据，加载任意节点对应的消息列表。
+
+        不依赖 conversation_id，直接使用节点中存储的 message_id 引用。
+
+        Args:
+            node_id: 目标节点 ID（MessageNode / ConversationNode / FolderNode）
+
+        Returns:
+            list[MessageVM] — 该节点对应的消息
+        """
+        print(f"[CTRL ] on_load_messages_for_node: node={node_id}")
+        messages = self._conversation_svc.get_messages_for_node(node_id)
+        result = [self._map_to_message_vm(m) for m in messages]
+        print(f"[CTRL ] on_load_messages_for_node: 返回 {len(result)} 个 MessageVM")
+        return result
+
+    def on_get_multi_conversation_messages(self) -> list[MessageVM]:
+        """
+        获取所有有效启用对话的消息，按时间排序合并。
+
+        Returns:
+            list[MessageVM] — 所有启用对话的消息
+        """
+        print("[CTRL ] on_get_multi_conversation_messages: 查询所有启用消息")
+        messages = self._conversation_svc.get_effective_enabled_messages()
+        result = [self._map_to_message_vm(m) for m in messages]
+        print(f"[CTRL ] on_get_multi_conversation_messages: 返回 {len(result)} 个 MessageVM")
+        return result
 
     def on_load_history(self) -> list[ConversationVM]:
         """
@@ -158,18 +194,12 @@ class AppController:
     @staticmethod
     def _map_to_conversation_vm(domain_obj) -> ConversationVM:
         """
-        领域对象 Conversation -> ConversationVM。
-
-        预期 domain_obj 字段:
-            id: str
-            title: str
-            last_message_preview: str
-            updated_at: datetime
+        ConversationNode → ConversationVM（Phase 5 — 移除旧 Conversation 兼容）。
         """
         return ConversationVM(
             id=domain_obj.id,
             title=domain_obj.title or "新对话",
-            preview=domain_obj.last_message_preview or "",
+            preview=getattr(domain_obj, "summary", ""),
             updated_at=_format_datetime(domain_obj.updated_at),
         )
 
@@ -289,27 +319,7 @@ class AppController:
 
     def on_delete_template(self, template_id: str) -> None:
         """删除模板。"""
-        from app.storage.context_store import ContextStore
-        # 直接操作 store 删除模板
-        templates = self._context_svc._store.list_templates()
-        remaining = [t for t in templates if t.id != template_id]
-        # 重新写入所有模板（暂无 delete_template 方法，用覆盖方式）
-        import json
-        from pathlib import Path
-        import config as app_config
-        store_path = Path(app_config.CONTEXT_STORE_PATH) / 'templates.json'
-        def _tmpl_to_dict(t):
-            return {
-                'id': t.id, 'name': t.name, 'description': t.description,
-                'blocks': [{
-                    'id': b.id, 'label': b.label, 'content': b.content,
-                    'source': b.source.value if hasattr(b.source,'value') else str(b.source),
-                    'enabled': b.enabled, 'order': b.order,
-                } for b in t.blocks]
-            }
-        store_path.parent.mkdir(parents=True, exist_ok=True)
-        with store_path.open('w', encoding='utf-8') as f:
-            json.dump([_tmpl_to_dict(t) for t in remaining], f, ensure_ascii=False, indent=2)
+        self._context_svc.delete_template(template_id)
 
     def on_save_current_as_template(self, name: str, description: str = "") -> dict:
         """把当前所有上下文块保存为新模板。"""
@@ -430,6 +440,206 @@ class AppController:
         if self._knowledge_svc is None:
             return {"entity_count": 0, "relation_count": 0}
         return self._knowledge_svc.get_stats()
+
+    # ──────────────────────────────────────────
+    # 树形结构管理（Phase 4）
+    # ──────────────────────────────────────────
+
+    def get_tree(self) -> list[TreeNodeVM]:
+        """
+        返回完整树结构的 DFS 排序平面列表，depth 和 has_children 预计算。
+
+        Returns:
+            list[TreeNodeVM] — 按 DFS 遍历顺序排列的节点视图模型
+        """
+        tree = self._conversation_svc.get_tree()
+        nodes = tree.nodes
+        if not nodes:
+            return []
+
+        # 构建 children 映射
+        child_map: dict[str | None, list] = {}
+        for n in nodes:
+            pid = n.parent_id
+            if pid not in child_map:
+                child_map[pid] = []
+            child_map[pid].append(n)
+
+        # 按 sort_order 排序每组
+        for pid in child_map:
+            child_map[pid].sort(key=lambda n: n.sort_order)
+
+        result: list[TreeNodeVM] = []
+
+        def dfs(node, depth: int) -> None:
+            children = child_map.get(node.id, [])
+            has_children = len(children) > 0
+
+            if isinstance(node, MessageNode):
+                vm = TreeNodeVM(
+                    id=node.id,
+                    title=node.preview or node.title or node.role,
+                    node_type="message",
+                    parent_id=node.parent_id,
+                    enabled=node.enabled,
+                    sort_order=node.sort_order,
+                    preview=node.preview,
+                    updated_at=_format_datetime(node.updated_at),
+                    has_children=False,  # MessageNode 永远是叶子
+                    depth=depth,
+                    role=node.role,
+                )
+            elif isinstance(node, FolderNode):
+                vm = TreeNodeVM(
+                    id=node.id,
+                    title=node.title or "新文件夹",
+                    node_type="folder",
+                    parent_id=node.parent_id,
+                    enabled=node.enabled,
+                    sort_order=node.sort_order,
+                    preview="",
+                    updated_at=_format_datetime(node.updated_at),
+                    has_children=has_children,
+                    depth=depth,
+                    context_block_count=len(getattr(node, "context_block_ids", [])),
+                    attachment_count=len(getattr(node, "attachment_paths", [])),
+                )
+            else:  # ConversationNode
+                vm = TreeNodeVM(
+                    id=node.id,
+                    title=node.title or "新对话",
+                    node_type="conversation",
+                    parent_id=node.parent_id,
+                    enabled=node.enabled,
+                    sort_order=node.sort_order,
+                    preview=getattr(node, "summary", ""),
+                    updated_at=_format_datetime(node.updated_at),
+                    has_children=has_children,
+                    depth=depth,
+                    message_count=getattr(node, "message_count", 0),
+                )
+            result.append(vm)
+
+            for child in children:
+                dfs(child, depth + 1)
+
+        # 从根节点开始 DFS
+        roots = child_map.get(None, [])
+        for root_node in roots:
+            dfs(root_node, 0)
+
+        return result
+
+    def on_create_folder(
+        self,
+        parent_id: str | None,
+        title: str,
+    ) -> TreeNodeVM:
+        """
+        UI 调用：创建新目录。
+
+        Args:
+            parent_id: 父节点 ID，None 表示根目录
+            title:     目录名称
+
+        Returns:
+            TreeNodeVM — 新创建的目录节点视图模型
+        """
+        folder = self._conversation_svc.create_folder(title, parent_id)
+        return TreeNodeVM(
+            id=folder.id,
+            title=folder.title,
+            node_type="folder",
+            parent_id=folder.parent_id,
+            enabled=folder.enabled,
+            sort_order=folder.sort_order,
+            updated_at=_format_datetime(folder.updated_at),
+            has_children=False,
+            depth=0,
+        )
+
+    def on_rename_node(self, node_id: str, new_title: str) -> None:
+        """UI 调用：重命名节点。"""
+        self._conversation_svc.rename_node(node_id, new_title)
+
+    def on_toggle_enabled(self, node_id: str) -> None:
+        """UI 调用：切换节点启用/禁用状态。"""
+        self._conversation_svc.toggle_enabled(node_id)
+
+    def on_move_node(
+        self,
+        node_id: str,
+        target_parent_id: str,
+        position: int | None = None,
+    ) -> None:
+        """UI 调用：移动节点到目标父级下。"""
+        self._conversation_svc.move_conversation(node_id, target_parent_id, position)
+
+    def on_soft_delete_node(self, node_id: str, mode: str = "recursive") -> None:
+        """UI 调用：软删除节点（移入回收站）。"""
+        self._conversation_svc.delete_conversation(node_id, mode)
+
+    def on_update_context_blocks(
+        self,
+        folder_id: str,
+        block_ids: list[str],
+    ) -> None:
+        """UI 调用：更新目录关联的 ContextBlock 列表。"""
+        self._conversation_svc.update_folder_context(folder_id, block_ids)
+
+    def on_get_folder_context(self, folder_id: str) -> dict:
+        """
+        UI 调用：获取目录的上下文块信息（供管理对话框使用）。
+
+        Returns:
+            {"title": str, "context_block_ids": list[str]}
+        """
+        node = self._conversation_svc.get_node(folder_id)
+        if node is None:
+            return {"title": "目录", "context_block_ids": []}
+        return {
+            "title": getattr(node, "title", "目录"),
+            "context_block_ids": list(getattr(node, "context_block_ids", [])),
+        }
+
+    def on_attach_file(self, folder_id: str, file_path: str) -> None:
+        """UI 调用：挂载附件到目录。"""
+        self._conversation_svc.attach_file(folder_id, file_path)
+
+    def on_detach_file(self, folder_id: str, file_path: str) -> None:
+        """UI 调用：从目录移除附件。"""
+        self._conversation_svc.detach_file(folder_id, file_path)
+
+    def on_list_trash(self) -> list[TrashEntryVM]:
+        """UI 调用：列出回收站所有条目。"""
+        entries = self._conversation_svc.get_trash_entries()
+        return [
+            TrashEntryVM(
+                id=entry.id,
+                node_id=entry.node_data.get("id", ""),
+                title=entry.node_data.get("title", "未命名"),
+                node_type=entry.node_data.get("node_type", "conversation"),
+                json_path=entry.json_path,
+                deleted_at=_format_datetime(entry.deleted_at),
+            )
+            for entry in entries
+        ]
+
+    def on_restore_from_trash(
+        self,
+        trash_entry_id: str,
+        new_parent_id: str | None = None,
+    ) -> None:
+        """UI 调用：从回收站恢复节点。"""
+        self._conversation_svc.restore_conversation(trash_entry_id, new_parent_id)
+
+    def on_permanently_delete(self, trash_entry_id: str) -> None:
+        """UI 调用：从回收站彻底删除节点及关联消息。"""
+        self._conversation_svc.permanently_delete_from_trash(trash_entry_id)
+
+    def on_clear_trash(self) -> int:
+        """UI 调用：清空回收站。返回清除的条目数。"""
+        return self._conversation_svc.clear_trash()
 
 # ──────────────────────────────────────────────
 # 模块级辅助（不含业务知识，仅格式化）

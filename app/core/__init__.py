@@ -10,8 +10,9 @@ from app.core.protocols import (
     LLMClientProtocol,
     SearchAdapterProtocol,
     FileParserProtocol,
-    ConversationRepoProtocol,
+    MessageRepoProtocol,
     ContextStoreProtocol,
+    TreeStoreProtocol,
 )
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "LLMClientProtocol",
     "SearchAdapterProtocol",
     "FileParserProtocol",
-    "ConversationRepoProtocol",
+    "MessageRepoProtocol",
     "ContextStoreProtocol",
+    "TreeStoreProtocol",
 ]

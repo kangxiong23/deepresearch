@@ -1,0 +1,778 @@
+# Layer: Storage
+# File: app/storage/tree_store.py
+# Responsibility: 树形结构的 JSON 文件持久化与操作。
+#                 管理 tree.json（节点层级）和 recycle_bin.json（软删除回收站）。
+#                 线程安全：写入操作由 threading.Lock 保护。
+#                 只负责读写 JSON 文件与对象序列化，不含业务逻辑。
+# Input:  AnyTreeNode 及其子类（FolderNode, ConversationNode）
+# Output: TreeRoot / AnyTreeNode / TrashEntry 领域对象
+# 禁止: 业务判断、编排逻辑、导入 UI 库
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import uuid
+from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
+from typing import Literal
+
+import config as app_config
+from app.storage.models import (
+    AnyTreeNode,
+    ConversationNode,
+    FolderNode,
+    MessageNode,
+    NodeType,
+    TrashEntry,
+    TreeNode,
+    TreeRoot,
+)
+
+
+class TreeStore:
+    """
+    树形结构 JSON 文件存储。
+
+    文件结构：
+        {TREE_STORE_PATH}/
+            tree.json          ← 完整树结构（TreeRoot 序列化）
+            recycle_bin.json   ← 软删除节点列表（TrashEntry 序列化）
+
+    默认行为：
+        - 首次启动自动创建默认树（含一个"未分类"根 FolderNode）
+        - 所有写入操作通过 threading.Lock 串行化
+        - 读取返回副本，外部修改不影响内部状态
+    """
+
+    def __init__(self, base_path: Path | None = None) -> None:
+        if base_path is None:
+            base_path = Path(app_config.TREE_STORE_PATH)
+        self._base = base_path
+        self._base.mkdir(parents=True, exist_ok=True)
+        self._tree_path = self._base / "tree.json"
+        self._trash_path = self._base / "recycle_bin.json"
+        self._lock = threading.RLock()
+
+        # Phase 5: O(1) 节点查找缓存
+        self._node_cache: dict[str, AnyTreeNode] = {}
+
+        # 加载或创建默认树
+        self._root = self._load_tree()
+        # __init__ 结束后重建缓存（_load_tree 内部调用 _create_default_tree
+        # 时会触发 _save_tree，此时 _root 尚未赋值，缓存由此处统一重建）
+        self._rebuild_cache()
+
+    # ──────────────────────────────────────────
+    # 内部 I/O
+    # ──────────────────────────────────────────
+
+    def _load_tree(self) -> TreeRoot:
+        """从 tree.json 加载树，若无文件则创建默认树（含"未分类"根目录）。"""
+        if not self._tree_path.exists():
+            return self._create_default_tree()
+        try:
+            with self._tree_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            version = data.get("version", "1.0")
+            nodes = [_dict_to_node(n) for n in data.get("nodes", [])]
+            return TreeRoot(version=version, nodes=nodes)
+        except (json.JSONDecodeError, OSError, KeyError):
+            return self._create_default_tree()
+
+    def _save_tree(self, root: TreeRoot) -> None:
+        """写入 tree.json 并重建缓存，由线程锁保护（原子写入）。"""
+        data = {
+            "version": root.version,
+            "nodes": [_node_to_dict(n) for n in root.nodes],
+        }
+        with self._lock:
+            self._tree_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._tree_path.with_suffix(".tmp")
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._tree_path)
+        # 写入后重建缓存（仅在 _root 已初始化后；__init__ 期间暂不重建）
+        if hasattr(self, "_root") and self._root is not None:
+            self._rebuild_cache()
+
+    def _load_trash(self) -> list[TrashEntry]:
+        """从 recycle_bin.json 加载回收站列表。"""
+        if not self._trash_path.exists():
+            return []
+        try:
+            with self._trash_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            entries: list[TrashEntry] = []
+            for d in data:
+                entries.append(TrashEntry(
+                    id=d.get("id", ""),
+                    json_path=d.get("json_path", ""),
+                    node_data=d.get("node_data", {}),
+                    deleted_at=(
+                        datetime.fromisoformat(d["deleted_at"])
+                        if d.get("deleted_at") else datetime.utcnow()
+                    ),
+                ))
+            return entries
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def _save_trash(self, entries: list[TrashEntry]) -> None:
+        """写入 recycle_bin.json，由线程锁保护（原子写入）。"""
+        data: list[dict] = []
+        for e in entries:
+            data.append({
+                "id": e.id,
+                "json_path": e.json_path,
+                "node_data": e.node_data,
+                "deleted_at": e.deleted_at.isoformat(),
+            })
+        with self._lock:
+            self._trash_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._trash_path.with_suffix(".tmp")
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._trash_path)
+
+    def _create_default_tree(self) -> TreeRoot:
+        """创建默认树结构：仅包含一个"未分类"根目录。"""
+        now = datetime.utcnow()
+        root_folder = FolderNode(
+            id="root",
+            parent_id=None,
+            sort_order=0,
+            enabled=True,
+            title="未分类",
+            created_at=now,
+            updated_at=now,
+        )
+        tree = TreeRoot(version="1.0", nodes=[root_folder])
+        self._save_tree(tree)
+        # 初始化空回收站
+        self._save_trash([])
+        return tree
+
+    # ──────────────────────────────────────────
+    # 内部查找辅助
+    # ──────────────────────────────────────────
+
+    def _rebuild_cache(self) -> None:
+        """从 _root.nodes 重建 _node_cache 字典，实现 O(1) 节点查找。"""
+        self._node_cache = {n.id: n for n in self._root.nodes}
+
+    def _find_node(self, node_id: str) -> AnyTreeNode | None:
+        """在树中按 ID 查找节点，O(1)（使用 _node_cache）。"""
+        return self._node_cache.get(node_id)
+
+    def _find_children(self, parent_id: str | None) -> list[AnyTreeNode]:
+        """返回 parent_id 的直接子节点，按 sort_order 排序。"""
+        return sorted(
+            [n for n in self._root.nodes if n.parent_id == parent_id],
+            key=lambda n: n.sort_order,
+        )
+
+    def _renumber_children(self, parent_id: str | None) -> None:
+        """将 parent_id 的子节点按 sort_order 重新编号为 0..N-1。"""
+        children = self._find_children(parent_id)
+        for i, child in enumerate(children):
+            child.sort_order = i
+
+    def _collect_subtree(self, node_id: str) -> list[AnyTreeNode]:
+        """收集节点及其所有后代（广度优先），用于递归删除。"""
+        result: list[AnyTreeNode] = []
+        node = self._find_node(node_id)
+        if node is None:
+            return result
+        result.append(node)
+        queue = [node_id]
+        while queue:
+            current_id = queue.pop(0)
+            for child in self._find_children(current_id):
+                result.append(child)
+                queue.append(child.id)
+        return result
+
+    def _build_path_for_node(self, node: AnyTreeNode) -> str:
+        """根据节点当前的 parent_id 在树中构建路径字符串。"""
+        if node.parent_id is None:
+            return "root"
+        parts: list[str] = []
+        current_id: str | None = node.parent_id
+        while current_id is not None:
+            parent = self._find_node(current_id)
+            if parent is None:
+                break
+            parts.insert(0, parent.title)
+            current_id = parent.parent_id
+        parts.append(node.title)
+        return "root/" + "/".join(parts)
+
+    # ──────────────────────────────────────────
+    # 公共查询 API
+    # ──────────────────────────────────────────
+
+    def get_tree(self) -> TreeRoot:
+        """
+        返回当前树根的深拷贝（只读安全，外部修改不影响内部状态）。
+
+        Returns:
+            TreeRoot — 包含 version 和 nodes 列表的完整拷贝
+        """
+        data = {
+            "version": self._root.version,
+            "nodes": [_node_to_dict(n) for n in self._root.nodes],
+        }
+        return TreeRoot(
+            version=data["version"],
+            nodes=[_dict_to_node(n) for n in data["nodes"]],
+        )
+
+    def get_node(self, node_id: str) -> AnyTreeNode | None:
+        """
+        按 ID 查找节点（返回副本）。
+
+        Args:
+            node_id: 节点唯一 ID
+
+        Returns:
+            AnyTreeNode | None — 不存在时返回 None
+        """
+        node = self._find_node(node_id)
+        if node is None:
+            return None
+        return _dict_to_node(_node_to_dict(node))
+
+    def get_children(self, parent_id: str | None) -> list[AnyTreeNode]:
+        """
+        返回某节点的直接子节点，按 sort_order 升序。
+
+        Args:
+            parent_id: 父节点 ID，None 表示查找根级节点
+
+        Returns:
+            list[AnyTreeNode] — 副本列表
+        """
+        children = self._find_children(parent_id)
+        return [_dict_to_node(_node_to_dict(c)) for c in children]
+
+    def get_path(self, node_id: str) -> str:
+        """
+        返回从根到该节点的路径字符串。
+
+        Args:
+            node_id: 节点唯一 ID
+
+        Returns:
+            str — 格式如 "root/子目录/对话"，根目录自身返回 "root"
+        """
+        node = self._find_node(node_id)
+        if node is None:
+            return ""
+        return self._build_path_for_node(node)
+
+    # ──────────────────────────────────────────
+    # MessageNode 查询 & enabled 级联（Phase 5）
+    # ──────────────────────────────────────────
+
+    def get_all_message_nodes(self) -> list[MessageNode]:
+        """返回树中所有 MessageNode 实例。"""
+        return [n for n in self._root.nodes if isinstance(n, MessageNode)]
+
+    def get_descendants(self, node_id: str) -> list[AnyTreeNode]:
+        """
+        收集节点的所有后代（BFS，不包含节点自身）。
+
+        Args:
+            node_id: 起始节点 ID
+
+        Returns:
+            后代节点列表（BFS 顺序）
+        """
+        result: list[AnyTreeNode] = []
+        queue = [node_id]
+        while queue:
+            current = queue.pop(0)
+            for child in self._find_children(current):
+                result.append(child)
+                queue.append(child.id)
+        return result
+
+    def set_node_enabled_cascade_down(
+        self, node_id: str, enabled: bool
+    ) -> list[str]:
+        """
+        设置节点 enabled 状态并递归级联到所有后代（前序遍历）。
+
+        Args:
+            node_id: 目标节点 ID
+            enabled: True 或 False（不支持 "some"）
+
+        Returns:
+            受影响的节点 ID 列表
+        """
+        node = self._find_node(node_id)
+        if node is None:
+            raise ValueError(f"Node not found: {node_id}")
+
+        affected_ids: list[str] = []
+        node.enabled = enabled
+        node.updated_at = datetime.utcnow()
+        affected_ids.append(node_id)
+
+        # BFS 级联到所有后代
+        queue = [node_id]
+        while queue:
+            current = queue.pop(0)
+            for child in self._find_children(current):
+                child.enabled = enabled
+                child.updated_at = datetime.utcnow()
+                affected_ids.append(child.id)
+                queue.append(child.id)
+
+        self._save_tree(self._root)
+        return affected_ids
+
+    def recompute_ancestors_enabled(self, node_id: str) -> list[str]:
+        """
+        自底向上重新计算祖先节点的 enabled 状态。
+
+        规则：
+            - 所有子节点均为 True  → ancestor = True
+            - 所有子节点均为 False → ancestor = False
+            - 混合状态              → ancestor = "some"
+
+        Args:
+            node_id: 变更来源节点 ID（从此节点的父级开始向上）
+
+        Returns:
+            状态发生变化的祖先节点 ID 列表
+        """
+        node = self._find_node(node_id)
+        if node is None:
+            return []
+
+        changed: list[str] = []
+        current_id = node.parent_id
+
+        while current_id is not None:
+            ancestor = self._find_node(current_id)
+            if ancestor is None:
+                break
+            children = self._find_children(current_id)
+            if not children:
+                current_id = ancestor.parent_id
+                continue
+
+            all_true = all(c.enabled is True for c in children)
+            all_false = all(c.enabled is False for c in children)
+
+            if all_true:
+                new_state = True
+            elif all_false:
+                new_state = False
+            else:
+                new_state = "some"
+
+            if ancestor.enabled != new_state:
+                ancestor.enabled = new_state
+                ancestor.updated_at = datetime.utcnow()
+                changed.append(current_id)
+
+            current_id = ancestor.parent_id
+
+        if changed:
+            self._save_tree(self._root)
+        return changed
+
+    # ──────────────────────────────────────────
+    # 节点 CRUD
+    # ──────────────────────────────────────────
+
+    def create_node(self, node: AnyTreeNode) -> None:
+        """
+        插入新节点到树中。
+
+        自动分配 sort_order（同级末尾），填充 created_at 和 updated_at
+        为当前时间。最后持久化到 tree.json。
+
+        Args:
+            node: 要插入的节点（FolderNode 或 ConversationNode）
+        """
+        now = datetime.utcnow()
+        node.created_at = now
+        node.updated_at = now
+
+        siblings = self._find_children(node.parent_id)
+        node.sort_order = len(siblings)
+
+        self._root.nodes.append(node)
+        self._save_tree(self._root)
+
+    def update_node(self, node_id: str, **updates) -> None:
+        """
+        更新节点字段，自动刷新 updated_at。
+
+        可更新字段：
+            FolderNode: title, enabled, context_block_ids, attachment_paths
+            ConversationNode: title, summary, enabled, message_count
+            MessageNode: title, enabled, preview, role
+
+        Args:
+            node_id: 节点唯一 ID
+            **updates: 要更新的字段键值对
+
+        Raises:
+            ValueError: 节点不存在时抛出
+        """
+        node = self._find_node(node_id)
+        if node is None:
+            raise ValueError(f"Node not found: {node_id}")
+
+        allowed = {
+            "title", "enabled", "summary", "message_count",
+            "context_block_ids", "attachment_paths", "preview", "role",
+        }
+        for key, value in updates.items():
+            if key in allowed and hasattr(node, key):
+                setattr(node, key, value)
+
+        node.updated_at = datetime.utcnow()
+        self._save_tree(self._root)
+
+    def move_node(
+        self,
+        node_id: str,
+        new_parent_id: str | None = None,
+        position: int | None = None,
+    ) -> None:
+        """
+        移动节点到新父级下，可选指定位置。
+
+        移动后自动重新编号新旧父级的 sort_order（0..N-1）。
+
+        Args:
+            node_id:       要移动的节点 ID
+            new_parent_id: 新父节点 ID，None 表示移到根级
+            position:      插入位置索引（0-based），None 表示末尾
+
+        Raises:
+            ValueError: 节点不存在、尝试移动根目录、或移动会产生循环时抛出
+        """
+        node = self._find_node(node_id)
+        if node is None:
+            raise ValueError(f"Node not found: {node_id}")
+
+        # 循环检测：新父级不能是 node_id 自身或其子孙
+        if new_parent_id is not None:
+            if new_parent_id == node_id:
+                raise ValueError(f"Cannot move a node into itself: {node_id}")
+            # 从新父级向上遍历，若遇到 node_id 则说明在尝试将节点移入其子孙
+            ancestor_id: str | None = new_parent_id
+            while ancestor_id is not None:
+                ancestor = self._find_node(ancestor_id)
+                if ancestor is None:
+                    break
+                if ancestor.id == node_id:
+                    raise ValueError(
+                        f"Cannot move node into its own descendant: "
+                        f"{node_id} -> {new_parent_id}"
+                    )
+                ancestor_id = ancestor.parent_id
+
+        old_parent_id = node.parent_id
+        node.parent_id = new_parent_id
+        node.updated_at = datetime.utcnow()
+
+        # 重新排列新父级下的子节点顺序
+        new_siblings = self._find_children(new_parent_id)
+        if position is not None:
+            new_siblings.remove(node)
+            new_siblings.insert(min(position, len(new_siblings)), node)
+        for i, n in enumerate(new_siblings):
+            n.sort_order = i
+
+        # 重新排列旧父级下的子节点顺序
+        if old_parent_id != new_parent_id:
+            old_siblings = self._find_children(old_parent_id)
+            for i, n in enumerate(old_siblings):
+                n.sort_order = i
+
+        self._save_tree(self._root)
+
+    # ──────────────────────────────────────────
+    # 删除与软删除
+    # ──────────────────────────────────────────
+
+    def delete_node(
+        self,
+        node_id: str,
+        mode: Literal["recursive", "raise"] = "recursive",
+    ) -> tuple[list[AnyTreeNode], list[TrashEntry]]:
+        """
+        从树中删除节点（不自动保存到回收站）。
+
+        Args:
+            node_id: 要删除的节点 ID
+            mode:
+                "recursive" — 删除整个子树，所有节点生成 TrashEntry
+                "raise"     — 仅删除该节点，其子节点提升到父级
+
+        Returns:
+            (被删除或被提升的节点列表, 进入回收站的条目列表)
+            调用者可根据需要将 TrashEntry 存入 recycle_bin.json。
+
+        Raises:
+            ValueError: 节点不存在或尝试删除根目录时抛出
+        """
+        node = self._find_node(node_id)
+        if node is None:
+            raise ValueError(f"Node not found: {node_id}")
+        if node.parent_id is None:
+            raise ValueError("Cannot delete the root folder")
+
+        old_parent_id = node.parent_id
+        removed_or_promoted: list[AnyTreeNode] = []
+        trash_entries: list[TrashEntry] = []
+        now = datetime.utcnow()
+
+        if mode == "recursive":
+            # 收集并移除整个子树
+            removed_or_promoted = self._collect_subtree(node_id)
+            removed_ids = {n.id for n in removed_or_promoted}
+            self._root.nodes = [
+                n for n in self._root.nodes if n.id not in removed_ids
+            ]
+
+            # 子树中所有节点进入回收站
+            for n in removed_or_promoted:
+                path = self._build_path_for_node(n)
+                trash_entries.append(TrashEntry(
+                    id=str(uuid.uuid4()),
+                    json_path=path,
+                    node_data=_node_to_dict(n),
+                    deleted_at=now,
+                ))
+
+        elif mode == "raise":
+            # 查找子节点
+            children = self._find_children(node_id)
+
+            # 子节点提升到被删节点的父级
+            existing_siblings = self._find_children(old_parent_id)
+            start_order = len(existing_siblings)
+            for i, child in enumerate(children):
+                child.parent_id = old_parent_id
+                child.sort_order = start_order + i
+
+            # 移除被删节点
+            self._root.nodes = [n for n in self._root.nodes if n.id != node_id]
+
+            removed_or_promoted = [node] + children
+
+            # 仅被删除节点进入回收站
+            path = self._build_path_for_node(node)
+            trash_entries.append(TrashEntry(
+                id=str(uuid.uuid4()),
+                json_path=path,
+                node_data=_node_to_dict(node),
+                deleted_at=now,
+            ))
+
+        # 重新编号
+        self._renumber_children(old_parent_id)
+
+        self._save_tree(self._root)
+        return (removed_or_promoted, trash_entries)
+
+    def soft_delete_node(
+        self,
+        node_id: str,
+        mode: Literal["recursive", "raise"] = "recursive",
+    ) -> None:
+        """
+        软删除：从树中移除节点并存入回收站。
+
+        等价于 delete_node() + 将 TrashEntry 列表持久化到 recycle_bin.json。
+
+        Args:
+            node_id: 要删除的节点 ID
+            mode:    删除模式（同 delete_node）
+
+        Raises:
+            ValueError: 节点不存在或尝试删除根目录时抛出
+        """
+        with self._lock:
+            _removed, trash_entries = self.delete_node(node_id, mode)
+            if trash_entries:
+                all_trash = self._load_trash()
+                all_trash.extend(trash_entries)
+                self._save_trash(all_trash)
+
+    # ──────────────────────────────────────────
+    # 回收站管理
+    # ──────────────────────────────────────────
+
+    def restore_from_trash(
+        self,
+        entry_id: str,
+        new_parent_id: str | None = None,
+        new_position: int | None = None,
+    ) -> None:
+        """
+        从回收站恢复节点到树中。
+
+        恢复后节点将从回收站移除。可指定新的父级和位置，
+        不指定则尝试使用原始 parent_id。
+
+        Args:
+            entry_id:      回收站条目 ID
+            new_parent_id: 新父节点 ID，None 则使用原始 parent_id
+            new_position:  插入位置，None 则追加到末尾
+
+        Raises:
+            ValueError: 条目不存在时抛出
+        """
+        all_trash = self._load_trash()
+        entry: TrashEntry | None = None
+        for e in all_trash:
+            if e.id == entry_id:
+                entry = e
+                break
+
+        if entry is None:
+            raise ValueError(f"Trash entry not found: {entry_id}")
+
+        # 从数据重建节点
+        node = _dict_to_node(entry.node_data)
+
+        # 决定父级
+        if new_parent_id is not None:
+            node.parent_id = new_parent_id
+
+        # 检查目标父级是否存在
+        if node.parent_id is not None:
+            parent = self._find_node(node.parent_id)
+            if parent is None:
+                # 父级不存在（可能也被删除了），降级到根目录
+                print(
+                    f"[STORAGE] 恢复节点时父级缺失 {node.parent_id}，"
+                    f"节点 {node.title} 将移至根目录"
+                )
+                node.parent_id = None
+
+        # 插入到树中
+        siblings = self._find_children(node.parent_id)
+        if new_position is not None:
+            siblings.insert(min(new_position, len(siblings)), node)
+        else:
+            siblings.append(node)
+        for i, n in enumerate(siblings):
+            n.sort_order = i
+
+        node.updated_at = datetime.utcnow()
+        self._root.nodes.append(node)
+
+        # 从回收站移除
+        all_trash = [e for e in all_trash if e.id != entry_id]
+        self._save_trash(all_trash)
+        self._save_tree(self._root)
+
+    def permanently_delete_from_trash(self, entry_id: str) -> None:
+        """
+        从回收站彻底移除条目（不恢复节点）。
+
+        Args:
+            entry_id: 回收站条目 ID
+        """
+        all_trash = self._load_trash()
+        all_trash = [e for e in all_trash if e.id != entry_id]
+        self._save_trash(all_trash)
+
+    def list_trash(self) -> list[TrashEntry]:
+        """返回回收站中所有条目（副本）。"""
+        return self._load_trash()
+
+    def clear_trash(self) -> int:
+        """
+        清空回收站（永久删除所有条目）。
+
+        Returns:
+            int — 被清除的条目数量
+        """
+        with self._lock:
+            all_trash = self._load_trash()
+            count = len(all_trash)
+            self._save_trash([])
+        print(f"[STORAGE] 清空回收站: {count} 个条目")
+        return count
+
+
+# ──────────────────────────────────────────────
+# 序列化 / 反序列化（模块私有）
+# ──────────────────────────────────────────────
+
+def _node_to_dict(node: AnyTreeNode) -> dict:
+    """将树节点序列化为 dict（datetime → ISO 格式字符串，NodeType → value）。"""
+    d: dict = {
+        "id": node.id,
+        "parent_id": node.parent_id,
+        "sort_order": node.sort_order,
+        "enabled": node.enabled,
+        "title": node.title,
+        "created_at": node.created_at.isoformat(),
+        "updated_at": node.updated_at.isoformat(),
+        "node_type": node.node_type.value if hasattr(node, "node_type") else NodeType.CONVERSATION.value,
+    }
+    if isinstance(node, FolderNode):
+        d["context_block_ids"] = node.context_block_ids
+        d["attachment_paths"] = node.attachment_paths
+    elif isinstance(node, MessageNode):
+        d["message_id"] = node.message_id
+        d["role"] = node.role
+        d["preview"] = node.preview
+    else:
+        d["summary"] = node.summary
+        d["message_count"] = node.message_count
+    return d
+
+
+def _dict_to_node(d: dict) -> AnyTreeNode:
+    """从 dict 反序列化为具体树节点（根据 node_type 字段分发）。"""
+    node_type = d.get("node_type", "conversation")
+    common = {
+        "id": d["id"],
+        "parent_id": d.get("parent_id"),
+        "sort_order": d.get("sort_order", 0),
+        "enabled": d.get("enabled", True),
+        "title": d.get("title", ""),
+        "created_at": (
+            datetime.fromisoformat(d["created_at"])
+            if d.get("created_at") else datetime.utcnow()
+        ),
+        "updated_at": (
+            datetime.fromisoformat(d["updated_at"])
+            if d.get("updated_at") else datetime.utcnow()
+        ),
+    }
+    if node_type == "folder":
+        return FolderNode(
+            **common,
+            context_block_ids=d.get("context_block_ids", []),
+            attachment_paths=d.get("attachment_paths", []),
+        )
+    elif node_type == "message":
+        return MessageNode(
+            **common,
+            message_id=d.get("message_id", d["id"]),
+            role=d.get("role", ""),
+            preview=d.get("preview", ""),
+        )
+    else:
+        return ConversationNode(
+            **common,
+            summary=d.get("summary", ""),
+            message_count=d.get("message_count", 0),
+        )

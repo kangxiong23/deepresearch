@@ -1,10 +1,13 @@
 # Layer: UI
 # File: app/ui/app.py
 # Flet 0.85 兼容版本
+# Phase 4 — 树形面板集成
 
 from __future__ import annotations
 import asyncio
 import flet as ft
+
+import config as app_config
 
 from app.ui.theme import Colors, Fonts, Spacing, build_theme
 from app.ui.widgets.chat_message import ChatMessage
@@ -33,13 +36,25 @@ class ChatApp:
         self._page = page
         self._configure_page(page)
 
+        # ── 侧边栏（Phase 4 — 树形面板）───────
         self._sidebar = Sidebar(
             on_new_conversation=self._handle_new_conversation,
             on_switch_conversation=self._handle_switch_conversation,
             on_delete_conversation=self._handle_delete_conversation,
             on_open_context_panel=self._handle_open_context_panel,
             on_open_kg_panel=self._handle_open_kg_panel,
+            # Phase 4 — 树操作回调
+            on_create_folder=self._handle_create_folder,
+            on_new_conversation_in_folder=self._handle_new_conversation_in_folder,
+            on_rename_node=self._handle_rename_node,
+            on_delete_node=self._handle_soft_delete_node,
+            on_toggle_enabled=self._handle_toggle_enabled,
+            on_move_node=self._handle_move_node,
+            on_manage_context=self._handle_manage_context,
+            on_attach_file=self._handle_attach_file,
+            on_open_trash=self._handle_open_trash,
         )
+        self._sidebar.set_page(page)
 
         self._input_area = InputArea(
             on_send=self._handle_send,
@@ -123,8 +138,8 @@ class ChatApp:
 
         chat_area = ft.Stack(
             controls=[
-                empty_hint,
-                ft.Container(content=message_list, expand=True),
+                ft.Container(content=message_list, expand=True),  # 底层：消息列表
+                empty_hint,                                        # 顶层：空状态提示
             ],
             expand=True,
         )
@@ -160,7 +175,7 @@ class ChatApp:
             )
         )
 
-        self._load_history()
+        self._load_tree()
 
     def _configure_page(self, page: ft.Page) -> None:
         page.title = "DeepResearch"
@@ -176,24 +191,64 @@ class ChatApp:
         page.window.min_width = 900
         page.window.min_height = 600
 
-    def _load_history(self) -> None:
-        conversations = self._ctrl.on_load_history()
+    # ──────────────────────────────────────────
+    # 树数据加载（Phase 4）
+    # ──────────────────────────────────────────
+
+    def _load_tree(self) -> None:
+        """从 Controller 获取树数据并加载到侧边栏树面板。"""
+        tree_nodes = self._ctrl.get_tree()
         if self._sidebar:
-            self._sidebar.load_conversations(conversations)
+            self._sidebar.load_tree(tree_nodes)
+
+    def _load_history(self) -> None:
+        """[已弃用] Phase 4 使用 _load_tree() 代替。保留向后兼容。"""
+        self._load_tree()
+
+    # ──────────────────────────────────────────
+    # 对话生命周期
+    # ──────────────────────────────────────────
 
     def _handle_new_conversation(self) -> None:
+        """新建对话（默认放在根目录"未分类"下）。"""
         session_id = self._ctrl.on_new_conversation()
         self._current_session_id = session_id
         self._clear_message_list()
         self._set_empty_hint(True)
         if self._sidebar:
             self._sidebar.set_active(session_id)
-        self._load_history()
+        self._load_tree()
+
+    def _handle_new_conversation_in_folder(self, parent_id: str | None) -> None:
+        """在指定目录下新建对话。"""
+        session_id = self._ctrl.on_new_conversation(parent_id=parent_id)
+        self._current_session_id = session_id
+        self._clear_message_list()
+        self._set_empty_hint(True)
+        if self._sidebar:
+            self._sidebar.set_active(session_id)
+        self._load_tree()
 
     def _handle_switch_conversation(self, session_id: str) -> None:
+        print(f"[UI   ] _handle_switch_conversation: node={session_id}, "
+              f"multi_conv={app_config.multi_conv_mode}")
         self._current_session_id = session_id
-        result = self._ctrl.on_switch_conversation(session_id)
-        self._rebuild_message_list(result.messages if result else [])
+        if app_config.multi_conv_mode:
+            # Phase 5: 加载所有启用对话的消息（合并时间线）
+            messages = self._ctrl.on_get_multi_conversation_messages()
+            print(f"[UI   ] multi_conv 模式: 获取到 {len(messages)} 条消息")
+            # 如果 multi_conv 模式无结果（例如无 MessageNode），
+            # 回退到加载当前点击节点的消息
+            if not messages:
+                print(f"[UI   ] multi_conv 无消息，回退到按节点加载: {session_id}")
+                messages = self._ctrl.on_load_messages_for_node(session_id)
+            self._rebuild_message_list(messages)
+        else:
+            # Phase 5: 以树结构为依据加载该节点对应的消息
+            # 不再依赖 conversation_id，直接通过树中存储的 message_id 引用查询
+            messages = self._ctrl.on_load_messages_for_node(session_id)
+            print(f"[UI   ] 单节点模式: 获取到 {len(messages)} 条消息")
+            self._rebuild_message_list(messages)
         if self._sidebar:
             self._sidebar.set_active(session_id)
         if self._page:
@@ -205,9 +260,175 @@ class ChatApp:
             self._current_session_id = ""
             self._clear_message_list()
             self._set_empty_hint(True)
-        self._load_history()
+        self._load_tree()
         if self._page:
             self._page.update()
+
+    # ──────────────────────────────────────────
+    # 树操作（Phase 4）
+    # ──────────────────────────────────────────
+
+    def _handle_create_folder(self, parent_id: str | None, title: str) -> None:
+        """创建新目录。"""
+        from app.ui.widgets.dialogs import show_new_folder_dialog
+
+        def on_confirm(name: str) -> None:
+            print(f"[TREE] 创建目录: parent={parent_id} name={name}")
+            self._ctrl.on_create_folder(parent_id, name)
+            self._load_tree()
+
+        show_new_folder_dialog(
+            self._page,
+            on_confirm=on_confirm,
+            default_title=title or "新文件夹",
+        )
+
+    def _handle_rename_node(self, node_id: str) -> None:
+        """重命名节点。"""
+        from app.ui.widgets.dialogs import show_rename_dialog
+
+        # 获取当前名称
+        current_title = ""
+        tree_nodes = self._ctrl.get_tree()
+        for n in tree_nodes:
+            if n.id == node_id:
+                current_title = n.title
+                break
+
+        def on_confirm(new_title: str) -> None:
+            print(f"[TREE] 重命名: {node_id} -> {new_title}")
+            self._ctrl.on_rename_node(node_id, new_title)
+            self._load_tree()
+
+        show_rename_dialog(self._page, current_title, on_confirm=on_confirm)
+
+    def _handle_toggle_enabled(self, node_id: str) -> None:
+        """切换节点启用/禁用状态（含级联）。"""
+        print(f"[TREE] 切换启用状态(级联): {node_id}")
+        self._ctrl.on_toggle_enabled(node_id)
+        self._load_tree()
+        # Phase 5: 多对话模式下，刷新聊天区的消息列表
+        if app_config.multi_conv_mode and self._current_session_id:
+            self._refresh_multi_conv_messages()
+
+    def _handle_move_node(self, node_id: str, target_parent_id: str) -> None:
+        """拖拽移动节点。"""
+        print(f"[TREE] 移动节点: {node_id} -> {target_parent_id}")
+        self._ctrl.on_move_node(node_id, target_parent_id)
+        self._load_tree()
+
+    def _handle_soft_delete_node(self, node_id: str) -> None:
+        """软删除节点（移入回收站）。"""
+        from app.ui.widgets.dialogs import show_confirm_dialog
+
+        def on_confirm() -> None:
+            print(f"[TREE] 软删除节点: {node_id}")
+
+            # 检查当前活跃对话是否在待删除子树中
+            should_clear = False
+            if self._current_session_id and self._current_session_id != node_id:
+                # 收集被删节点的所有后代 ID
+                tree_nodes = self._ctrl.get_tree()
+                children_map: dict[str | None, list] = {}
+                for n in tree_nodes:
+                    pid = n.parent_id
+                    if pid not in children_map:
+                        children_map[pid] = []
+                    children_map[pid].append(n)
+
+                descendant_ids: set[str] = set()
+                queue = [node_id]
+                while queue:
+                    cur = queue.pop(0)
+                    for child in children_map.get(cur, []):
+                        descendant_ids.add(child.id)
+                        queue.append(child.id)
+
+                if self._current_session_id in descendant_ids:
+                    should_clear = True
+
+            self._ctrl.on_soft_delete_node(node_id)
+            if node_id == self._current_session_id or should_clear:
+                self._current_session_id = ""
+                self._clear_message_list()
+                self._set_empty_hint(True)
+            self._load_tree()
+
+        show_confirm_dialog(
+            self._page,
+            title="删除确认",
+            message="确定要删除吗？将移入回收站，可恢复。",
+            on_confirm=on_confirm,
+        )
+
+    def _handle_manage_context(self, folder_id: str) -> None:
+        """管理目录关联的 ContextBlock。"""
+        from app.ui.widgets.dialogs import show_context_block_manager_dialog
+
+        folder_info = self._ctrl.on_get_folder_context(folder_id)
+        all_blocks = self._ctrl.on_get_context_blocks()
+
+        def on_save(new_ids: list[str]) -> None:
+            print(f"[TREE] 更新上下文块 {folder_id}: {len(new_ids)} 个块")
+            self._ctrl.on_update_context_blocks(folder_id, new_ids)
+            self._load_tree()
+
+        show_context_block_manager_dialog(
+            self._page,
+            folder_title=folder_info["title"],
+            all_blocks=all_blocks,
+            current_block_ids=folder_info["context_block_ids"],
+            on_save=on_save,
+        )
+
+    def _handle_attach_file(self, folder_id: str) -> None:
+        """挂载附件到目录。"""
+
+        def on_result(e: ft.FilePickerResultEvent) -> None:
+            if e.files:
+                for f in e.files:
+                    print(f"[TREE] 挂载附件到 {folder_id}: {f.path}")
+                    self._ctrl.on_attach_file(folder_id, f.path)
+                self._load_tree()
+
+        fp = ft.FilePicker()
+        fp.on_result = on_result
+        self._page.overlay.append(fp)
+        self._page.update()
+        fp.pick_files(allow_multiple=True)
+
+    def _handle_open_trash(self) -> None:
+        """打开回收站对话框。"""
+        from app.ui.widgets.dialogs import show_recycle_bin_dialog
+
+        entries = self._ctrl.on_list_trash()
+
+        def on_restore(trash_entry_id: str) -> None:
+            print(f"[TREE] 恢复: {trash_entry_id}")
+            self._ctrl.on_restore_from_trash(trash_entry_id)
+            self._load_tree()
+
+        def on_permanent_delete(trash_entry_id: str) -> None:
+            print(f"[TREE] 彻底删除: {trash_entry_id}")
+            self._ctrl.on_permanently_delete(trash_entry_id)
+            self._load_tree()
+
+        def on_clear_all() -> None:
+            count = self._ctrl.on_clear_trash()
+            print(f"[TREE] 清空回收站: {count} 个条目")
+            self._load_tree()
+
+        show_recycle_bin_dialog(
+            self._page,
+            trash_entries=entries,
+            on_restore=on_restore,
+            on_permanent_delete=on_permanent_delete,
+            on_clear_all=on_clear_all,
+        )
+
+    # ──────────────────────────────────────────
+    # 消息发送
+    # ──────────────────────────────────────────
 
     def _handle_send(self, text: str, files: list[str]) -> None:
         if not self._current_session_id:
@@ -247,7 +468,6 @@ class ChatApp:
         thinking_block: ThinkingBlock | None = None
 
         # 助手回复气泡
-        # on_remember 用列表包裹 msg 引用，等 msg 创建后赋值
         _msg_holder: list = []
         def _on_remember(e):
             msg = _msg_holder[0] if _msg_holder else None
@@ -270,7 +490,6 @@ class ChatApp:
                     break
 
                 if chunk_vm.chunk_type == "thinking":
-                    # 第一个 thinking chunk：创建 ThinkingBlock 插到气泡前面
                     if thinking_block is None:
                         thinking_block = ThinkingBlock()
                         self._insert_before_last(thinking_block)
@@ -288,6 +507,12 @@ class ChatApp:
                 self._input_area.set_generating(False)
             if self._page:
                 self._page.update()
+            # 刷新树面板以更新摘要/消息计数
+            self._load_tree()
+
+    # ──────────────────────────────────────────
+    # 上下文面板
+    # ──────────────────────────────────────────
 
     def _handle_open_context_panel(self) -> None:
         if self._context_panel:
@@ -307,14 +532,11 @@ class ChatApp:
         self._refresh_context_panel()
 
     def _handle_delete_template(self, template_id: str) -> None:
-        """删除模板并刷新面板。"""
         self._ctrl.on_delete_template(template_id)
         self._refresh_context_panel()
 
     def _handle_apply_template(self, template_id: str) -> None:
-        """应用模板或保存当前为模板。"""
         if template_id.startswith("__save__:"):
-            # 保存当前块为新模板
             name = template_id[len("__save__:"):]
             self._ctrl.on_save_current_as_template(name)
         else:
@@ -326,7 +548,6 @@ class ChatApp:
         self._refresh_context_panel()
 
     def _handle_open_kg_panel(self) -> None:
-        """打开知识图谱管理面板，刷新数据。"""
         if self._kg_panel is None:
             return
         self._kg_panel.load_data(
@@ -342,14 +563,13 @@ class ChatApp:
 
     def _handle_delete_kg_entity(self, entity_name: str) -> None:
         self._ctrl.on_delete_kg_entity(entity_name)
-        self._handle_open_kg_panel()  # 刷新面板
+        self._handle_open_kg_panel()
 
     def _handle_delete_kg_relation(self, relation_id: str) -> None:
         self._ctrl.on_delete_kg_relation(relation_id)
-        self._handle_open_kg_panel()  # 刷新面板
+        self._handle_open_kg_panel()
 
     def _refresh_context_panel(self) -> None:
-        """刷新上下文面板的块列表和预览。"""
         if not self._context_panel:
             return
         from app.controllers.view_models import ContextBlockVM
@@ -366,7 +586,6 @@ class ChatApp:
         self._context_panel.load_blocks(block_vms)
         preview = self._ctrl.on_get_context_preview()
         self._context_panel.set_preview(preview)
-        # 加载模板列表
         from app.controllers.view_models import TemplateVM
         templates_data = self._ctrl.on_get_templates()
         template_vms = [
@@ -376,7 +595,6 @@ class ChatApp:
         self._context_panel.load_templates(template_vms)
 
     def _insert_before_last(self, control) -> None:
-        """在消息列表最后一个控件之前插入（用于在气泡前插入 ThinkingBlock）。"""
         if not self._message_list_ref.current:
             return
         lst = self._message_list_ref.current.controls
@@ -396,9 +614,20 @@ class ChatApp:
             self._message_list_ref.current.controls.clear()
             self._message_list_ref.current.update()
 
+    def _refresh_multi_conv_messages(self) -> None:
+        """Phase 5: 刷新聊天区，展示所有启用对话的消息（合并时间线）。"""
+        if not self._current_session_id:
+            return
+        messages = self._ctrl.on_get_multi_conversation_messages()
+        self._rebuild_message_list(messages)
+        if self._page:
+            self._page.update()
+
     def _rebuild_message_list(self, message_vms: list) -> None:
         if not self._message_list_ref.current:
+            print("[UI   ] _rebuild_message_list: message_list_ref 未就绪，跳过")
             return
+        print(f"[UI   ] _rebuild_message_list: 重建消息列表，{len(message_vms)} 条消息")
         self._message_list_ref.current.controls.clear()
         has_messages = bool(message_vms)
         self._set_empty_hint(not has_messages)
@@ -428,7 +657,6 @@ class ChatApp:
     async def _do_remember(
         self, session_id: str, msg: "ChatMessage | None"
     ) -> None:
-        """异步执行知识提取，完成后更新按钮状态。"""
         try:
             result = await self._ctrl.on_remember_conversation(session_id)
             print(f"[KG] {result}")
@@ -442,9 +670,7 @@ class ChatApp:
             self._page.update()
 
     def _make_remember_handler_simple(self, session_id: str):
-        """给已有消息（切换对话时重建）用的 remember handler。"""
         def _handler(e):
-            # 找到触发按钮所在的 ChatMessage
             control = e.control
             msg = None
             parent = getattr(control, 'parent', None)
@@ -466,5 +692,57 @@ class ChatApp:
 
     def _make_regenerate_handler(self, session_id: str):
         def _handler(e):
-            self._ctrl.on_regenerate_message(session_id, "")
+            if self._page:
+                self._page.run_task(
+                    self._stream_regenerate, session_id
+                )
         return _handler
+
+    async def _stream_regenerate(self, session_id: str) -> None:
+        """流式重新生成最后一条助手回复。"""
+        from app.ui.widgets.chat_message import ThinkingBlock
+
+        thinking_block: ThinkingBlock | None = None
+
+        _msg_holder: list = []
+        def _on_remember(e):
+            msg = _msg_holder[0] if _msg_holder else None
+            self._page.run_task(self._do_remember, session_id, msg)
+        assistant_msg = ChatMessage(
+            role="assistant",
+            content="",
+            on_copy=self._make_copy_handler(),
+            on_regenerate=self._make_regenerate_handler(session_id),
+            on_remember=_on_remember,
+        )
+        _msg_holder.append(assistant_msg)
+        assistant_msg.start_stream()
+        self._streaming_message = assistant_msg
+        self._append_message(assistant_msg)
+
+        try:
+            async for chunk_vm in self._ctrl.on_regenerate_message(
+                session_id, ""
+            ):
+                if chunk_vm.is_done:
+                    break
+
+                if chunk_vm.chunk_type == "thinking":
+                    if thinking_block is None:
+                        thinking_block = ThinkingBlock()
+                        self._insert_before_last(thinking_block)
+                    thinking_block.append_text(chunk_vm.delta)
+                else:
+                    assistant_msg.append_stream(chunk_vm.delta)
+
+                if self._page:
+                    self._page.update()
+                await asyncio.sleep(0)
+        finally:
+            assistant_msg.finalize_stream()
+            self._streaming_message = None
+            if self._input_area:
+                self._input_area.set_generating(False)
+            if self._page:
+                self._page.update()
+            self._load_tree()

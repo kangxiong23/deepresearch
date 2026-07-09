@@ -39,6 +39,11 @@ class Colors:
     ERROR          = "#F06B6B"
     INFO           = "#4A9EFF"
 
+    # 复选框状态色（树节点 enabled 指示器）
+    CHECKBOX_ENABLED  = "#4CAF82"  # 绿色 — 已启用
+    CHECKBOX_DISABLED = "#3D4255"  # 暗色 — 已禁用
+    CHECKBOX_SOME     = "#E8A838"  # 琥珀色 — 部分启用
+
     # 边框 & 分割线
     BORDER         = "#252A38"  # 普通边框
     BORDER_FOCUS   = "#4A9EFF"  # 聚焦态边框

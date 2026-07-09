@@ -91,3 +91,36 @@ class TemplateVM:
     id: str
     name: str
     description: str = ""
+
+
+# ──────────────────────────────────────────────
+# 树形结构 VM（Phase 4 — 树面板用）
+# ──────────────────────────────────────────────
+@dataclass
+class TreeNodeVM:
+    """树形节点视图模型，统一表示目录、对话和消息节点。"""
+    id: str
+    title: str
+    node_type: str                           # "folder" | "conversation" | "message"
+    parent_id: str | None = None
+    enabled: bool | str = True               # True, False, or "some"
+    sort_order: int = 0
+    preview: str = ""                        # 对话摘要 / 消息预览 / 目录留空
+    updated_at: str = ""                     # 格式化时间字符串
+    has_children: bool = False               # 是否有子节点（预计算）
+    depth: int = 0                           # 缩进级别（预计算）
+    message_count: int = 0                   # 仅对话
+    context_block_count: int = 0             # 仅目录
+    attachment_count: int = 0                # 仅目录
+    role: str = ""                           # 仅消息节点: "user" | "assistant" | "thinking"
+
+
+@dataclass
+class TrashEntryVM:
+    """回收站条目视图模型。"""
+    id: str                                  # TrashEntry ID
+    node_id: str                             # 原节点 ID
+    title: str
+    node_type: str                           # "folder" | "conversation"
+    json_path: str
+    deleted_at: str                          # 格式化时间字符串

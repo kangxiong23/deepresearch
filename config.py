@@ -34,6 +34,12 @@ CONTEXT_STORE_PATH: str = os.getenv(
     str(Path(__file__).parent / "data" / "context"),
 )
 
+# 树形结构存储路径（tree.json + recycle_bin.json）
+TREE_STORE_PATH: str = os.getenv(
+    "TREE_STORE_PATH",
+    str(Path(__file__).parent / "data" / "tree"),
+)
+
 # 日志级别
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
@@ -87,6 +93,10 @@ KG_STORE_PATH: str = os.getenv(
     "KG_STORE_PATH",
     str(Path(__file__).parent / "data" / "knowledge_graph"),
 )
+
+# 多对话模式：显示所有启用对话的消息（合并时间线），而非仅当前对话
+# Phase 5 — 启用后，聊天区展示所有 effectively-enabled 消息
+multi_conv_mode: bool = True
 
 # 知识注入开关：发消息时是否自动查询图谱并注入相关知识
 kg_injection_enabled: bool = True

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "5eab79de-2981-45eb-9c81-3bd7053caef1",
+    "name": "学术研究风格",
+    "node_type": "entry",
+    "content_ref": "60a7ae80-f04d-4c74-a628-91ffb6735097",
+    "enabled": true,
+    "source": "template"
+  },
+  {
+    "id": "6d7df445-47cf-4302-aa4a-0c52d85cb18a",
+    "name": "你是一位专注于解决情感问题的情感大师",
+    "node_type": "entry",
+    "content_ref": "09aa1388-59d4-4cff-814d-4f8152b9d7d1",
+    "enabled": true,
+    "source": "template"
+  }
+]

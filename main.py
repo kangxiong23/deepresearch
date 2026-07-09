@@ -9,7 +9,8 @@ import flet as ft
 
 # ── 基础设施 ──────────────────────────────────
 from app.storage.database import initialize_database
-from app.storage.conversation_repo import ConversationRepo
+from app.storage.message_repo import MessageRepo
+from app.storage.tree_store import TreeStore
 from app.storage.context_store import ContextStore
 
 # ── 适配器 ────────────────────────────────────
@@ -58,9 +59,10 @@ def main(page: ft.Page) -> None:
     logger.info("database initialized")
 
     # ── 2. Storage 层 ─────────────────────────
-    conversation_repo = ConversationRepo()
-    context_store     = ContextStore()
-    kg_store          = KGStore()
+    message_repo  = MessageRepo()
+    tree_store    = TreeStore()
+    context_store = ContextStore()
+    kg_store      = KGStore()
 
     # ── 3. Adapter 层 ─────────────────────────
     llm_client      = DeepSeekClient()
@@ -72,8 +74,9 @@ def main(page: ft.Page) -> None:
 
     # ── 4. Core 服务层 ────────────────────────
     context_service = ContextService(
-        conversation_repo=conversation_repo,
+        message_repo=message_repo,
         context_store=context_store,
+        tree_store=tree_store,
     )
     search_service = SearchService(
         adapters=search_adapters,
@@ -82,8 +85,9 @@ def main(page: ft.Page) -> None:
         parsers=file_parsers,
     )
     conversation_service = ConversationService(
+        message_repo=message_repo,
+        tree_store=tree_store,
         llm_client=llm_client,
-        conversation_repo=conversation_repo,
         context_service=context_service,
         search_service=search_service,
         file_service=file_service,

@@ -102,6 +102,12 @@ class ContextStore:
             templates.append(_template_to_dict(template))
         self._write_json(self._templates_path, templates)
 
+    def delete_template(self, template_id: str) -> None:
+        """删除模板。"""
+        templates = self._load_templates_raw()
+        templates = [t for t in templates if t.get("id") != template_id]
+        self._write_json(self._templates_path, templates)
+
     # ──────────────────────────────────────────
     # 内部 I/O
     # ──────────────────────────────────────────

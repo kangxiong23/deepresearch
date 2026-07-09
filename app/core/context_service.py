@@ -2,20 +2,30 @@
 # File: app/core/context_service.py
 # Responsibility: 上下文编排服务。
 #                 决定"如何构建发送给 LLM 的完整上下文"——
-#                 包括历史消息截断策略、系统提示拼接、上下文块插入。
-#                 不直接读写数据库，通过 ConversationRepo / ContextStore 协议操作。
+#                 包括历史消息截断策略、系统提示拼接、上下文块插入、
+#                 树形目录上下文收集（Phase 3）。
+#                 不直接读写数据库，通过 MessageRepo / ContextStore / TreeStore 协议操作。
 # Input:  conversation_id, 上下文块列表, 新消息
 # Output: LLMContext（组装好的完整请求上下文，交给 ConversationService 传给 LLM）
 # 禁止: HTTP 调用、数据库 SQL、UI 导入
 
 from __future__ import annotations
 
+import uuid
+from pathlib import Path
+
 import config as app_config
-from app.core.protocols import ConversationRepoProtocol, ContextStoreProtocol
+from app.core.protocols import (
+    ContextStoreProtocol,
+    MessageRepoProtocol,
+    TreeStoreProtocol,
+)
 from app.storage.models import (
     ContextBlock,
-    ContextTemplate,
     ContextSource,
+    ContextTemplate,
+    ConversationNode,
+    FolderNode,
     LLMContext,
     Message,
     Role,
@@ -31,27 +41,33 @@ _DEFAULT_SYSTEM_PROMPT = (
     "When you don't know something, say so clearly."
 )
 
+# 附件文件读取大小上限（字节）
+_MAX_ATTACHMENT_BYTES = 1_000_000
+
 
 class ContextService:
     """
-    上下文构建服务。
+    上下文构建服务（Phase 3 — 集成树形上下文收集）。
 
     编排职责：
-    1. 从 ContextStore 读取用户配置的上下文块（系统提示、背景材料等）
-    2. 从 ConversationRepo 读取历史消息，按 token 预算截断
-    3. 将以上内容组装为 LLMContext，供 ConversationService 传给 LLM 客户端
+    1. 从 ContextStore 读取用户全局配置的上下文块
+    2. 从 TreeStore 沿父目录链收集树关联的 ContextBlock 和附件
+    3. 从 MessageRepo 读取历史消息，按 token 预算截断
+    4. 将以上内容组装为 LLMContext，供 ConversationService 传给 LLM 客户端
 
     不直接操作数据库或外部 API。
     """
 
     def __init__(
         self,
-        conversation_repo: ConversationRepoProtocol,
+        message_repo: MessageRepoProtocol,
         context_store: ContextStoreProtocol,
+        tree_store: TreeStoreProtocol | None = None,
         knowledge_service=None,
     ) -> None:
-        self._repo = conversation_repo
+        self._repo = message_repo
         self._store = context_store
+        self._tree = tree_store                 # Phase 3: 树形上下文收集
         self._knowledge_svc = knowledge_service  # 可选，延迟注入
 
     def set_knowledge_service(self, knowledge_service) -> None:
@@ -72,22 +88,34 @@ class ContextService:
         为一次 LLM 调用组装完整上下文。
 
         流程：
-        1. 读取并合并用户上下文块（system prompt 块优先，其余按 order 拼接）
-        2. 读取历史消息并按 token 预算截断
-        3. 若有搜索结果注入，拼接到用户消息之前
-        4. 追加本次新用户消息
-        5. 从 config 读取模型配置并填入 LLMContext
+        1. 收集树形上下文资源（父目录的 ContextBlock + 附件文件）
+        2. 构建系统提示（全局块 → 树块 → 附件内容 → 知识图谱 → 默认提示）
+        3. 读取历史消息并按 token 预算截断
+        4. 若有搜索结果，拼接到用户消息之前
+        5. 追加本次新用户消息
+        6. 从 config 读取模型配置并填入 LLMContext
 
         Args:
-            conversation_id:      当前对话 ID
+            conversation_id:      当前对话节点 ID
             new_user_message:     用户本次输入的文本
             injected_search_text: 搜索结果文本（由 SearchService 提供，可为空）
 
         Returns:
             LLMContext — 可直接传给 LLMClientProtocol.stream_chat()
         """
-        # 1. 构建系统提示（含知识图谱注入）
-        system_prompt = self._build_system_prompt()
+        # ── Phase 3: 收集树形上下文资源 ────────
+        tree_block_ids: list[str] = []
+        tree_attachment_paths: list[str] = []
+        if self._tree is not None:
+            tree_block_ids, tree_attachment_paths = (
+                self._collect_context_resources(conversation_id)
+            )
+
+        # 1. 构建系统提示（含树上下文 + 知识图谱注入）
+        system_prompt = self._build_system_prompt(
+            tree_block_ids=tree_block_ids,
+            tree_attachment_paths=tree_attachment_paths,
+        )
         if self._knowledge_svc and app_config.kg_injection_enabled:
             kg_results = self._knowledge_svc.query_for_context(new_user_message)
             kg_text = self._knowledge_svc.format_knowledge_for_injection(kg_results)
@@ -108,7 +136,6 @@ class ContextService:
         # 3. 组装 messages 列表（OpenAI 格式）
         messages: list[dict] = []
         for msg in truncated:
-            # 思考块不发给 LLM（仅展示用）
             if msg.role == Role.THINKING:
                 continue
             messages.append({
@@ -132,21 +159,11 @@ class ContextService:
         )
 
     # ──────────────────────────────────────────
-    # 上下文块管理接口
+    # 上下文块管理接口（不变）
     # ──────────────────────────────────────────
 
     def add_text_block(self, content: str, label: str = "") -> ContextBlock:
-        """
-        手动添加一个文本上下文块。
-
-        Args:
-            content: 文本内容
-            label:   可选显示标签
-
-        Returns:
-            新建的 ContextBlock（已持久化）
-        """
-        import uuid
+        """手动添加一个文本上下文块。"""
         block = ContextBlock(
             id=str(uuid.uuid4()),
             label=label or content[:20],
@@ -159,18 +176,7 @@ class ContextService:
         return block
 
     def add_file_block(self, content: str, filename: str) -> ContextBlock:
-        """
-        将解析后的文件内容作为上下文块添加。
-        由 FileService 提取内容后调用此方法。
-
-        Args:
-            content:  文件提取出的文本
-            filename: 原始文件名（用作 label）
-
-        Returns:
-            新建的 ContextBlock（已持久化）
-        """
-        import uuid
+        """将解析后的文件内容作为上下文块添加。"""
         block = ContextBlock(
             id=str(uuid.uuid4()),
             label=filename,
@@ -195,24 +201,14 @@ class ContextService:
         return self._store.get_blocks()
 
     def apply_template(self, template_id: str) -> list[ContextBlock]:
-        """
-        应用模板：将模板中的块全部追加到当前上下文块列表。
-
-        Args:
-            template_id: 目标模板 ID
-
-        Returns:
-            新追加的上下文块列表
-        """
+        """应用模板：将模板中的块全部追加到当前上下文块列表。"""
         template = self._store.get_template(template_id)
         if template is None:
             return []
-        # 先清除所有已有的模板来源块（避免叠加）
         existing = self._store.get_blocks()
         for b in existing:
             if b.source == ContextSource.TEMPLATE:
                 self._store.delete_block(b.id)
-        import uuid
         base_order = self._next_order()
         new_blocks: list[ContextBlock] = []
         for i, tmpl_block in enumerate(template.blocks):
@@ -232,40 +228,247 @@ class ContextService:
         """获取所有可用模板。"""
         return self._store.list_templates()
 
+    def delete_template(self, template_id: str) -> None:
+        """删除模板。"""
+        self._store.delete_template(template_id)
+
     def get_assembled_preview(self) -> str:
-        """
-        返回当前已启用上下文块拼接后的预览文本。
-        供 UI 上下文面板展示用，不影响实际 LLM 调用。
-        """
+        """返回当前已启用上下文块拼接后的预览文本。"""
         blocks = [b for b in self._store.get_blocks() if b.enabled]
         return self._assemble_context_blocks(blocks)
+
+    # ──────────────────────────────────────────
+    # Phase 3: 树形上下文收集
+    # ──────────────────────────────────────────
+
+    def _collect_context_resources(
+        self,
+        conversation_id: str,
+    ) -> tuple[list[str], list[str]]:
+        """
+        从对话节点向上遍历所有父目录，收集 context_block_ids 和
+        attachment_paths（去重，保持由近到远的顺序）。
+
+        仅收集 effectively-enabled 的 FolderNode 的资源。
+
+        优化：单次 O(D) 遍历——收集祖先链后，从上到下（root→node）扫描，
+        维护运行中的 effective 状态，无需为每个祖先重复调用 _is_node_enabled。
+
+        Args:
+            conversation_id: 当前对话节点 ID
+
+        Returns:
+            (去重的 context_block_id 列表, 去重的 attachment_path 列表)
+        """
+        if self._tree is None:
+            return ([], [])
+
+        node = self._tree.get_node(conversation_id)
+        if node is None:
+            return ([], [])
+
+        # 第一步：收集祖先链（从近到远，即 node→root 方向）
+        ancestors: list = []  # list of FolderNode, bottom-up order
+        current_id: str | None = node.parent_id
+        while current_id is not None:
+            parent = self._tree.get_node(current_id)
+            if parent is None:
+                break
+            if isinstance(parent, FolderNode):
+                ancestors.append(parent)
+            current_id = parent.parent_id
+
+        # 第二步：从上到下（root→node）单次扫描，维护运行中的 effective 状态
+        # 规则：最近的（离 root 更近的）非 "some" 祖先覆盖所有后代
+        block_ids: list[str] = []
+        attachment_paths: list[str] = []
+        effective = True  # 默认启用（无祖先约束时）
+
+        for ancestor in reversed(ancestors):  # root first, then down
+            if ancestor.enabled is True:
+                effective = True
+            elif ancestor.enabled is False:
+                effective = False
+            # ancestor.enabled == "some": 保持当前 effective 不变
+
+            if effective:
+                for bid in ancestor.context_block_ids:
+                    if bid not in block_ids:
+                        block_ids.append(bid)
+                for ap in ancestor.attachment_paths:
+                    if ap not in attachment_paths:
+                        attachment_paths.append(ap)
+
+        return (block_ids, attachment_paths)
+
+    def is_node_effectively_enabled(self, node_id: str) -> bool:
+        """
+        公开方法：判断节点是否实际启用（考虑父节点级联覆盖规则）。
+
+        供 ConversationService 等外部调用方获取节点的 effective enabled 状态。
+
+        Args:
+            node_id: 要检查的节点 ID
+
+        Returns:
+            bool — 节点是否实际启用
+        """
+        return self._is_node_enabled(node_id)
+
+    def _is_node_enabled(self, node_id: str) -> bool:
+        """
+        判断节点是否实际启用（考虑父节点覆盖规则）。
+
+        规则（自顶向下级联，高层祖先优先）：
+        - 从节点父级向上遍历所有祖先，遇到 True/False 就更新有效状态
+        - 最高层（最接近根）的非 "some" 祖先最终决定
+        - 若所有祖先均为 "some"，则使用节点自身的 enabled 值
+
+        示例：root(some) → A(False) → B(True) → C(some)
+        - 从 C 向上：B=True（effective=True），A=False（覆盖！effective=False）
+        - 最终 C 为 False（A 的 False 级联覆盖了 B 的 True）
+
+        Args:
+            node_id: 要检查的节点 ID
+
+        Returns:
+            bool — 节点是否实际启用
+        """
+        if self._tree is None:
+            return True
+
+        node = self._tree.get_node(node_id)
+        if node is None:
+            return False
+
+        # 节点自身值作为初始默认
+        effective = node.enabled is not False
+
+        # 从父级向上遍历，高层祖先覆盖低层
+        current_id: str | None = node.parent_id
+        while current_id is not None:
+            parent = self._tree.get_node(current_id)
+            if parent is None:
+                break
+            if parent.enabled is True:
+                effective = True
+            elif parent.enabled is False:
+                effective = False
+            # parent.enabled == "some": 不改变 effective
+            current_id = parent.parent_id
+
+        return effective
+
+    def _read_attachment_content(self, path: str) -> str:
+        """
+        读取单个附件文件内容，带大小限制和异常处理。
+
+        Args:
+            path: 文件绝对路径
+
+        Returns:
+            文件文本内容，失败或过大时返回空字符串或占位提示
+        """
+        try:
+            file_path = Path(path)
+            if not file_path.exists():
+                print(f"[CTX] 附件不存在: {path}")
+                return ""
+
+            file_size = file_path.stat().st_size
+            if file_size > _MAX_ATTACHMENT_BYTES:
+                print(f"[CTX] 附件过大 ({file_size} bytes)，跳过: {path}")
+                return f"[附件过大未加载：{file_path.name} ({file_size} bytes)]"
+
+            with file_path.open("r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            return content
+        except OSError as e:
+            print(f"[CTX] 读取附件失败 {path}: {e}")
+            return ""
+        except Exception as e:
+            print(f"[CTX] 附件异常 {path}: {e}")
+            return ""
 
     # ──────────────────────────────────────────
     # 内部编排方法
     # ──────────────────────────────────────────
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(
+        self,
+        tree_block_ids: list[str] | None = None,
+        tree_attachment_paths: list[str] | None = None,
+    ) -> str:
         """
-        将用户添加的所有启用上下文块直接拼入 system prompt。
-        用户块的内容会覆盖/补充默认指令，AI 会优先遵守。
+        构建完整的 system prompt，按以下顺序拼接：
+
+        1. 全局用户上下文块（手动添加，source=MANUAL / FILE / TEMPLATE）
+        2. 树目录收集的 ContextBlock（按父目录由近到远，去重）
+        3. 树目录附件文件内容
+        4. 默认系统提示（_DEFAULT_SYSTEM_PROMPT）
+
+        Args:
+            tree_block_ids:        树收集到的 ContextBlock ID 列表
+            tree_attachment_paths: 树收集到的附件文件路径列表
+
+        Returns:
+            拼接完成的 system prompt 字符串
         """
-        blocks = self._store.get_blocks()
-        enabled = [b for b in blocks if b.enabled]
+        if tree_block_ids is None:
+            tree_block_ids = []
+        if tree_attachment_paths is None:
+            tree_attachment_paths = []
 
         parts: list[str] = []
+        tree_id_set: set[str] = set(tree_block_ids) if tree_block_ids else set()
 
-        # 用户自定义块优先（放在最前面，AI 会优先遵守）
-        for block in enabled:
+        # ── 1. 全局上下文块（排除已在树中的）─
+        all_blocks = self._store.get_blocks()
+        global_enabled = [
+            b for b in all_blocks
+            if b.enabled and b.id not in tree_id_set
+        ]
+        for block in global_enabled:
             if block.content.strip():
                 parts.append(block.content.strip())
 
-        # 默认提示兜底（放在末尾）
+        # ── 2. 树目录 ContextBlock ──────────
+        if tree_block_ids and self._tree is not None:
+            all_blocks_by_id = {b.id: b for b in all_blocks}
+            tree_blocks: list[ContextBlock] = []
+            for bid in tree_block_ids:
+                block = all_blocks_by_id.get(bid)
+                if block is None:
+                    print(f"[CTX] 树 ContextBlock 未找到 (全局 storage): {bid}")
+                    continue
+                if block.enabled and block.content.strip():
+                    tree_blocks.append(block)
+
+            if tree_blocks:
+                print(f"[CTX] 注入 {len(tree_blocks)} 个树目录 ContextBlock")
+                tree_text = self._assemble_context_blocks(tree_blocks)
+                if tree_text.strip():
+                    parts.append(tree_text.strip())
+
+        # ── 3. 树目录附件文件 ───────────────
+        if tree_attachment_paths:
+            loaded = 0
+            for ap in tree_attachment_paths:
+                content = self._read_attachment_content(ap)
+                if content.strip():
+                    label = Path(ap).name
+                    parts.append(f"[附件：{label}]\n{content}")
+                    loaded += 1
+            if loaded:
+                print(f"[CTX] 注入 {loaded} 个树附件文件")
+
+        # ── 4. 默认系统提示（兜底）───────────
         parts.append(_DEFAULT_SYSTEM_PROMPT)
 
         return "\n\n".join(p for p in parts if p.strip())
 
     def _assemble_context_blocks(self, blocks: list[ContextBlock]) -> str:
-        """将上下文块按 order 拼接为单一文本（用于系统提示外注入或预览）。"""
+        """将上下文块按 order 拼接为单一文本。"""
         sorted_blocks = sorted(blocks, key=lambda b: b.order)
         return "\n\n".join(
             f"[{b.label}]\n{b.content}" for b in sorted_blocks if b.content.strip()
@@ -285,11 +488,12 @@ class ContextService:
         if not messages:
             return []
 
-        # 从末尾向前累计
         selected: list[Message] = []
         total = 0
         for msg in reversed(messages):
-            estimated = msg.token_count if msg.token_count > 0 else len(msg.content) // 4
+            estimated = (
+                msg.token_count if msg.token_count > 0 else len(msg.content) // 4
+            )
             if total + estimated > budget_tokens and selected:
                 break
             selected.append(msg)
@@ -303,10 +507,7 @@ class ContextService:
         user_text: str,
         search_text: str,
     ) -> str:
-        """
-        将用户原始输入与搜索结果拼接为完整用户消息内容。
-        搜索结果以结构化前缀注入。
-        """
+        """将用户原始输入与搜索结果拼接为完整用户消息内容。"""
         if not search_text:
             return user_text
         return (
