@@ -1,0 +1,33 @@
+# ── Python ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environment ───────────────────────
+.venv/
+venv/
+env/
+
+# ── Environment & secrets ─────────────────────
+.env
+
+# ── IDE / editor ──────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────
+Thumbs.db
+.DS_Store
+
+# ── Runtime data (user-specific) ──────────────
+*.db
+*.db-shm
+*.db-wal
+data/context/
+data/knowledge_graph/
