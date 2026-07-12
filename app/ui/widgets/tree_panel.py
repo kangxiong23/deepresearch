@@ -762,6 +762,36 @@ class TreePanel(QWidget):
         if root is not None:
             expand_matching(root)
 
+    def expand_to_node(self, node_id: str) -> None:
+        """
+        展开目标节点的所有祖先节点，使其在树视图中可见。
+
+        从目标节点向上遍历父链，收集所有祖先 ID，
+        然后从根向目标逐层展开。
+        """
+        if self._model is None or not self._tree_data:
+            return
+
+        child_to_parent: dict[str, str | None] = {}
+        for n in self._tree_data:
+            child_to_parent[n.id] = n.parent_id
+
+        ancestors: list[str] = []
+        current_id: str | None = node_id
+        while current_id is not None:
+            parent_id = child_to_parent.get(current_id)
+            if parent_id is not None:
+                ancestors.append(parent_id)
+            current_id = parent_id
+
+        for aid in reversed(ancestors):
+            self._expanded_ids.add(aid)
+            item = self._find_item_by_node_id(aid)
+            if item is not None and item.hasChildren():
+                idx = self._model.indexFromItem(item)
+                if idx.isValid():
+                    self._tree_view.expand(idx)
+
     def _find_item_by_node_id(self, node_id: str) -> QStandardItem | None:
         """
         在 model 中递归搜索指定 node_id 的 QStandardItem。

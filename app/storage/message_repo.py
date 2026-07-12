@@ -144,6 +144,14 @@ class MessageRepo:
         ).fetchall()
         return [_row_to_message(r) for r in rows]
 
+    def get_all_messages(self) -> list[Message]:
+        """返回数据库中所有消息，按 created_at 倒序。"""
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT * FROM messages ORDER BY created_at DESC"
+        ).fetchall()
+        return [_row_to_message(r) for r in rows]
+
     def get_messages_by_conversation_ids(
         self, conversation_ids: list[str]
     ) -> list[Message]:

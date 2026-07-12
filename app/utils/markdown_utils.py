@@ -68,6 +68,49 @@ def truncate_for_preview(text: str, max_chars: int = 60) -> str:
     return text[:max_chars].rstrip() + "…"
 
 
+def strip_for_search(text: str) -> str:
+    """
+    为关键词搜索预处理 Markdown 文本：去除所有 Markdown 语法标记，
+    将换行移除，折叠多余空白，返回适合关键词匹配的纯文本。
+
+    比 extract_plain_text 更激进 — 额外处理：
+    - 块引用 > 标记
+    - 无序列表 * + - 标记
+    - 有序列表 1. 2. 标记
+    - 换行 → 移除（中文搜索无需空格分隔）
+    """
+    t = text
+    # 1. 删除代码块
+    t = re.sub(r"```[\s\S]*?```", " ", t)
+    # 2. 删除行内代码
+    t = re.sub(r"`([^`]*)`", r"\1", t)
+    # 3. 删除图片
+    t = re.sub(r"!\[.*?\]\(.*?\)", " ", t)
+    # 4. 链接 [text](url) → text
+    t = re.sub(r"\[([^\]]*)\]\([^\)]*\)", r"\1", t)
+    # 5. 标题 # 标记
+    t = re.sub(r"^#{1,6}\s+", "", t, flags=re.MULTILINE)
+    # 6. 粗体 **text** / __text__
+    t = re.sub(r"\*\*([^\*]+)\*\*", r"\1", t)
+    t = re.sub(r"__([^_]+)__", r"\1", t)
+    # 7. 斜体 *text* / _text_
+    t = re.sub(r"(?<!\*)\*([^\*]+)\*(?!\*)", r"\1", t)
+    t = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"\1", t)
+    # 8. 水平线
+    t = re.sub(r"^\s*[-*_]{3,}\s*$", " ", t, flags=re.MULTILINE)
+    # 9. 块引用 >
+    t = re.sub(r"^>\s?", "", t, flags=re.MULTILINE)
+    # 10. 无序列表标记
+    t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.MULTILINE)
+    # 11. 有序列表标记
+    t = re.sub(r"^\s*\d+\.\s+", "", t, flags=re.MULTILINE)
+    # 12. 换行 → 移除
+    t = t.replace("\n", "").replace("\r", "")
+    # 13. 折叠多余空白
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def estimate_token_count(text: str) -> int:
     """
     粗略估算文本的 token 数（用于上下文窗口管理）。

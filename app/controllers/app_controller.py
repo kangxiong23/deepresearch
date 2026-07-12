@@ -14,6 +14,7 @@ from app.controllers.view_models import (
     ConversationVM,
     ConversationDetailVM,
     MessageVM,
+    SearchResultVM,
     StreamChunkVM,
     TreeNodeVM,
     TrashEntryVM,
@@ -125,6 +126,72 @@ class AppController:
         result = [self._map_to_message_vm(m) for m in messages]
         print(f"[CTRL ] on_get_multi_conversation_messages: 返回 {len(result)} 个 MessageVM")
         return result
+
+    def on_search(self, keywords_text: str) -> list[SearchResultVM]:
+        """
+        UI 调用：执行消息关键词搜索。
+
+        Args:
+            keywords_text: 空格分隔的搜索关键词
+
+        Returns:
+            list[SearchResultVM] — 按时间倒序排列的搜索结果
+        """
+        if not keywords_text.strip():
+            return []
+
+        keywords = [
+            kw.strip().lower()
+            for kw in keywords_text.split()
+            if kw.strip()
+        ]
+        results = self._conversation_svc.search_messages(keywords)
+        vms: list[SearchResultVM] = []
+        for r in results:
+            snippet = self._build_snippet(r.content, keywords)
+            vms.append(SearchResultVM(
+                message_id=r.message_id,
+                conversation_id=r.conversation_id,
+                role=r.role,
+                snippet=snippet,
+                tree_path=r.tree_path,
+                created_at=_format_datetime(r.created_at),
+            ))
+        return vms
+
+    @staticmethod
+    def _build_snippet(content: str, keywords: list[str]) -> str:
+        """
+        围绕消息中最早匹配的关键词构建上下文片段。
+        在所有关键词中找到最早出现位置，显示该位置前后各 10 字符。
+        """
+        from app.utils.markdown_utils import strip_for_search
+
+        plain = strip_for_search(content)
+        if not keywords or not plain:
+            return plain[:30] if plain else ""
+
+        plain_lower = plain.lower()
+        best_idx: int | None = None
+        best_kw: str = ""
+        for kw in keywords:
+            idx = plain_lower.find(kw)
+            if idx != -1 and (best_idx is None or idx < best_idx):
+                best_idx = idx
+                best_kw = kw
+
+        if best_idx is None:
+            return plain[:30] + ("..." if len(plain) > 30 else "")
+
+        kw_len = len(best_kw)
+        start = max(0, best_idx - 10)
+        end = min(len(plain), best_idx + kw_len + 10)
+        snippet = plain[start:end]
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(plain):
+            snippet = snippet + "..."
+        return snippet
 
     def on_load_history(self) -> list[ConversationVM]:
         """

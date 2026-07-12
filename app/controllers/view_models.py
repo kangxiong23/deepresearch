@@ -124,3 +124,14 @@ class TrashEntryVM:
     node_type: str                           # "folder" | "conversation"
     json_path: str
     deleted_at: str                          # 格式化时间字符串
+
+
+@dataclass
+class SearchResultVM:
+    """消息搜索结果视图模型。"""
+    message_id: str
+    conversation_id: str       # 所属对话 ID
+    role: str                  # "user" | "assistant" | "thinking" | "system"
+    snippet: str               # 关键词上下文片段（~30 chars）
+    tree_path: str             # 树路径，如 "项目A/对话1/用户消息"
+    created_at: str            # 格式化时间字符串

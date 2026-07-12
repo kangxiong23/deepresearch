@@ -12,10 +12,11 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QFrame,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QIcon
 
 from app.ui.theme import Colors, Fonts, Spacing, Radius
@@ -55,6 +56,7 @@ class Sidebar(QWidget):
     open_trash_clicked = Signal()
     open_context_panel_clicked = Signal()
     open_kg_panel_clicked = Signal()
+    search_requested = Signal(str)  # 携带搜索关键词（去抖后）
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -79,6 +81,14 @@ class Sidebar(QWidget):
             }}
         """)
 
+        # ── 搜索框 ──────────────────────────────
+        self._search_box = self._build_search_box()
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self._on_search_timeout)
+        self._search_box.textChanged.connect(self._on_search_text_changed)
+
         # ── 树形面板 ──────────────────────────────
         self._tree_panel = TreePanel()
 
@@ -92,6 +102,7 @@ class Sidebar(QWidget):
         layout.addWidget(header)
         layout.addWidget(button_row)
         layout.addWidget(section_label)
+        layout.addWidget(self._search_box)
         layout.addWidget(self._tree_panel, stretch=1)
         layout.addWidget(bottom_widget)
 
@@ -361,6 +372,45 @@ class Sidebar(QWidget):
         return row_widget
 
     # ──────────────────────────────────────────────
+    # ──────────────────────────────────────────────
+    # 搜索框
+    # ──────────────────────────────────────────────
+
+    def _build_search_box(self) -> QLineEdit:
+        """构建搜索输入框。"""
+        search = QLineEdit()
+        search.setPlaceholderText("搜索消息... (Ctrl+F)")
+        search.setFont(Fonts.body(Fonts.SIZE_SM))
+        search.setClearButtonEnabled(True)
+        search.setStyleSheet(f"""
+            QLineEdit {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.BG_ELEVATED};
+                border: 1px solid {Colors.BORDER};
+                border-radius: {Radius.MD}px;
+                padding: 8px 12px;
+                margin: 0 {Spacing.LG}px {Spacing.MD}px {Spacing.LG}px;
+            }}
+            QLineEdit:focus {{
+                border-color: {Colors.PRIMARY};
+            }}
+        """)
+        return search
+
+    def _on_search_text_changed(self, text: str) -> None:
+        """搜索文本变化 → 重启去抖定时器。"""
+        self._search_timer.stop()
+        if text.strip():
+            self._search_timer.start()
+        else:
+            self.search_requested.emit("")
+
+    def _on_search_timeout(self) -> None:
+        """去抖定时器超时 → 发出搜索请求。"""
+        text = self._search_box.text()
+        self.search_requested.emit(text)
+
+    # ──────────────────────────────────────────────
     # 公开接口
     # ──────────────────────────────────────────────
 
@@ -368,6 +418,20 @@ class Sidebar(QWidget):
     def tree_panel(self) -> TreePanel:
         """返回内部的 TreePanel 实例，供 ChatApp 直接连接信号。"""
         return self._tree_panel
+
+    @property
+    def search_box(self) -> QLineEdit:
+        """返回搜索输入框，供 SearchPopup 定位。"""
+        return self._search_box
+
+    def focus_search(self) -> None:
+        """聚焦搜索框并选中全部文本。"""
+        self._search_box.setFocus()
+        self._search_box.selectAll()
+
+    def clear_search(self) -> None:
+        """清空搜索框内容。"""
+        self._search_box.clear()
 
     def load_tree(self, nodes: list) -> None:
         """

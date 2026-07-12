@@ -69,6 +69,21 @@ class ConversationDetail:
 # ──────────────────────────────────────────────
 
 @dataclass
+class MessageSearchResult:
+    """
+    Core 层消息搜索结果（领域模型）。
+    由 ConversationService.search_messages() 生成，
+    供 Controller 映射为 SearchResultVM。
+    """
+    message_id: str
+    conversation_id: str
+    role: str
+    content: str               # 原始内容（用于 snippet 生成）
+    tree_path: str             # 树路径，如 "项目A/对话1/用户消息"
+    created_at: datetime
+
+
+@dataclass
 class MessageChunk:
     """LLM 流式输出的单个增量块，由 Adapter 生成，Core 透传，Controller 映射为 VM。"""
     delta: str

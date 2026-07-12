@@ -157,6 +157,10 @@ class MessageRepoProtocol(Protocol):
         """按对话 ID 集合批量获取消息，按 created_at 升序排列。"""
         ...
 
+    def get_all_messages(self) -> list[Message]:
+        """返回数据库中所有消息，按 created_at 降序排列。"""
+        ...
+
 
 # ──────────────────────────────────────────────
 # 上下文存储接口

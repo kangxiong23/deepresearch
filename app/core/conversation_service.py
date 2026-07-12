@@ -33,6 +33,7 @@ from app.storage.models import (
     MessageNode,
     Message,
     MessageChunk,
+    MessageSearchResult,
     NodeType,
     Role,
     TreeRoot,
@@ -385,6 +386,61 @@ class ConversationService:
             str — 如 "root/未分类/我的对话"
         """
         return self._tree.get_path(conversation_id)
+
+    def search_messages(
+        self, keywords: list[str]
+    ) -> list[MessageSearchResult]:
+        """
+        在所有消息中搜索关键词（OR 逻辑，大小写不敏感）。
+
+        Args:
+            keywords: 已分割且小写的关键词列表
+
+        Returns:
+            list[MessageSearchResult] — 按 created_at 降序排列
+        """
+        if not keywords:
+            return []
+
+        from app.utils.markdown_utils import strip_for_search
+
+        all_messages = self._msg_repo.get_all_messages()
+        all_msg_nodes = self._tree.get_all_message_nodes()
+
+        node_map: dict[str, MessageNode] = {}
+        for n in all_msg_nodes:
+            node_map[n.message_id] = n
+
+        results: list[MessageSearchResult] = []
+        for msg in all_messages:
+            searchable = strip_for_search(msg.content).lower()
+            if any(kw in searchable for kw in keywords):
+                tree_node = node_map.get(msg.id)
+                if tree_node is not None:
+                    tree_path = self._tree.get_path(tree_node.id)
+                else:
+                    conv_node = self._tree.get_node(msg.conversation_id)
+                    if conv_node is not None:
+                        tree_path = self._tree.get_path(msg.conversation_id)
+                        role_label = (
+                            msg.role.value
+                            if hasattr(msg.role, "value")
+                            else str(msg.role)
+                        )
+                        tree_path = f"{tree_path}/{role_label}"
+                    else:
+                        tree_path = f"?/{msg.id[:8]}"
+
+                results.append(MessageSearchResult(
+                    message_id=msg.id,
+                    conversation_id=msg.conversation_id,
+                    role=msg.role.value if hasattr(msg.role, "value") else str(msg.role),
+                    content=msg.content,
+                    tree_path=tree_path,
+                    created_at=msg.created_at,
+                ))
+
+        return results
 
     # ──────────────────────────────────────────
     # 树节点管理（Phase 4 — 目录/对话通用操作）

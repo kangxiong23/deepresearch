@@ -15,10 +15,12 @@ from PySide6.QtWidgets import (
     QFileDialog,
 )
 from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtGui import QShortcut, QKeySequence
 
 from app.ui.theme import Colors, build_global_stylesheet
 from app.ui.main_window import MainWindow
 from app.ui.widgets.chat_message import ChatMessage, ThinkingBlock
+from app.ui.widgets.search_popup import SearchPopup
 from app.ui.widgets.sidebar import Sidebar
 from app.ui.async_bridge import (
     AsyncStreamWorker,
@@ -60,6 +62,24 @@ class ChatApp:
         # ── 构建主窗口 ──────────────────────────
         self._window = MainWindow()
 
+        # ── 搜索弹窗 ──────────────────────────
+        self._search_popup = SearchPopup(self._window)
+        self._search_popup.result_clicked.connect(
+            self._on_search_result_clicked
+        )
+        self._search_popup.dismissed.connect(
+            self._on_search_popup_dismissed
+        )
+        self._skip_next_anchor_restore = False
+
+        # ── Ctrl+F 快捷键 ───────────────────────
+        self._search_shortcut = QShortcut(
+            QKeySequence("Ctrl+F"), self._window
+        )
+        self._search_shortcut.activated.connect(
+            self._window.sidebar.focus_search
+        )
+
         # ── 应用全局样式表 ─────────────────────
         self._apply_theme()
 
@@ -99,6 +119,7 @@ class ChatApp:
         sidebar.open_trash_clicked.connect(self._handle_open_trash)
         sidebar.open_context_panel_clicked.connect(self._handle_open_context_panel)
         sidebar.open_kg_panel_clicked.connect(self._handle_open_kg_panel)
+        sidebar.search_requested.connect(self._on_search)
 
         # ── TreePanel 信号 ────────────────────────
         tree = sidebar.tree_panel
@@ -206,15 +227,16 @@ class ChatApp:
         msg_list = self._window.message_list
 
         if not scroll_to_bottom:
-            # 刷新前：收集当前消息 ID 列表并保存滚动锚点
-            old_ids = self._get_current_message_ids()
-            msg_list.save_scroll_anchor(old_ids)
+            if self._skip_next_anchor_restore:
+                self._skip_next_anchor_restore = False
+            else:
+                old_ids = self._get_current_message_ids()
+                msg_list.save_scroll_anchor(old_ids)
 
         messages = self._ctrl.on_get_multi_conversation_messages()
         self._rebuild_message_list(messages)
 
         if scroll_to_bottom:
-            # rangeChanged 信号驱动 — 布局完成后滚动到底部
             scrollbar = msg_list._scroll_area.verticalScrollBar()
 
             def _scroll_on_range(min_val: int, max_val: int) -> None:
@@ -232,8 +254,9 @@ class ChatApp:
                     scrollbar.rangeChanged.disconnect(_scroll_on_range)
                 except (TypeError, RuntimeError):
                     pass
+        elif self._skip_next_anchor_restore:
+            self._skip_next_anchor_restore = False
         else:
-            # 滚动锚点恢复 — 延迟到布局完成后
             new_ids = [vm.id for vm in messages if vm.id]
             QTimer.singleShot(0, lambda: QTimer.singleShot(
                 0, lambda: msg_list.restore_scroll_anchor(new_ids)
@@ -872,6 +895,87 @@ class ChatApp:
         """
         self._refresh_kg_panel()
         self._window.show_kg_panel()
+
+    # ── 搜索操作 ────────────────────────────
+
+    def _on_search(self, text: str) -> None:
+        """执行搜索并显示结果弹窗。"""
+        if not text.strip():
+            self._search_popup.hide()
+            return
+
+        try:
+            results = self._ctrl.on_search(text)
+        except Exception as exc:
+            print(f"[UI] Search error: {exc}")
+            return
+
+        search_box = self._window.sidebar.search_box
+        global_pos = search_box.mapToGlobal(
+            search_box.rect().bottomLeft()
+        )
+        self._search_popup.setFixedWidth(search_box.width())
+        self._search_popup.show_results(results, global_pos)
+
+    def _on_search_result_clicked(self, result) -> None:
+        """
+        点击搜索结果：导航到目标消息。
+        1. 关闭弹窗 + 清空搜索框
+        2. 若消息被禁用 → 自动启用
+        3. 展开树到消息节点 + 高亮
+        4. 若新启用了消息 → 重载消息列表（跳过锚点恢复）
+        5. 滚动到消息并高亮
+        """
+        msg_id = result.message_id
+        conv_id = result.conversation_id
+
+        # 关闭弹窗 + 清空搜索框
+        self._search_popup.hide()
+        self._window.sidebar.clear_search()
+
+        # 查找树节点，判断是否需要启用
+        node = self._get_tree_node_by_id(msg_id)
+        needs_enable = node is not None and node.enabled is False
+
+        # 自动启用禁用的消息
+        if needs_enable:
+            try:
+                self._ctrl.on_toggle_enabled(msg_id)
+                tree_nodes = self._ctrl.get_tree()
+                self._tree_nodes = tree_nodes
+                self._window.sidebar.tree_panel.refresh_enabled_states(
+                    tree_nodes
+                )
+            except Exception as exc:
+                print(f"[UI] Auto-enable error: {exc}")
+
+        # 展开树 + 高亮
+        self._window.sidebar.tree_panel.expand_to_node(msg_id)
+        self._window.sidebar.tree_panel.set_active(msg_id)
+
+        # 设置当前发送目标
+        self._current_session_id = conv_id
+
+        # 若启用了新消息 → 重载消息列表
+        if needs_enable:
+            self._skip_next_anchor_restore = True
+            self._load_all_messages(scroll_to_bottom=False)
+
+        # 滚动到消息并高亮
+        self._pending_scroll_target = msg_id
+        delay = 50 if needs_enable else 0
+        QTimer.singleShot(delay, lambda: self._do_scroll_to_target(msg_id))
+
+    def _on_search_popup_dismissed(self) -> None:
+        """搜索弹窗关闭时清除搜索框。"""
+        self._window.sidebar.clear_search()
+
+    def _get_tree_node_by_id(self, node_id: str):
+        """从当前缓存的树节点中查找指定 ID 的节点。"""
+        for n in self._tree_nodes:
+            if n.id == node_id:
+                return n
+        return None
 
     # ── 上下文面板操作 ──────────────────────
 
