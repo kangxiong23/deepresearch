@@ -1,469 +1,774 @@
-# Layer: UI → widgets
+# Layer: UI (PySide6) → widgets
 # File: app/ui/widgets/context_panel.py
-# Flet 0.85 兼容版本
+# Responsibility: 上下文管理面板（右侧滑出抽屉）— 显示已选块列表、保存模板、
+#                 添加文本块、拼接预览、模板库。
+#                 与 Flet 版本 app/ui_flet_legacy/widgets/context_panel.py 功能完全对等。
 
 from __future__ import annotations
 from typing import Callable
-import flet as ft
-from app.ui.theme import Colors, Fonts, Spacing, Radius, Borders
+
+from PySide6.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QFrame,
+    QLabel,
+    QPushButton,
+    QTextEdit,
+    QLineEdit,
+    QScrollArea,
+    QSizePolicy,
+    QCheckBox,
+)
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont
+
+from app.ui.theme import Colors, Fonts, Spacing, Radius
 
 
-class _ContextBlockItem(ft.Container):
+# ──────────────────────────────────────────────
+# 单个上下文块控件
+# ──────────────────────────────────────────────
+
+
+class _ContextBlockRow(QFrame):
+    """
+    上下文块条目行：开关 + 标签 + 预览 + 移除按钮。
+    与 Flet 版本的 _ContextBlockItem 功能完全一致。
+    """
+
+    remove_requested = Signal(str)   # block_id
+    toggled = Signal(str, bool)      # block_id, enabled
+
     def __init__(
         self,
         block_id: str,
         label: str,
         preview: str,
-        on_remove: Callable[[str], None],
-        on_toggle: Callable[[str, bool], None],
         enabled: bool = True,
+        parent: QWidget | None = None,
     ) -> None:
+        super().__init__(parent)
         self._block_id = block_id
-        self._toggle_ref = ft.Ref[ft.Switch]()
 
-        sw = ft.Switch(
-            ref=self._toggle_ref,
-            value=enabled,
-            active_color=Colors.PRIMARY,
-            scale=0.75,
-        )
-        sw.on_change = lambda e: on_toggle(block_id, e.control.value)
-
-        super().__init__(
-            content=ft.Row(
-                controls=[
-                    sw,
-                    ft.Column(
-                        expand=True,
-                        spacing=2,
-                        controls=[
-                            ft.Text(
-                                label,
-                                size=Fonts.SIZE_SM,
-                                color=Colors.TEXT_PRIMARY,
-                                weight=ft.FontWeight.W_500,
-                                max_lines=1,
-                                overflow=ft.TextOverflow.ELLIPSIS,
-                            ),
-                            ft.Text(
-                                preview,
-                                size=Fonts.SIZE_XS,
-                                color=Colors.TEXT_DISABLED,
-                                max_lines=2,
-                                overflow=ft.TextOverflow.ELLIPSIS,
-                                font_family=Fonts.MONO,
-                            ),
-                        ],
-                    ),
-                    ft.IconButton(
-                        icon=ft.Icons.REMOVE_CIRCLE_OUTLINE,
-                        icon_size=16,
-                        icon_color=Colors.ERROR,
-                        tooltip="移除",
-                        style=ft.ButtonStyle(
-                            padding=ft.Padding(left=4, right=4, top=4, bottom=4),
-                        ),
-                        on_click=lambda e: on_remove(block_id),
-                    ),
-                ],
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=Spacing.SM,
-            ),
-            padding=ft.Padding(
-                left=Spacing.SM, right=Spacing.SM,
-                top=Spacing.SM, bottom=Spacing.SM,
-            ),
-            border=ft.Border(bottom=ft.BorderSide(1, Colors.DIVIDER)),
+        # ── 开关 ──────────────────────────────────
+        self._switch = QCheckBox()
+        self._switch.setChecked(enabled)
+        self._switch.setFixedSize(36, 18)
+        self._switch.setStyleSheet(f"""
+            QCheckBox::indicator {{
+                width: 36px;
+                height: 18px;
+                border-radius: 9px;
+                border: 1px solid {Colors.BORDER};
+                background-color: transparent;
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {Colors.PRIMARY};
+                border-color: {Colors.PRIMARY};
+            }}
+        """)
+        self._switch.toggled.connect(
+            lambda val: self.toggled.emit(block_id, val)
         )
 
+        # ── 标签 + 预览 ───────────────────────────
+        label_widget = QLabel(label)
+        label_widget.setFont(Fonts.body(Fonts.SIZE_SM, QFont.Weight.Medium))
+        label_widget.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_PRIMARY};
+                background: transparent;
+                border: none;
+            }}
+        """)
 
-class _TemplateItem(ft.Container):
+        preview_widget = QLabel(preview)
+        preview_widget.setFont(Fonts.mono(Fonts.SIZE_XS))
+        preview_widget.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_DISABLED};
+                background: transparent;
+                border: none;
+            }}
+        """)
+        preview_widget.setWordWrap(True)
+        preview_widget.setMaximumHeight(32)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(2)
+        text_col.addWidget(label_widget)
+        text_col.addWidget(preview_widget)
+
+        # ── 移除按钮 ──────────────────────────────
+        remove_btn = QPushButton("✕")
+        remove_btn.setFont(Fonts.body(12))
+        remove_btn.setFixedSize(22, 22)
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.setToolTip("移除")
+        remove_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.ERROR};
+                background: transparent;
+                border: none;
+                padding: 2px;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.ERROR}22;
+                border-radius: 3px;
+            }}
+        """)
+        remove_btn.clicked.connect(
+            lambda: self.remove_requested.emit(block_id)
+        )
+
+        # ── 行布局 ────────────────────────────────
+        row_layout = QHBoxLayout(self)
+        row_layout.setContentsMargins(Spacing.SM, Spacing.SM, Spacing.SM, Spacing.SM)
+        row_layout.setSpacing(Spacing.SM)
+        row_layout.addWidget(self._switch)
+        row_layout.addLayout(text_col, stretch=1)
+        row_layout.addWidget(remove_btn)
+
+        # ── 底部边框 ──────────────────────────────
+        self.setStyleSheet(f"""
+            _ContextBlockRow {{
+                background-color: transparent;
+                border-bottom: 1px solid {Colors.DIVIDER};
+            }}
+        """)
+
+
+# ──────────────────────────────────────────────
+# 模板条目控件
+# ──────────────────────────────────────────────
+
+
+class _TemplateRow(QFrame):
+    """
+    模板条目行：图标 + 名称 + 描述 + 应用按钮 + 删除按钮。
+    与 Flet 版本的 _TemplateItem 功能完全一致。
+    """
+
+    apply_requested = Signal(str)   # template_id
+    delete_requested = Signal(str)  # template_id
+
     def __init__(
         self,
         template_id: str,
         name: str,
         description: str,
-        on_apply: Callable[[str], None],
-        on_delete: Callable[[str], None] | None = None,
+        parent: QWidget | None = None,
     ) -> None:
-        super().__init__(
-            content=ft.Row(
-                controls=[
-                    ft.Icon(ft.Icons.DESCRIPTION_OUTLINED, size=16, color=Colors.PRIMARY),
-                    ft.Column(
-                        expand=True,
-                        spacing=2,
-                        controls=[
-                            ft.Text(name, size=Fonts.SIZE_SM, color=Colors.TEXT_PRIMARY),
-                            ft.Text(
-                                description,
-                                size=Fonts.SIZE_XS,
-                                color=Colors.TEXT_DISABLED,
-                                max_lines=1,
-                                overflow=ft.TextOverflow.ELLIPSIS,
-                            ),
-                        ],
-                    ),
-                    ft.ElevatedButton(
-                        content=ft.Text(
-                            "应用",
-                            size=Fonts.SIZE_XS,
-                            color=Colors.PRIMARY,
-                            font_family=Fonts.MONO,
-                        ),
-                        style=ft.ButtonStyle(
-                            bgcolor="transparent",
-                            overlay_color=Colors.PRIMARY_GLOW,
-                            side=ft.BorderSide(1, Colors.PRIMARY),
-                            shape=ft.RoundedRectangleBorder(radius=4),
-                            padding=ft.Padding(left=10, right=10, top=4, bottom=4),
-                            elevation=0,
-                        ),
-                        on_click=lambda e: on_apply(template_id),
-                    ),
-                    ft.IconButton(
-                        icon=ft.Icons.DELETE_OUTLINE,
-                        icon_size=14,
-                        icon_color=Colors.ERROR,
-                        tooltip="删除模板",
-                        style=ft.ButtonStyle(
-                            padding=ft.Padding(left=4, right=4, top=4, bottom=4),
-                        ),
-                        on_click=lambda e: on_delete(template_id) if on_delete else None,
-                    ),
-                ],
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=Spacing.SM,
-            ),
-            padding=ft.Padding(
-                left=Spacing.MD, right=Spacing.MD,
-                top=Spacing.SM, bottom=Spacing.SM,
-            ),
-            border=ft.Border(bottom=ft.BorderSide(1, Colors.DIVIDER)),
+        super().__init__(parent)
+        self._template_id = template_id
+
+        # ── 图标 ──────────────────────────────────
+        icon_label = QLabel("📄")
+        icon_label.setFont(Fonts.body(14))
+        icon_label.setFixedWidth(20)
+        icon_label.setStyleSheet("QLabel { background: transparent; border: none; }")
+
+        # ── 名称 + 描述 ───────────────────────────
+        name_widget = QLabel(name)
+        name_widget.setFont(Fonts.body(Fonts.SIZE_SM))
+        name_widget.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_PRIMARY};
+                background: transparent;
+                border: none;
+            }}
+        """)
+
+        desc_widget = QLabel(description)
+        desc_widget.setFont(Fonts.body(Fonts.SIZE_XS))
+        desc_widget.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_DISABLED};
+                background: transparent;
+                border: none;
+            }}
+        """)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(2)
+        text_col.addWidget(name_widget)
+        if description:
+            text_col.addWidget(desc_widget)
+
+        # ── 应用按钮 ──────────────────────────────
+        apply_btn = QPushButton("应用")
+        apply_btn.setFont(Fonts.mono(Fonts.SIZE_XS))
+        apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.PRIMARY};
+                background-color: transparent;
+                border: 1px solid {Colors.PRIMARY};
+                border-radius: {Radius.SM}px;
+                padding: 4px 10px;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.PRIMARY_GLOW};
+            }}
+        """)
+        apply_btn.clicked.connect(
+            lambda: self.apply_requested.emit(template_id)
         )
 
+        # ── 删除按钮 ──────────────────────────────
+        delete_btn = QPushButton("🗑")
+        delete_btn.setFont(Fonts.body(10))
+        delete_btn.setFixedSize(22, 22)
+        delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        delete_btn.setToolTip("删除模板")
+        delete_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.ERROR};
+                background: transparent;
+                border: none;
+                padding: 2px;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.ERROR}22;
+                border-radius: 3px;
+            }}
+        """)
+        delete_btn.clicked.connect(
+            lambda: self.delete_requested.emit(template_id)
+        )
 
-class ContextPanel(ft.Container):
+        # ── 行布局 ────────────────────────────────
+        row_layout = QHBoxLayout(self)
+        row_layout.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
+        row_layout.setSpacing(Spacing.SM)
+        row_layout.addWidget(icon_label)
+        row_layout.addLayout(text_col, stretch=1)
+        row_layout.addWidget(apply_btn)
+        row_layout.addWidget(delete_btn)
+
+        self.setStyleSheet(f"""
+            _TemplateRow {{
+                background-color: transparent;
+                border-bottom: 1px solid {Colors.DIVIDER};
+            }}
+        """)
+
+
+# ──────────────────────────────────────────────
+# 上下文管理面板主体
+# ──────────────────────────────────────────────
+
+
+class ContextPanel(QWidget):
     """
-    上下文管理面板（右侧抽屉）。
+    上下文管理面板（右侧滑出抽屉，380px 宽）。
 
-    公开接口：show() / hide() / load_blocks() / load_templates() / set_preview()
+    公开接口：
+        show_panel()           — 显示面板
+        hide_panel()           — 隐藏面板
+        load_blocks(items)     — 加载上下文块列表
+        load_templates(items)  — 加载模板列表
+        set_preview(text)      — 更新拼接预览
+
+    信号：
+        remove_block(str)          — 移除上下文块（block_id）
+        toggle_block(str, bool)    — 切换块启用状态
+        add_text_block(str)        — 添加自定义文本块（内容文本）
+        save_as_template(str)      — 保存当前块为模板（模板名称）
+        apply_template(str)        — 应用模板（template_id）
+        delete_template(str)       — 删除模板（template_id）
+        close_requested()          — 关闭面板
     """
 
-    def __init__(
-        self,
-        on_remove_block: Callable[[str], None],
-        on_toggle_block: Callable[[str, bool], None],
-        on_apply_template: Callable[[str], None],
-        on_delete_template: Callable[[str], None] | None = None,
-        on_close: Callable[[], None] = lambda: None,
-        on_add_text_block: Callable[[str], None] = lambda x: None,
-    ) -> None:
-        self._on_remove_block = on_remove_block
-        self._on_toggle_block = on_toggle_block
-        self._on_apply_template = on_apply_template
-        self._on_delete_template = on_delete_template
-        self._on_close = on_close
-        self._blocks_list_ref = ft.Ref[ft.ListView]()
-        self._templates_list_ref = ft.Ref[ft.ListView]()
-        self._preview_ref = ft.Ref[ft.Text]()
-        self._new_block_tf_ref = ft.Ref[ft.TextField]()
+    remove_block = Signal(str)
+    toggle_block = Signal(str, bool)
+    add_text_block = Signal(str)
+    save_as_template = Signal(str)
+    apply_template = Signal(str)
+    delete_template = Signal(str)
+    close_requested = Signal()
 
-        header = ft.Container(
-            content=ft.Row(
-                controls=[
-                    ft.Icon(ft.Icons.LAYERS_OUTLINED, size=18, color=Colors.PRIMARY),
-                    ft.Text(
-                        "上下文管理",
-                        size=Fonts.SIZE_LG,
-                        color=Colors.TEXT_PRIMARY,
-                        weight=ft.FontWeight.W_600,
-                        font_family=Fonts.MONO,
-                    ),
-                    ft.Container(expand=True),
-                    ft.IconButton(
-                        icon=ft.Icons.CLOSE,
-                        icon_size=18,
-                        icon_color=Colors.TEXT_SECONDARY,
-                        tooltip="关闭",
-                        on_click=lambda e: on_close(),
-                        style=ft.ButtonStyle(
-                            padding=ft.Padding(left=6, right=6, top=6, bottom=6),
-                        ),
-                    ),
-                ],
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=Spacing.SM,
-            ),
-            padding=ft.Padding(
-                left=Spacing.LG, right=Spacing.MD,
-                top=Spacing.MD, bottom=Spacing.MD,
-            ),
-            border=Borders.BOTTOM_ONLY,
-        )
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("contextPanel")
+        self.setFixedWidth(380)
 
-        blocks_section = ft.Column(
-            spacing=0,
-            controls=[
-                ft.Container(
-                    content=ft.Text(
-                        "已选上下文块",
-                        size=Fonts.SIZE_XS,
-                        font_family=Fonts.MONO,
-                        color=Colors.TEXT_DISABLED,
-                    ),
-                    padding=ft.Padding(
-                        left=Spacing.LG, right=Spacing.LG,
-                        top=Spacing.MD, bottom=Spacing.SM,
-                    ),
-                ),
-                ft.ListView(
-                    ref=self._blocks_list_ref,
-                    height=200,
-                    spacing=0,
-                    padding=ft.Padding(
-                        left=Spacing.MD, right=Spacing.MD,
-                        top=0, bottom=0,
-                    ),
-                ),
-            ],
-        )
+        # ── 头部 ──────────────────────────────────
+        header = self._build_header()
 
-        new_block_tf = ft.TextField(
-            ref=self._new_block_tf_ref,
-            hint_text="输入自定义上下文内容...",
-            hint_style=ft.TextStyle(color=Colors.TEXT_DISABLED, size=Fonts.SIZE_SM),
-            multiline=True,
-            min_lines=2,
-            max_lines=5,
-            expand=True,
-            border_color=Colors.BORDER,
-            focused_border_color=Colors.PRIMARY,
-            bgcolor=Colors.BG_ELEVATED,
-            text_style=ft.TextStyle(color=Colors.TEXT_PRIMARY, size=Fonts.SIZE_SM),
-            border_radius=8,
-            content_padding=ft.Padding(
-                left=Spacing.MD, right=Spacing.MD,
-                top=Spacing.SM, bottom=Spacing.SM,
-            ),
-        )
+        # ── 已选上下文块区域 ──────────────────────
+        blocks_section = self._build_blocks_section()
 
-        self._template_name_ref = ft.Ref[ft.TextField]()
+        # ── 保存为模板区域 ────────────────────────
+        save_template_section = self._build_save_template_section()
 
-        save_template_section = ft.Container(
-            content=ft.Row(
-                controls=[
-                    ft.TextField(
-                        ref=self._template_name_ref,
-                        hint_text="输入模板名称，保存当前块为模板...",
-                        hint_style=ft.TextStyle(color=Colors.TEXT_DISABLED, size=Fonts.SIZE_XS),
-                        expand=True,
-                        border_color=Colors.BORDER,
-                        focused_border_color=Colors.PRIMARY,
-                        bgcolor=Colors.BG_ELEVATED,
-                        text_style=ft.TextStyle(color=Colors.TEXT_PRIMARY, size=Fonts.SIZE_XS),
-                        border_radius=6,
-                        content_padding=ft.Padding(left=8, right=8, top=6, bottom=6),
-                    ),
-                    ft.IconButton(
-                        icon=ft.Icons.BOOKMARK_ADD_OUTLINED,
-                        icon_color=Colors.ACCENT,
-                        icon_size=18,
-                        tooltip="保存为模板",
-                        on_click=lambda e: self._handle_save_template(on_apply_template),
-                    ),
-                ],
-                spacing=Spacing.SM,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            ),
-            padding=ft.Padding(left=Spacing.LG, right=Spacing.LG, top=Spacing.SM, bottom=Spacing.SM),
-            border=Borders.BOTTOM_ONLY,
-        )
+        # ── 添加文本块区域 ────────────────────────
+        add_block_section = self._build_add_block_section()
 
-        add_block_section = ft.Container(
-            content=ft.Column(
-                spacing=Spacing.SM,
-                controls=[
-                    ft.Text(
-                        "添加文本块",
-                        size=Fonts.SIZE_XS,
-                        font_family=Fonts.MONO,
-                        color=Colors.TEXT_DISABLED,
-                    ),
-                    ft.Row(
-                        controls=[
-                            new_block_tf,
-                            ft.IconButton(
-                                icon=ft.Icons.ADD_CIRCLE_OUTLINE,
-                                icon_color=Colors.PRIMARY,
-                                icon_size=20,
-                                tooltip="添加",
-                                on_click=lambda e: self._handle_add_block(on_add_text_block),
-                            ),
-                        ],
-                        vertical_alignment=ft.CrossAxisAlignment.END,
-                        spacing=Spacing.SM,
-                    ),
-                ],
-            ),
-            padding=ft.Padding(
-                left=Spacing.LG, right=Spacing.LG,
-                top=Spacing.MD, bottom=Spacing.MD,
-            ),
-            border=Borders.BOTTOM_ONLY,
-        )
+        # ── 拼接预览区域 ─────────────────────────
+        preview_section = self._build_preview_section()
 
-        preview_section = ft.Column(
-            spacing=0,
-            controls=[
-                ft.Container(
-                    content=ft.Text(
-                        "拼接预览",
-                        size=Fonts.SIZE_XS,
-                        font_family=Fonts.MONO,
-                        color=Colors.TEXT_DISABLED,
-                    ),
-                    padding=ft.Padding(
-                        left=Spacing.LG, right=Spacing.LG,
-                        top=Spacing.MD, bottom=Spacing.SM,
-                    ),
-                ),
-                ft.Container(
-                    content=ft.Text(
-                        ref=self._preview_ref,
-                        value="（尚无上下文）",
-                        size=Fonts.SIZE_XS,
-                        font_family=Fonts.MONO,
-                        color=Colors.TEXT_CODE,
-                    ),
-                    height=120,
-                    padding=ft.Padding(
-                        left=Spacing.LG, right=Spacing.LG,
-                        top=Spacing.SM, bottom=Spacing.SM,
-                    ),
-                    bgcolor=Colors.BG_BASE,
-                    border=ft.Border(
-                        top=ft.BorderSide(1, Colors.DIVIDER),
-                        bottom=ft.BorderSide(1, Colors.DIVIDER),
-                        left=ft.BorderSide(2, Colors.PRIMARY_DIM),
-                        right=ft.BorderSide(1, Colors.DIVIDER),
-                    ),
-                ),
-            ],
-        )
+        # ── 模板库区域 ────────────────────────────
+        templates_section = self._build_templates_section()
 
-        templates_section = ft.Column(
-            spacing=0,
-            controls=[
-                ft.Container(
-                    content=ft.Text(
-                        "模板库",
-                        size=Fonts.SIZE_XS,
-                        font_family=Fonts.MONO,
-                        color=Colors.TEXT_DISABLED,
-                    ),
-                    padding=ft.Padding(
-                        left=Spacing.LG, right=Spacing.LG,
-                        top=Spacing.MD, bottom=Spacing.SM,
-                    ),
-                ),
-                ft.ListView(
-                    ref=self._templates_list_ref,
-                    height=180,
-                    spacing=0,
-                    padding=ft.Padding(left=0, right=0, top=0, bottom=0),
-                ),
-            ],
-        )
+        # ── 整体布局（可滚动）─────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: transparent;
+                border: none;
+            }}
+        """)
 
-        super().__init__(
-            content=ft.Column(
-                controls=[
-                    header,
-                    blocks_section,
-                    save_template_section,
-                    add_block_section,
-                    preview_section,
-                    templates_section,
-                ],
-                spacing=0,
-                scroll=ft.ScrollMode.AUTO,
-            ),
-            width=380,
-            bgcolor=Colors.BG_SURFACE,
-            border=ft.Border(
-                left=ft.BorderSide(1, Colors.BORDER),
-                top=ft.BorderSide(0, "transparent"),
-                right=ft.BorderSide(0, "transparent"),
-                bottom=ft.BorderSide(0, "transparent"),
-            ),
-            visible=False,
-        )
+        content = QWidget()
+        content.setStyleSheet("QWidget { background-color: transparent; }")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+        content_layout.addWidget(header)
+        content_layout.addWidget(blocks_section)
+        content_layout.addWidget(save_template_section)
+        content_layout.addWidget(add_block_section)
+        content_layout.addWidget(preview_section)
+        content_layout.addWidget(templates_section)
+        content_layout.addStretch()
 
-    def _handle_save_template(self, on_apply) -> None:
-        """把当前所有块保存为新模板（名称由用户输入）。"""
-        if not self._template_name_ref.current:
-            return
-        name = self._template_name_ref.current.value.strip()
-        if not name:
-            return
-        # 通知外部（app.py 会调用 controller 保存）
-        # 这里通过一个特殊 id 传递保存指令
-        on_apply(f"__save__:{name}")
-        self._template_name_ref.current.value = ""
-        self._template_name_ref.current.update()
+        scroll.setWidget(content)
 
-    def _handle_add_block(self, callback: Callable[[str], None]) -> None:
-        if not self._new_block_tf_ref.current:
-            return
-        text = self._new_block_tf_ref.current.value.strip()
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        main_layout.addWidget(scroll)
+
+        # ── 整体样式 ──────────────────────────────
+        self.setStyleSheet(f"""
+            ContextPanel {{
+                background-color: {Colors.BG_SURFACE};
+                border-left: 1px solid {Colors.BORDER};
+            }}
+        """)
+
+        # 默认隐藏
+        self.setVisible(False)
+
+    # ── 头部 ──────────────────────────────────────
+
+    def _build_header(self) -> QWidget:
+        """构建面板头部。"""
+        header = QWidget()
+        header.setStyleSheet(f"""
+            QWidget {{
+                background-color: transparent;
+                border-bottom: 1px solid {Colors.DIVIDER};
+            }}
+        """)
+
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(Spacing.LG, Spacing.MD, Spacing.MD, Spacing.MD)
+        layout.setSpacing(Spacing.SM)
+
+        icon = QLabel("📚")
+        icon.setFont(Fonts.body(18))
+        icon.setStyleSheet("background: transparent; border: none;")
+
+        title = QLabel("上下文管理")
+        title.setFont(Fonts.mono(Fonts.SIZE_LG, QFont.Weight.DemiBold))
+        title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; background: transparent; border: none;")
+
+        layout.addWidget(icon)
+        layout.addWidget(title)
+        layout.addStretch()
+
+        close_btn = QPushButton("✕")
+        close_btn.setFont(Fonts.body(14))
+        close_btn.setFixedSize(28, 28)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setToolTip("关闭")
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.TEXT_SECONDARY};
+                background: transparent;
+                border: none;
+                padding: 4px;
+            }}
+            QPushButton:hover {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.BG_OVERLAY};
+                border-radius: 4px;
+            }}
+        """)
+        close_btn.clicked.connect(self.close_requested.emit)
+        layout.addWidget(close_btn)
+
+        return header
+
+    # ── 已选上下文块区域 ─────────────────────────
+
+    def _build_blocks_section(self) -> QWidget:
+        """构建已选上下文块列表区域。"""
+        section = QWidget()
+        section.setStyleSheet("QWidget { background-color: transparent; }")
+
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 节标题
+        section_label = QLabel("已选上下文块")
+        section_label.setFont(Fonts.mono(Fonts.SIZE_XS))
+        section_label.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_DISABLED};
+                background: transparent;
+                border: none;
+                padding: {Spacing.MD}px {Spacing.LG}px {Spacing.SM}px {Spacing.LG}px;
+            }}
+        """)
+        layout.addWidget(section_label)
+
+        # 块列表容器
+        self._blocks_container = QWidget()
+        self._blocks_container.setStyleSheet("QWidget { background-color: transparent; }")
+        self._blocks_layout = QVBoxLayout(self._blocks_container)
+        self._blocks_layout.setContentsMargins(0, 0, 0, 0)
+        self._blocks_layout.setSpacing(0)
+
+        # 固定高度的滚动区域
+        blocks_scroll = QScrollArea()
+        blocks_scroll.setWidgetResizable(True)
+        blocks_scroll.setFixedHeight(200)
+        blocks_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        blocks_scroll.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: transparent;
+                border: none;
+            }}
+        """)
+        blocks_scroll.setWidget(self._blocks_container)
+
+        inner_layout = QVBoxLayout()
+        inner_layout.setContentsMargins(Spacing.MD, 0, Spacing.MD, 0)
+        inner_layout.setSpacing(0)
+        inner_layout.addWidget(blocks_scroll)
+        layout.addLayout(inner_layout)
+
+        return section
+
+    # ── 保存为模板区域 ───────────────────────────
+
+    def _build_save_template_section(self) -> QWidget:
+        """构建保存为模板区域。"""
+        section = QWidget()
+        section.setStyleSheet(f"""
+            QWidget {{
+                background-color: transparent;
+                border-bottom: 1px solid {Colors.DIVIDER};
+            }}
+        """)
+
+        layout = QHBoxLayout(section)
+        layout.setContentsMargins(Spacing.LG, Spacing.SM, Spacing.LG, Spacing.SM)
+        layout.setSpacing(Spacing.SM)
+
+        self._template_name_input = QLineEdit()
+        self._template_name_input.setPlaceholderText("输入模板名称，保存当前块为模板...")
+        self._template_name_input.setFont(Fonts.body(Fonts.SIZE_XS))
+        self._template_name_input.setStyleSheet(f"""
+            QLineEdit {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.BG_ELEVATED};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                padding: 6px 8px;
+            }}
+            QLineEdit:focus {{
+                border-color: {Colors.PRIMARY};
+            }}
+        """)
+
+        save_btn = QPushButton("🔖")
+        save_btn.setFont(Fonts.body(14))
+        save_btn.setFixedSize(32, 32)
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setToolTip("保存为模板")
+        save_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.ACCENT};
+                background: transparent;
+                border: none;
+                padding: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.BG_OVERLAY};
+                border-radius: 4px;
+            }}
+        """)
+        save_btn.clicked.connect(self._on_save_template)
+
+        layout.addWidget(self._template_name_input, stretch=1)
+        layout.addWidget(save_btn)
+
+        return section
+
+    def _on_save_template(self) -> None:
+        """保存为模板按钮：发送模板名称。"""
+        name = self._template_name_input.text().strip()
+        if name:
+            self.save_as_template.emit(name)
+            self._template_name_input.clear()
+
+    # ── 添加文本块区域 ───────────────────────────
+
+    def _build_add_block_section(self) -> QWidget:
+        """构建添加文本块区域。"""
+        section = QWidget()
+        section.setStyleSheet(f"""
+            QWidget {{
+                background-color: transparent;
+                border-bottom: 1px solid {Colors.DIVIDER};
+            }}
+        """)
+
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD)
+        layout.setSpacing(Spacing.SM)
+
+        section_label = QLabel("添加文本块")
+        section_label.setFont(Fonts.mono(Fonts.SIZE_XS))
+        section_label.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_DISABLED};
+                background: transparent;
+                border: none;
+            }}
+        """)
+        layout.addWidget(section_label)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(Spacing.SM)
+
+        self._new_block_input = QTextEdit()
+        self._new_block_input.setPlaceholderText("输入自定义上下文内容...")
+        self._new_block_input.setFont(Fonts.body(Fonts.SIZE_SM))
+        self._new_block_input.setMinimumHeight(48)
+        self._new_block_input.setMaximumHeight(100)
+        self._new_block_input.setStyleSheet(f"""
+            QTextEdit {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.BG_ELEVATED};
+                border: 1px solid {Colors.BORDER};
+                border-radius: {Radius.MD}px;
+                padding: {Spacing.SM}px {Spacing.MD}px;
+            }}
+            QTextEdit:focus {{
+                border-color: {Colors.PRIMARY};
+            }}
+        """)
+
+        add_btn = QPushButton("＋")
+        add_btn.setFont(Fonts.body(18))
+        add_btn.setFixedSize(36, 36)
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setToolTip("添加")
+        add_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.PRIMARY};
+                background: transparent;
+                border: none;
+                padding: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.PRIMARY_GLOW};
+                border-radius: 4px;
+            }}
+        """)
+        add_btn.clicked.connect(self._on_add_block)
+
+        input_row.addWidget(self._new_block_input, stretch=1)
+        input_row.addWidget(add_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        layout.addLayout(input_row)
+
+        return section
+
+    def _on_add_block(self) -> None:
+        """添加文本块按钮：发送内容文本。"""
+        text = self._new_block_input.toPlainText().strip()
         if text:
-            callback(text)
-            self._new_block_tf_ref.current.value = ""
-            self._new_block_tf_ref.current.update()
+            self.add_text_block.emit(text)
+            self._new_block_input.clear()
 
-    def show(self) -> None:
-        self.visible = True
-        self.update()
+    # ── 拼接预览区域 ─────────────────────────────
 
-    def hide(self) -> None:
-        self.visible = False
-        self.update()
+    def _build_preview_section(self) -> QWidget:
+        """构建拼接预览区域。"""
+        section = QWidget()
+        section.setStyleSheet("QWidget { background-color: transparent; }")
 
-    def load_blocks(self, items: list) -> None:
-        if not self._blocks_list_ref.current:
-            return
-        self._blocks_list_ref.current.controls.clear()
-        for vm in items:
-            self._blocks_list_ref.current.controls.append(
-                _ContextBlockItem(
-                    block_id=vm.id,
-                    label=vm.label,
-                    preview=vm.preview,
-                    enabled=getattr(vm, "enabled", True),
-                    on_remove=self._on_remove_block,
-                    on_toggle=self._on_toggle_block,
-                )
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        section_label = QLabel("拼接预览")
+        section_label.setFont(Fonts.mono(Fonts.SIZE_XS))
+        section_label.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_DISABLED};
+                background: transparent;
+                border: none;
+                padding: {Spacing.MD}px {Spacing.LG}px {Spacing.SM}px {Spacing.LG}px;
+            }}
+        """)
+        layout.addWidget(section_label)
+
+        self._preview_text = QLabel("（尚无上下文）")
+        self._preview_text.setFont(Fonts.mono(Fonts.SIZE_XS))
+        self._preview_text.setWordWrap(True)
+        self._preview_text.setFixedHeight(120)
+        self._preview_text.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_CODE};
+                background-color: {Colors.BG_BASE};
+                border-top: 1px solid {Colors.DIVIDER};
+                border-bottom: 1px solid {Colors.DIVIDER};
+                border-left: 2px solid {Colors.PRIMARY_DIM};
+                border-right: 1px solid {Colors.DIVIDER};
+                padding: {Spacing.SM}px {Spacing.LG}px;
+            }}
+        """)
+        layout.addWidget(self._preview_text)
+
+        return section
+
+    # ── 模板库区域 ───────────────────────────────
+
+    def _build_templates_section(self) -> QWidget:
+        """构建模板库区域。"""
+        section = QWidget()
+        section.setStyleSheet("QWidget { background-color: transparent; }")
+
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        section_label = QLabel("模板库")
+        section_label.setFont(Fonts.mono(Fonts.SIZE_XS))
+        section_label.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_DISABLED};
+                background: transparent;
+                border: none;
+                padding: {Spacing.MD}px {Spacing.LG}px {Spacing.SM}px {Spacing.LG}px;
+            }}
+        """)
+        layout.addWidget(section_label)
+
+        # 模板列表容器
+        self._templates_container = QWidget()
+        self._templates_container.setStyleSheet("QWidget { background-color: transparent; }")
+        self._templates_layout = QVBoxLayout(self._templates_container)
+        self._templates_layout.setContentsMargins(0, 0, 0, 0)
+        self._templates_layout.setSpacing(0)
+
+        templates_scroll = QScrollArea()
+        templates_scroll.setWidgetResizable(True)
+        templates_scroll.setFixedHeight(180)
+        templates_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        templates_scroll.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: transparent;
+                border: none;
+            }}
+        """)
+        templates_scroll.setWidget(self._templates_container)
+        layout.addWidget(templates_scroll)
+
+        return section
+
+    # ──────────────────────────────────────────────
+    # 公开接口
+    # ──────────────────────────────────────────────
+
+    def show_panel(self) -> None:
+        """显示面板。"""
+        self.setVisible(True)
+
+    def hide_panel(self) -> None:
+        """隐藏面板。"""
+        self.setVisible(False)
+
+    def is_visible(self) -> bool:
+        """面板是否可见。"""
+        return self.isVisible()
+
+    def load_blocks(self, items: list[dict]) -> None:
+        """
+        加载上下文块列表。
+
+        Args:
+            items: dict 列表，每项含 id, label, preview, enabled
+        """
+        # 清除旧条目
+        self._clear_layout(self._blocks_layout)
+
+        for block in items:
+            row = _ContextBlockRow(
+                block_id=block.get("id", ""),
+                label=block.get("label", ""),
+                preview=block.get("preview", ""),
+                enabled=block.get("enabled", True),
             )
-        self._blocks_list_ref.current.update()
+            row.remove_requested.connect(self.remove_block.emit)
+            row.toggled.connect(self.toggle_block.emit)
+            self._blocks_layout.addWidget(row)
 
-    def load_templates(self, items: list) -> None:
-        if not self._templates_list_ref.current:
-            return
-        self._templates_list_ref.current.controls.clear()
-        for vm in items:
-            self._templates_list_ref.current.controls.append(
-                _TemplateItem(
-                    template_id=vm.id,
-                    name=vm.name,
-                    description=getattr(vm, "description", ""),
-                    on_apply=self._on_apply_template,
-                    on_delete=self._on_delete_template,
-                )
+        self._blocks_layout.addStretch()
+
+    def load_templates(self, items: list[dict]) -> None:
+        """
+        加载模板列表。
+
+        Args:
+            items: dict 列表，每项含 id, name, description
+        """
+        self._clear_layout(self._templates_layout)
+
+        for tmpl in items:
+            row = _TemplateRow(
+                template_id=tmpl.get("id", ""),
+                name=tmpl.get("name", ""),
+                description=tmpl.get("description", ""),
             )
-        self._templates_list_ref.current.update()
+            row.apply_requested.connect(self.apply_template.emit)
+            row.delete_requested.connect(self.delete_template.emit)
+            self._templates_layout.addWidget(row)
+
+        self._templates_layout.addStretch()
 
     def set_preview(self, text: str) -> None:
-        if self._preview_ref.current:
-            self._preview_ref.current.value = text or "（尚无上下文）"
-            self._preview_ref.current.update()
+        """
+        更新拼接预览文本。
+
+        Args:
+            text: 预览文本内容
+        """
+        self._preview_text.setText(text or "（尚无上下文）")
+
+    @staticmethod
+    def _clear_layout(layout) -> None:
+        """清空布局中的所有子控件。"""
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+            # 如果还有子布局，递归清除
+            sub_layout = item.layout()
+            if sub_layout:
+                ContextPanel._clear_layout(sub_layout)
+                sub_layout.deleteLater()

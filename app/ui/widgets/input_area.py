@@ -1,430 +1,555 @@
-# Layer: UI → widgets
+# Layer: UI (PySide6) → widgets
 # File: app/ui/widgets/input_area.py
-# Responsibility: 底部输入区复合体——输入框、模型切换、思考/搜索开关、文件上传、发送/停止按钮
-# Flet 0.85 兼容版本
+# Responsibility: 底部输入区 — 输入框、模型切换、思考/搜索开关、文件上传、发送/停止按钮
+# 与 Flet 版本 app/ui_flet_legacy/widgets/input_area.py 视觉完全一致
 
 from __future__ import annotations
-from typing import Callable
-import threading
-import flet as ft
+
+from PySide6.QtWidgets import (
+    QFrame,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QTextEdit,
+    QPushButton,
+    QComboBox,
+    QLabel,
+    QSizePolicy,
+    QFileDialog,
+)
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont, QKeyEvent, QTextOption
+
 import config as app_config
 from app.ui.theme import Colors, Fonts, Spacing, Radius
 
 
-class _ToggleChip(ft.Container):
+# ──────────────────────────────────────────────
+# 开关芯片（Toggle Chip）
+# ──────────────────────────────────────────────
+
+
+class ToggleChip(QPushButton):
+    """
+    自定义开关按钮。与原 Flet 版本 _ToggleChip 视觉完全一致。
+
+    信号：
+        toggled(bool) — 状态变化时发出
+    """
+
+    toggled = Signal(bool)
+
     def __init__(
         self,
         label: str,
         icon: str,
         active_color: str,
         initial: bool = False,
-        on_change: Callable[[bool], None] | None = None,
+        parent: QWidget | None = None,
     ) -> None:
-        self._active = initial
-        self._active_color = active_color
-        self._on_change = on_change
-        self._label_ref = ft.Ref[ft.Text]()
-        self._icon_ref = ft.Ref[ft.Icon]()
+        super().__init__(parent)
+        self._active: bool = initial
+        self._active_color: str = active_color
+        self._label: str = label
+        self._icon: str = icon
 
-        super().__init__(
-            content=ft.Row(
-                controls=[
-                    ft.Icon(
-                        icon,
-                        ref=self._icon_ref,
-                        size=14,
-                        color=active_color if initial else Colors.TEXT_DISABLED,
-                    ),
-                    ft.Text(
-                        ref=self._label_ref,
-                        value=label,
-                        size=Fonts.SIZE_XS,
-                        font_family=Fonts.MONO,
-                        color=active_color if initial else Colors.TEXT_DISABLED,
-                    ),
-                ],
-                tight=True,
-                spacing=4,
-            ),
-            padding=ft.Padding(left=8, right=8, top=4, bottom=4),
-            border=ft.Border(
-                top=ft.BorderSide(1, active_color if initial else Colors.BORDER),
-                bottom=ft.BorderSide(1, active_color if initial else Colors.BORDER),
-                left=ft.BorderSide(1, active_color if initial else Colors.BORDER),
-                right=ft.BorderSide(1, active_color if initial else Colors.BORDER),
-            ),
-            border_radius=Radius.SM,
-            bgcolor=f"{active_color}22" if initial else "transparent",
-            on_click=self._toggle,
-        )
+        self.setText(f"  {icon}  {label}")
+        self.setFont(Fonts.mono(Fonts.SIZE_XS))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setCheckable(False)
+        self.clicked.connect(self._toggle)
 
-    def _toggle(self, e) -> None:
+        self._apply_style()
+        self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+
+    def _toggle(self) -> None:
+        """切换状态。"""
         self._active = not self._active
-        color = self._active_color if self._active else Colors.TEXT_DISABLED
-        border_color = self._active_color if self._active else Colors.BORDER
-        self.bgcolor = f"{self._active_color}22" if self._active else "transparent"
-        self.border = ft.Border(
-            top=ft.BorderSide(1, border_color),
-            bottom=ft.BorderSide(1, border_color),
-            left=ft.BorderSide(1, border_color),
-            right=ft.BorderSide(1, border_color),
-        )
-        if self._icon_ref.current:
-            self._icon_ref.current.color = color
-        if self._label_ref.current:
-            self._label_ref.current.color = color
-        e.control.update()
-        if self._on_change:
-            self._on_change(self._active)
+        self._apply_style()
+        self.toggled.emit(self._active)
+
+    def _apply_style(self) -> None:
+        """根据当前状态更新样式。"""
+        if self._active:
+            border_color = self._active_color
+            text_color = self._active_color
+            bg = f"{self._active_color}22"
+        else:
+            border_color = Colors.BORDER
+            text_color = Colors.TEXT_DISABLED
+            bg = "transparent"
+
+        self.setStyleSheet(f"""
+            QPushButton {{
+                color: {text_color};
+                background-color: {bg};
+                border: 1px solid {border_color};
+                border-radius: {Radius.SM}px;
+                padding: 4px 8px;
+            }}
+            QPushButton:hover {{
+                border-color: {self._active_color};
+            }}
+        """)
 
     @property
     def value(self) -> bool:
+        """当前激活状态。"""
         return self._active
 
     def set_value(self, val: bool) -> None:
+        """程序化设置状态（不触发信号）。"""
         if self._active != val:
             self._active = val
-            color = self._active_color if val else Colors.TEXT_DISABLED
-            border_color = self._active_color if val else Colors.BORDER
-            self.bgcolor = f"{self._active_color}22" if val else "transparent"
-            self.border = ft.Border(
-                top=ft.BorderSide(1, border_color),
-                bottom=ft.BorderSide(1, border_color),
-                left=ft.BorderSide(1, border_color),
-                right=ft.BorderSide(1, border_color),
-            )
-            if self._icon_ref.current:
-                self._icon_ref.current.color = color
-            if self._label_ref.current:
-                self._label_ref.current.color = color
+            self._apply_style()
 
 
-class _ModelSelector(ft.Container):
-    """下拉模型选择，写入 app_config.model_type"""
+# ──────────────────────────────────────────────
+# 模型选择器
+# ──────────────────────────────────────────────
+
+
+class ModelSelector(QComboBox):
+    """
+    模型下拉选择。与原 Flet 版本 _ModelSelector 功能完全一致。
+
+    写入 app_config.model_type，通知 on_change 回调。
+    """
+
+    model_changed = Signal(str)
 
     _MODEL_OPTIONS = [
         ("deepseek-v4-flash", "Flash"),
         ("deepseek-v4-pro", "Pro"),
     ]
 
-    def __init__(self, on_change: Callable[[str], None] | None = None) -> None:
-        self._on_change = on_change
-        current = getattr(app_config, "model_type", "deepseek-v4-flash")
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        current = getattr(app_config, "model_type", "deepseek-v4-pro")
 
-        options = [
-            ft.dropdown.Option(key=k, text=v)
-            for k, v in self._MODEL_OPTIONS
-        ]
+        for key, label in self._MODEL_OPTIONS:
+            self.addItem(label, key)
 
-        self._dd = ft.Dropdown(
-            value=current,
-            options=options,
-            width=150,
-            text_size=Fonts.SIZE_SM,
-            text_style=ft.TextStyle(
-                font_family=Fonts.MONO,
-                color=Colors.TEXT_PRIMARY,
-            ),
-            bgcolor=Colors.BG_ELEVATED,
-            border_color=Colors.BORDER,
-            focused_border_color=Colors.PRIMARY,
-            border_radius=8,
-            content_padding=ft.Padding(left=10, right=10, top=6, bottom=6),
-        )
-        self._dd.on_change = self._handle_change
-        super().__init__(content=self._dd)
+        # 设置当前选中项
+        for i in range(self.count()):
+            if self.itemData(i) == current:
+                self.setCurrentIndex(i)
+                break
 
-    def _handle_change(self, e) -> None:
-        app_config.model_type = e.control.value
-        if self._on_change:
-            self._on_change(e.control.value)
+        self.setFont(Fonts.mono(Fonts.SIZE_SM))
+        self.setFixedWidth(150)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(f"""
+            QComboBox {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.BG_ELEVATED};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 8px;
+                padding: 6px 10px;
+            }}
+            QComboBox:hover {{
+                border-color: {Colors.PRIMARY};
+            }}
+            QComboBox:focus {{
+                border-color: {Colors.PRIMARY};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border: none;
+                padding-right: 4px;
+            }}
+            QComboBox::down-arrow {{
+                width: 8px;
+                height: 8px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {Colors.BG_ELEVATED};
+                color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {Colors.BORDER};
+                selection-background-color: {Colors.BG_OVERLAY};
+                outline: none;
+            }}
+        """)
+
+        self.currentIndexChanged.connect(self._on_change)
+
+    def _on_change(self, index: int) -> None:
+        """下拉选择变更。"""
+        model_key = self.itemData(index)
+        if model_key:
+            app_config.model_type = model_key
+            self.model_changed.emit(model_key)
 
 
-class _AttachmentBar(ft.Row):
-    def __init__(self) -> None:
-        super().__init__(spacing=Spacing.SM, wrap=True)
+# ──────────────────────────────────────────────
+# 附件条
+# ──────────────────────────────────────────────
+
+
+class AttachmentBar(QWidget):
+    """
+    附件文件标签栏。与原 Flet 版本 _AttachmentBar 功能完全一致。
+    """
+
+    files_changed = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
         self._files: list[tuple[str, str]] = []  # (display_name, abs_path)
 
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(Spacing.SM)
+        self._layout.addStretch()
+
+        self.setVisible(False)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
     def add_file(self, name: str, abs_path: str = "") -> None:
+        """添加文件标签。"""
         self._files.append((name, abs_path or name))
-        chip = ft.Container(
-            content=ft.Row(
-                controls=[
-                    ft.Icon(ft.Icons.ATTACH_FILE, size=12, color=Colors.PRIMARY),
-                    ft.Text(
-                        name,
-                        size=Fonts.SIZE_XS,
-                        color=Colors.TEXT_SECONDARY,
-                        max_lines=1,
-                        overflow=ft.TextOverflow.ELLIPSIS,
-                    ),
-                    ft.IconButton(
-                        icon=ft.Icons.CLOSE,
-                        icon_size=10,
-                        icon_color=Colors.TEXT_DISABLED,
-                        style=ft.ButtonStyle(
-                            padding=ft.Padding(left=2, right=2, top=2, bottom=2),
-                        ),
-                        on_click=lambda e, n=name: self._remove(n),
-                    ),
-                ],
-                tight=True,
-                spacing=4,
-            ),
-            padding=ft.Padding(left=6, right=2, top=3, bottom=3),
-            border=ft.Border(
-                top=ft.BorderSide(1, Colors.BORDER),
-                bottom=ft.BorderSide(1, Colors.BORDER),
-                left=ft.BorderSide(1, Colors.BORDER),
-                right=ft.BorderSide(1, Colors.BORDER),
-            ),
-            border_radius=Radius.SM,
-        )
-        self.controls.append(chip)
+
+        chip = self._make_chip(name)
+        self._layout.insertWidget(self._layout.count() - 1, chip)
+        self.setVisible(True)
+        self.files_changed.emit()
+
+    def _make_chip(self, name: str) -> QFrame:
+        """创建单个文件标签控件。"""
+        chip = QFrame()
+        chip.setStyleSheet(f"""
+            QFrame {{
+                background-color: transparent;
+                border: 1px solid {Colors.BORDER};
+                border-radius: {Radius.SM}px;
+                padding: 2px 4px;
+            }}
+        """)
+
+        chip_layout = QHBoxLayout(chip)
+        chip_layout.setContentsMargins(6, 3, 2, 3)
+        chip_layout.setSpacing(4)
+
+        # 文件图标
+        icon_label = QLabel("📎")
+        icon_label.setFont(Fonts.body(10))
+
+        # 文件名
+        name_label = QLabel(name)
+        name_label.setFont(Fonts.body(Fonts.SIZE_XS))
+        name_label.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_SECONDARY};
+                background-color: transparent;
+                border: none;
+            }}
+        """)
+        name_label.setMaximumWidth(200)
+
+        # 移除按钮
+        remove_btn = QPushButton("✕")
+        remove_btn.setFont(Fonts.body(8))
+        remove_btn.setFixedSize(16, 16)
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.TEXT_DISABLED};
+                background-color: transparent;
+                border: none;
+                padding: 0;
+            }}
+            QPushButton:hover {{
+                color: {Colors.ERROR};
+            }}
+        """)
+        remove_btn.clicked.connect(lambda: self._remove(name))
+
+        chip_layout.addWidget(icon_label)
+        chip_layout.addWidget(name_label)
+        chip_layout.addWidget(remove_btn)
+
+        return chip
 
     def _remove(self, name: str) -> None:
+        """移除指定文件。"""
         self._files = [(n, p) for n, p in self._files if n != name]
-        self.controls = [
-            c for c in self.controls
-            if not (
-                isinstance(c, ft.Container)
-                and isinstance(c.content, ft.Row)
-                and any(
-                    isinstance(ctrl, ft.Text) and ctrl.value == name
-                    for ctrl in c.content.controls
-                )
-            )
-        ]
-        self.update()
+        self._rebuild_chips()
+
+    def _rebuild_chips(self) -> None:
+        """重建所有标签。"""
+        # 移除所有子控件（保留 stretch）
+        while self._layout.count() > 1:
+            item = self._layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # 重新添加标签
+        for name, _ in self._files:
+            chip = self._make_chip(name)
+            self._layout.insertWidget(self._layout.count() - 1, chip)
+
+        if not self._files:
+            self.setVisible(False)
+
+        self.files_changed.emit()
 
     def get_files(self) -> list[str]:
-        """返回绝对路径列表，供 Core 层读取文件内容。"""
+        """返回绝对路径列表。"""
         return [p for _, p in self._files]
 
     def clear_files(self) -> None:
-        self._files = []
-        self.controls.clear()
+        """清空所有附件。"""
+        self._files.clear()
+        self._rebuild_chips()
 
 
-class InputArea(ft.Container):
+# ──────────────────────────────────────────────
+# 输入区
+# ──────────────────────────────────────────────
+
+
+class InputArea(QFrame):
     """
-    底部输入复合体。
+    底部输入复合体。与原 Flet 版本 InputArea 视觉完全一致。
 
-    公开接口：
-        set_generating(True/False)  — 切换发送/停止状态
-        clear()                     — 发送后清空输入框与附件
-        set_enabled(bool)           — 整体启用/禁用
+    信号：
+        send_requested(str, list[str]) — 用户点击发送（文本，文件路径列表）
+        stop_requested()               — 用户点击停止生成
+        model_changed(str)             — 模型变更
+        thinking_toggled(bool)         — 思考模式切换
+        search_toggled(bool)           — 搜索开关切换
     """
 
-    def __init__(
-        self,
-        on_send: Callable[[str, list[str]], None],
-        on_stop: Callable[[], None],
-        on_model_change: Callable[[str], None] | None = None,
-        on_thinking_change: Callable[[bool], None] | None = None,
-        on_search_change: Callable[[bool], None] | None = None,
-    ) -> None:
-        self._on_send = on_send
-        self._on_stop = on_stop
-        self._generating = False
+    send_requested = Signal(str, list)
+    stop_requested = Signal()
+    model_changed = Signal(str)
+    thinking_toggled = Signal(bool)
+    search_toggled = Signal(bool)
 
-        self._tf_ref = ft.Ref[ft.TextField]()
-        self._send_btn_ref = ft.Ref[ft.IconButton]()
-        self._attachment_bar = _AttachmentBar()
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("inputArea")
+        self._generating: bool = False
 
-        self._thinking_chip = _ToggleChip(
-            label="THINK",
-            icon=ft.Icons.PSYCHOLOGY_OUTLINED,
-            active_color=Colors.ROLE_THINKING,
-            initial=getattr(app_config, "thinking_enabled", False),
-            on_change=self._on_thinking_toggle,
+        # ── 附件条 ──────────────────────────────
+        self._attachment_bar = AttachmentBar()
+
+        # ── 输入文本框 ──────────────────────────
+        self._text_edit = QTextEdit()
+        self._text_edit.setPlaceholderText(
+            "输入消息，Shift+Enter 换行，Enter 发送..."
         )
-        self._search_chip = _ToggleChip(
-            label="SEARCH",
-            icon=ft.Icons.TRAVEL_EXPLORE_OUTLINED,
-            active_color=Colors.ACCENT,
-            initial=getattr(app_config, "search_enabled", False),
-            on_change=self._on_search_toggle,
+        self._text_edit.setFont(Fonts.body(Fonts.SIZE_MD))
+        self._text_edit.setStyleSheet(f"""
+            QTextEdit {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: transparent;
+                border: none;
+                padding: 8px 0px;
+            }}
+        """)
+        self._text_edit.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
-
-        self._external_thinking_cb = on_thinking_change
-        self._external_search_cb = on_search_change
-
-        model_selector = _ModelSelector(on_change=on_model_change)
-
-        # 不使用 Flet FilePicker（0.85 兼容性问题），改用 tkinter 原生对话框
-        self._file_picker = None
-
-        text_field = ft.TextField(
-            ref=self._tf_ref,
-            hint_text="输入消息，Shift+Enter 换行，Enter 发送...",
-            hint_style=ft.TextStyle(
-                color=Colors.TEXT_DISABLED,
-                size=Fonts.SIZE_MD,
-            ),
-            multiline=True,
-            min_lines=1,
-            max_lines=8,
-            expand=True,
-            border=ft.InputBorder.NONE,
-            text_style=ft.TextStyle(
-                color=Colors.TEXT_PRIMARY,
-                size=Fonts.SIZE_MD,
-                font_family=Fonts.BODY,
-            ),
-            cursor_color=Colors.PRIMARY,
-            bgcolor="transparent",
-            content_padding=ft.Padding(left=0, right=0, top=8, bottom=8),
-            on_submit=self._handle_send,
-            shift_enter=True,
+        self._text_edit.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-
-        send_btn = ft.IconButton(
-            ref=self._send_btn_ref,
-            icon=ft.Icons.SEND_ROUNDED,
-            icon_color=Colors.PRIMARY,
-            icon_size=20,
-            tooltip="发送 (Enter)",
-            style=ft.ButtonStyle(
-                bgcolor=Colors.PRIMARY_GLOW,
-                shape=ft.CircleBorder(),
-                padding=ft.Padding(left=10, right=10, top=10, bottom=10),
-            ),
-            on_click=self._handle_send,
+        self._text_edit.setMinimumHeight(40)
+        self._text_edit.setMaximumHeight(200)
+        self._text_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
         )
+        # 启用 Enter 发送
+        self._text_edit.installEventFilter(self)
+        self._text_edit.setWordWrapMode(QTextOption.WrapMode.WordWrap)
 
-        toolbar = ft.Row(
-            controls=[
-                ft.IconButton(
-                    icon=ft.Icons.ATTACH_FILE_OUTLINED,
-                    icon_size=16,
-                    icon_color=Colors.TEXT_SECONDARY,
-                    tooltip="上传文件",
-                    style=ft.ButtonStyle(
-                        padding=ft.Padding(left=6, right=6, top=6, bottom=6),
-                    ),
-                    on_click=self._open_file_dialog,
-                ),
-                self._thinking_chip,
-                self._search_chip,
-                ft.Container(expand=True),
-                model_selector,
-            ],
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            spacing=Spacing.SM,
+        # ── 发送/停止按钮 ───────────────────────
+        self._send_btn = QPushButton()
+        self._send_btn.setFont(Fonts.body(18))
+        self._send_btn.setFixedSize(40, 40)
+        self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._send_btn.setToolTip("发送 (Enter)")
+        self._send_btn.clicked.connect(self._on_send_click)
+        self._apply_send_style()
+
+        # ── 输入行 ──────────────────────────────
+        input_row = QHBoxLayout()
+        input_row.setContentsMargins(0, 0, 0, 0)
+        input_row.setSpacing(Spacing.SM)
+        input_row.addWidget(self._text_edit, stretch=1)
+        input_row.addWidget(self._send_btn)
+        input_row.setAlignment(Qt.AlignmentFlag.AlignBottom)
+
+        # ── 工具栏 ──────────────────────────────
+        self._file_btn = self._make_toolbar_btn("📎", "上传文件")
+        self._file_btn.clicked.connect(self._open_file_dialog)
+
+        initial_thinking = getattr(app_config, "thinking_enabled", False)
+        self._thinking_chip = ToggleChip(
+            "THINK", "🧠", Colors.ROLE_THINKING, initial=initial_thinking
         )
+        self._thinking_chip.toggled.connect(self._on_thinking_toggle)
 
-        input_row = ft.Row(
-            controls=[text_field, send_btn],
-            vertical_alignment=ft.CrossAxisAlignment.END,
-            spacing=Spacing.SM,
+        initial_search = getattr(app_config, "search_enabled", False)
+        self._search_chip = ToggleChip(
+            "SEARCH", "🌐", Colors.ACCENT, initial=initial_search
         )
+        self._search_chip.toggled.connect(self._on_search_toggle)
 
-        super().__init__(
-            content=ft.Column(
-                controls=[
-                    self._attachment_bar,
-                    input_row,
-                    ft.Container(
-                        content=toolbar,
-                        padding=ft.Padding(left=0, right=0, top=Spacing.SM, bottom=0),
-                        border=ft.Border(top=ft.BorderSide(1, Colors.DIVIDER)),
-                    ),
-                ],
-                spacing=Spacing.SM,
-            ),
-            padding=ft.Padding(
-                left=Spacing.LG, right=Spacing.LG,
-                top=Spacing.MD, bottom=Spacing.MD,
-            ),
-            bgcolor=Colors.BG_SURFACE,
-            border=ft.Border(
-                top=ft.BorderSide(1, Colors.BORDER),
-                bottom=ft.BorderSide(0, "transparent"),
-                left=ft.BorderSide(0, "transparent"),
-                right=ft.BorderSide(0, "transparent"),
-            ),
+        self._model_selector = ModelSelector()
+        self._model_selector.model_changed.connect(self.model_changed)
+
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(0, Spacing.SM, 0, 0)
+        toolbar.setSpacing(Spacing.SM)
+        toolbar.addWidget(self._file_btn)
+        toolbar.addWidget(self._thinking_chip)
+        toolbar.addWidget(self._search_chip)
+        toolbar.addStretch()
+        toolbar.addWidget(self._model_selector)
+
+        # ── 整体组装 ────────────────────────────
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(
+            Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD
         )
+        layout.setSpacing(Spacing.SM)
+        layout.addWidget(self._attachment_bar)
+        layout.addLayout(input_row)
+        layout.addLayout(toolbar)
 
-    def _handle_send(self, e) -> None:
+        # ── 边框样式 ────────────────────────────
+        toolbar_line_style = f"""
+            border-top: 1px solid {Colors.DIVIDER};
+        """
+        # Apply top-border via a separator approach - the toolbar itself handles this
+        self.setStyleSheet(f"""
+            InputArea {{
+                background-color: {Colors.BG_SURFACE};
+                border: none;
+                border-top: 1px solid {Colors.BORDER};
+            }}
+        """)
+
+    # ── 事件过滤器（Enter 发送）────────────────
+
+    def eventFilter(self, obj, event) -> bool:
+        """拦截文本编辑框的按键事件：Enter 发送，Shift+Enter 换行。"""
+        if obj is self._text_edit and event.type() == event.Type.KeyPress:
+            key_event = event
+            if key_event.key() == Qt.Key.Key_Return or key_event.key() == Qt.Key.Key_Enter:
+                if not key_event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self._on_send_click()
+                    return True
+        return super().eventFilter(obj, event)
+
+    # ── 按钮样式 ──────────────────────────────
+
+    def _make_toolbar_btn(self, text: str, tooltip: str) -> QPushButton:
+        """创建工具栏小按钮。"""
+        btn = QPushButton(text)
+        btn.setFont(Fonts.body(12))
+        btn.setToolTip(tooltip)
+        btn.setFixedSize(28, 28)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.TEXT_SECONDARY};
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+                padding: 2px;
+            }}
+            QPushButton:hover {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.BG_OVERLAY};
+            }}
+        """)
+        return btn
+
+    def _apply_send_style(self) -> None:
+        """根据生成状态应用发送/停止按钮样式。"""
         if self._generating:
-            return
-        text = self._tf_ref.current.value.strip() if self._tf_ref.current else ""
-        if not text and not self._attachment_bar.get_files():
-            return
-        files = self._attachment_bar.get_files()
-        self._on_send(text, files)
+            self._send_btn.setText("⏹")
+            self._send_btn.setToolTip("停止生成")
+            icon_color = Colors.ERROR
+            bg = f"{Colors.ERROR}22"
+        else:
+            self._send_btn.setText("➤")
+            self._send_btn.setToolTip("发送 (Enter)")
+            icon_color = Colors.PRIMARY
+            bg = Colors.PRIMARY_GLOW
 
-    def _open_file_dialog(self, e) -> None:
-        """在独立线程用 tkinter 打开原生文件选择对话框，避免 Flet FilePicker 兼容问题。"""
-        def _pick():
-            try:
-                import tkinter as tk
-                from tkinter import filedialog
-                root = tk.Tk()
-                root.withdraw()          # 隐藏主窗口
-                root.wm_attributes('-topmost', True)  # 置顶
-                paths = filedialog.askopenfilenames(
-                    title="选择文件",
-                    filetypes=[
-                        ("支持的文件", "*.txt *.md *.json *.docx *.pdf"),
-                        ("所有文件", "*.*"),
-                    ]
-                )
-                root.destroy()
-                if paths and self.page:
-                    import os
-                    for p in paths:
-                        name = os.path.basename(p)
-                        print(f"[FilePicker] 选中: name={repr(name)} path={repr(p)}")
-                        self._attachment_bar.add_file(name, p)
-                    self.page.run_task(self._refresh_after_pick)
-            except Exception as ex:
-                print(f"[FilePicker] 错误: {ex}")
-        threading.Thread(target=_pick, daemon=True).start()
+        self._send_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {icon_color};
+                background-color: {bg};
+                border: none;
+                border-radius: 20px;
+                padding: 8px;
+            }}
+            QPushButton:hover {{
+                background-color: {icon_color}33;
+            }}
+        """)
 
-    async def _refresh_after_pick(self) -> None:
-        """文件选择完成后刷新 UI。"""
-        self.update()
-        if self.page:
-            self.page.update()
+    # ── 发送/停止逻辑 ─────────────────────────
+
+    def _on_send_click(self) -> None:
+        """发送或停止按钮点击。"""
+        if self._generating:
+            self.stop_requested.emit()
+        else:
+            text = self._text_edit.toPlainText().strip()
+            files = self._attachment_bar.get_files()
+            if not text and not files:
+                return
+            self.send_requested.emit(text, files)
+
+    # ── 文件对话框 ─────────────────────────────
+
+    def _open_file_dialog(self) -> None:
+        """打开原生文件选择对话框。"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择文件",
+            "",
+            "支持的文件 (*.txt *.md *.json *.docx *.pdf);;所有文件 (*.*)",
+        )
+        if paths:
+            import os
+            for p in paths:
+                name = os.path.basename(p)
+                self._attachment_bar.add_file(name, p)
+
+    # ── 芯片回调 ───────────────────────────────
 
     def _on_thinking_toggle(self, val: bool) -> None:
+        """思考模式切换。"""
         app_config.thinking_enabled = val
-        if self._external_thinking_cb:
-            self._external_thinking_cb(val)
+        self.thinking_toggled.emit(val)
 
     def _on_search_toggle(self, val: bool) -> None:
+        """搜索开关切换。"""
         app_config.search_enabled = val
-        if self._external_search_cb:
-            self._external_search_cb(val)
+        self.search_toggled.emit(val)
 
-    def get_file_picker(self):
-        """已废弃，改用 tkinter 原生对话框，返回 None。"""
-        return None
+    # ── 公开接口 ──────────────────────────────
 
     def set_generating(self, generating: bool) -> None:
+        """切换生成状态（发送 ↔ 停止）。"""
         self._generating = generating
-        if self._send_btn_ref.current:
-            self._send_btn_ref.current.icon = (
-                ft.Icons.STOP_CIRCLE_OUTLINED if generating else ft.Icons.SEND_ROUNDED
-            )
-            self._send_btn_ref.current.icon_color = (
-                Colors.ERROR if generating else Colors.PRIMARY
-            )
-            self._send_btn_ref.current.on_click = (
-                (lambda e: self._on_stop()) if generating else self._handle_send
-            )
-            self._send_btn_ref.current.update()
+        self._apply_send_style()
 
     def clear(self) -> None:
-        if self._tf_ref.current:
-            self._tf_ref.current.value = ""
-            self._tf_ref.current.update()
+        """清空输入框和附件。"""
+        self._text_edit.clear()
         self._attachment_bar.clear_files()
-        self.update()
 
     def set_enabled(self, enabled: bool) -> None:
-        if self._tf_ref.current:
-            self._tf_ref.current.disabled = not enabled
-            self._tf_ref.current.update()
+        """启用/禁用输入区。"""
+        self._text_edit.setEnabled(enabled)
+        self._send_btn.setEnabled(enabled)

@@ -1,113 +1,367 @@
-# Layer: UI → widgets
+# Layer: UI (PySide6) → widgets
 # File: app/ui/widgets/chat_message.py
-# Flet 0.85 兼容版本
+# Responsibility: 聊天消息气泡 — 角色标签、Markdown 渲染、操作按钮、流式更新、思考块
+# 与 Flet 版本 app/ui_flet_legacy/widgets/chat_message.py 视觉完全一致
 
 from __future__ import annotations
-import flet as ft
-from app.ui.theme import Colors, Fonts, Spacing, Radius, Borders
+
+import markdown as _md_lib
+
+from PySide6.QtWidgets import (
+    QFrame,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QTextBrowser,
+    QPushButton,
+    QSizePolicy,
+    QScrollBar,
+)
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont, QColor
+
+from app.ui.theme import Colors, Fonts, Spacing, Radius
 
 
-def _role_badge(role: str) -> ft.Control:
+# ──────────────────────────────────────────────
+# Markdown → HTML 转换器（深色主题）
+# ──────────────────────────────────────────────
+
+_MD_EXTENSIONS = ["fenced_code", "codehilite", "tables", "nl2br"]
+
+# 深色主题 HTML 模板
+# Qt QTextBrowser 使用的富文本引擎仅支持 CSS 2.1 子集；
+# 所有字号/粗细/颜色必须显式声明，否则回退到 body 默认值。
+_HTML_TEMPLATE = """<!DOCTYPE html>
+<html><head><style>
+body {{
+    font-family: "{body_font}";
+    font-size: {font_size}px;
+    color: {text_color};
+    background-color: transparent;
+    margin: 0;
+    padding: 0;
+    line-height: 1.5;
+}}
+h1 {{
+    font-size: {h1_size}px;
+    font-weight: bold;
+    color: {text_color};
+    margin: 12px 0 6px 0;
+    padding-bottom: 4px;
+    border-bottom: 1px solid {border_color};
+}}
+h2 {{
+    font-size: {h2_size}px;
+    font-weight: bold;
+    color: {text_color};
+    margin: 10px 0 4px 0;
+}}
+h3 {{
+    font-size: {h3_size}px;
+    font-weight: bold;
+    color: {text_color};
+    margin: 8px 0 4px 0;
+}}
+h4, h5, h6 {{
+    font-size: {h4_size}px;
+    font-weight: bold;
+    color: {text_color};
+    margin: 6px 0 2px 0;
+}}
+strong, b {{ font-weight: bold; }}
+em, i {{ font-style: italic; }}
+p {{ margin: 4px 0; }}
+pre {{
+    background-color: {code_bg};
+    border: 1px solid {border_color};
+    border-radius: 4px;
+    padding: 8px 12px;
+    overflow-x: auto;
+    font-family: "{mono_font}", monospace;
+    font-size: {code_font_size}px;
+    line-height: 1.4;
+}}
+code {{
+    font-family: "{mono_font}", monospace;
+    font-size: {code_font_size}px;
+    color: {text_code};
+    background-color: {code_bg};
+    padding: 1px 4px;
+    border-radius: 2px;
+}}
+pre code {{
+    background-color: transparent;
+    padding: 0;
+    color: {text_code};
+}}
+blockquote {{
+    border-left: 2px solid {accent_color};
+    margin: 8px 0;
+    padding: 4px 12px;
+    color: {text_secondary};
+}}
+a {{ color: {primary_color}; }}
+ul {{
+    margin: 4px 0;
+    padding-left: 20px;
+    list-style-type: disc;
+}}
+ol {{
+    margin: 4px 0;
+    padding-left: 20px;
+    list-style-type: decimal;
+}}
+ul ul {{ list-style-type: circle; }}
+ul ul ul {{ list-style-type: square; }}
+li {{ margin: 2px 0; }}
+table {{
+    border-collapse: collapse;
+    margin: 8px 0;
+}}
+th, td {{
+    border: 1px solid {border_color};
+    padding: 4px 8px;
+}}
+th {{ background-color: {code_bg}; }}
+hr {{
+    border: none;
+    border-top: 1px solid {border_color};
+    margin: 12px 0;
+}}
+</style></head><body>{content}</body></html>"""
+
+
+def _render_markdown(text: str) -> str:
+    """将 markdown 文本转换为深色主题 HTML。"""
+    html_body = _md_lib.markdown(
+        text,
+        extensions=_MD_EXTENSIONS,
+    )
+    # 标题字号逐级递减：h1=1.6x, h2=1.4x, h3=1.2x, h4+ = 正文尺寸
+    base = Fonts.SIZE_MD
+    return _HTML_TEMPLATE.format(
+        body_font=Fonts.BODY,
+        font_size=base,
+        h1_size=int(base * 1.6),
+        h2_size=int(base * 1.4),
+        h3_size=int(base * 1.2),
+        h4_size=base,
+        text_color=Colors.TEXT_PRIMARY,
+        code_bg=Colors.BG_BASE,
+        border_color=Colors.BORDER,
+        mono_font=Fonts.MONO,
+        code_font_size=Fonts.SIZE_SM,
+        text_code=Colors.TEXT_CODE,
+        accent_color=Colors.ACCENT,
+        text_secondary=Colors.TEXT_SECONDARY,
+        primary_color=Colors.PRIMARY,
+        content=html_body,
+    )
+
+
+# ──────────────────────────────────────────────
+# 角色标签
+# ──────────────────────────────────────────────
+
+
+def _role_badge(role: str) -> QLabel:
+    """创建角色标签控件。与原 Flet 版本 _role_badge() 视觉完全一致。"""
     label_map = {
         "user":      ("YOU",      Colors.ROLE_USER),
         "assistant": ("DEEP",     Colors.ROLE_ASSISTANT),
         "thinking":  ("THINKING", Colors.ROLE_THINKING),
     }
     text, color = label_map.get(role, ("???", Colors.TEXT_SECONDARY))
-    return ft.Container(
-        content=ft.Text(
-            text,
-            size=Fonts.SIZE_XS,
-            font_family=Fonts.MONO,
-            color=color,
-            weight=ft.FontWeight.BOLD,
-        ),
-        padding=ft.Padding(left=6, right=6, top=2, bottom=2),
-        border=ft.Border(
-            top=ft.BorderSide(1, color),
-            bottom=ft.BorderSide(1, color),
-            left=ft.BorderSide(1, color),
-            right=ft.BorderSide(1, color),
-        ),
-        border_radius=Radius.SM,
-    )
+
+    badge = QLabel(text)
+    badge.setFont(Fonts.mono(Fonts.SIZE_XS, QFont.Weight.Bold))
+    badge.setStyleSheet(f"""
+        QLabel {{
+            color: {color};
+            background-color: transparent;
+            border: 1px solid {color};
+            border-radius: {Radius.SM}px;
+            padding: 2px 6px;
+        }}
+    """)
+    badge.setFixedHeight(22)
+    badge.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+    return badge
 
 
-class ThinkingBlock(ft.Column):
-    def __init__(self) -> None:
-        self._text_ref = ft.Ref[ft.Text]()
-        self._content_ref = ft.Ref[ft.Container]()
-        self._toggle_icon_ref = ft.Ref[ft.Icon]()
-        self._expanded = True
-        self._buffer = ""
+# ──────────────────────────────────────────────
+# 常量
+# ──────────────────────────────────────────────
 
-        super().__init__(
-            spacing=0,
-            controls=[
-                ft.Container(
-                    content=ft.Row(
-                        controls=[
-                            _role_badge("thinking"),
-                            ft.Container(expand=True),
-                            ft.Icon(
-                                ft.Icons.EXPAND_LESS,
-                                ref=self._toggle_icon_ref,
-                                size=16,
-                                color=Colors.TEXT_SECONDARY,
-                            ),
-                        ],
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
-                    padding=ft.Padding(
-                        left=Spacing.MD, right=Spacing.MD,
-                        top=Spacing.SM, bottom=Spacing.SM,
-                    ),
-                    border=Borders.BOTTOM_ONLY,
-                    on_click=self._on_toggle,
-                ),
-                ft.Container(
-                    ref=self._content_ref,
-                    content=ft.Text(
-                        ref=self._text_ref,
-                        value="",
-                        size=Fonts.SIZE_SM,
-                        font_family=Fonts.MONO,
-                        color=Colors.TEXT_SECONDARY,
-                    ),
-                    padding=ft.Padding(
-                        left=Spacing.MD, right=Spacing.MD,
-                        top=Spacing.SM, bottom=Spacing.SM,
-                    ),
-                    visible=True,
-                ),
-            ],
+MAX_CONTENT_HEIGHT = 2000  # 单条消息最大可见高度 (px)，超出启用内部滚动
+
+# ──────────────────────────────────────────────
+# 思考块
+# ──────────────────────────────────────────────
+
+
+class ThinkingBlock(QFrame):
+    """
+    可折叠的思考内容块。与原 Flet 版本 ThinkingBlock 视觉完全一致。
+
+    流式使用：
+        block.start_stream()       # 可选，初始化缓冲
+        block.append_text(delta)   # 追加文本，自动刷新
+    """
+
+    # 当内容变化时发出信号（用于外部 page.update 等效操作）
+    content_changed = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("thinkingBlock")
+
+        self._expanded: bool = True
+        self._buffer: str = ""
+
+        # ── 折叠按钮 ────────────────────────────
+        self._toggle_btn = QPushButton("▾")
+        self._toggle_btn.setFont(Fonts.body(Fonts.SIZE_SM))
+        self._toggle_btn.setFixedSize(20, 20)
+        self._toggle_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.TEXT_SECONDARY};
+                background-color: transparent;
+                border: none;
+                padding: 0;
+            }}
+            QPushButton:hover {{
+                color: {Colors.TEXT_PRIMARY};
+            }}
+        """)
+        self._toggle_btn.clicked.connect(self._on_toggle)
+
+        # ── 头行：角色标签 + 空格 + 折叠按钮 ──
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(Spacing.SM)
+        header_row.addWidget(_role_badge("thinking"))
+        header_row.addStretch()
+        header_row.addWidget(self._toggle_btn)
+
+        header_widget = QWidget()
+        header_widget.setLayout(header_row)
+        header_widget.setCursor(Qt.CursorShape.PointingHandCursor)
+        header_widget.mousePressEvent = lambda e: self._on_toggle()
+
+        # ── 内容区 ──────────────────────────────
+        self._content_browser = QTextBrowser()
+        self._content_browser.setOpenExternalLinks(True)
+        self._content_browser.setReadOnly(True)
+        self._content_browser.setFont(Fonts.mono(Fonts.SIZE_SM))
+        self._content_browser.setStyleSheet(f"""
+            QTextBrowser {{
+                color: {Colors.TEXT_SECONDARY};
+                background-color: transparent;
+                border: none;
+                padding: 0;
+            }}
+        """)
+        self._content_browser.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
+        )
+        self._content_browser.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._content_browser.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
 
-    def append_text(self, delta: str) -> None:
-        self._buffer += delta
-        if self._text_ref.current:
-            self._text_ref.current.value = self._buffer
+        # ── 整体布局 ────────────────────────────
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(
+            Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM
+        )
+        layout.setSpacing(Spacing.SM)
+        layout.addWidget(header_widget)
+        layout.addWidget(self._content_browser)
 
-    def _on_toggle(self, e) -> None:
+        # ── 底部边框 ────────────────────────────
+        self.setStyleSheet(f"""
+            ThinkingBlock {{
+                background-color: transparent;
+                border: none;
+                border-bottom: 1px solid {Colors.DIVIDER};
+            }}
+        """)
+
+        # 初始高度
+        self._update_content_height()
+
+    def _on_toggle(self) -> None:
+        """切换展开/折叠。"""
         self._expanded = not self._expanded
-        if self._content_ref.current:
-            self._content_ref.current.visible = self._expanded
-        if self._toggle_icon_ref.current:
-            self._toggle_icon_ref.current.name = (
-                ft.Icons.EXPAND_LESS if self._expanded else ft.Icons.EXPAND_MORE
-            )
-        e.control.page.update()
+        self._content_browser.setVisible(self._expanded)
+        self._toggle_btn.setText("▾" if self._expanded else "▸")
+        self._update_content_height()
+        self.content_changed.emit()
+
+    def append_text(self, delta: str) -> None:
+        """追加文本（流式），自动更新显示。"""
+        self._buffer += delta
+        self._content_browser.setPlainText(self._buffer)
+        self._update_content_height()
+
+    def start_stream(self) -> None:
+        """[兼容] 与 ChatMessage.start_stream 接口统一。"""
+        self._buffer = ""
+        self._content_browser.setPlainText("")
+
+    @property
+    def current_content(self) -> str:
+        """当前缓冲的完整文本。"""
+        return self._buffer
+
+    def _update_content_height(self) -> None:
+        """根据可见性、内容和可用宽度调整高度。"""
+        if not self._expanded or not self._buffer:
+            self._content_browser.setFixedHeight(0)
+            return
+
+        viewport = self._content_browser.viewport()
+        if viewport is None:
+            return
+        available_width = viewport.width()
+        if available_width <= 0:
+            return  # 尚未布局，等 resizeEvent
+
+        doc = self._content_browser.document()
+        doc.setTextWidth(available_width)
+        height = int(doc.size().height()) + 8
+        self._content_browser.setFixedHeight(max(height, 20))
 
 
-class ChatMessage(ft.Container):
+# ──────────────────────────────────────────────
+# 聊天消息气泡
+# ──────────────────────────────────────────────
+
+
+class ChatMessage(QFrame):
     """
-    单条消息气泡，支持流式逐字更新。
+    单条消息气泡。与原 Flet 版本 ChatMessage 视觉完全一致。
 
     流式使用：
         msg.start_stream()
-        msg.append_stream(delta); page.update()
+        msg.append_stream(delta)
         msg.finalize_stream()
+
+    信号：
+        copy_requested      — 用户点击复制按钮
+        regenerate_requested — 用户点击重新生成按钮
+        remember_requested   — 用户点击记住按钮
     """
+
+    copy_requested = Signal(str)        # content text
+    regenerate_requested = Signal()     # no args needed
+    remember_requested = Signal()       # no args needed
 
     def __init__(
         self,
@@ -115,156 +369,309 @@ class ChatMessage(ft.Container):
         content: str,
         message_id: str = "",
         is_thinking: bool = False,
-        on_copy=None,
-        on_regenerate=None,
-        on_remember=None,
+        parent: QWidget | None = None,
     ) -> None:
+        super().__init__(parent)
+        self.setObjectName("chatMessage")
+
         self.role = role
         self.message_id = message_id
-        self._is_streaming = False
-        self._stream_buffer = content
-
-        self._md_ref = ft.Ref[ft.Markdown]()
-        self._action_row_ref = ft.Ref[ft.Row]()
-        self._remember_btn_ref = ft.Ref[ft.IconButton]()
-        self._on_remember = on_remember
+        self._is_streaming: bool = False
+        self._stream_buffer: str = content
+        self._updating_height: bool = False  # 防重入
 
         is_user = (role == "user")
-        bg_color = Colors.BG_ELEVATED if is_user else Colors.BG_SURFACE
-        border = (
-            ft.Border(
-                top=ft.BorderSide(1, Colors.BORDER),
-                bottom=ft.BorderSide(1, Colors.BORDER),
-                left=ft.BorderSide(1, Colors.ROLE_USER + "55"),
-                right=ft.BorderSide(1, Colors.BORDER),
-            )
-            if is_user else
-            ft.Border(
-                top=ft.BorderSide(1, Colors.BORDER),
-                bottom=ft.BorderSide(1, Colors.BORDER),
-                left=ft.BorderSide(2, Colors.ROLE_ASSISTANT),
-                right=ft.BorderSide(1, Colors.BORDER),
-            )
-        )
-        radius = Radius.BUBBLE_USER if is_user else Radius.BUBBLE_ASST
 
-        action_controls: list[ft.Control] = []
+        # ── 角色标签行 ──────────────────────────
+        badge_row = QHBoxLayout()
+        badge_row.setContentsMargins(0, 0, 0, 0)
+        badge_row.setSpacing(Spacing.SM)
+        badge_row.addWidget(_role_badge(role))
+        badge_row.addStretch()
+
+        # ── 内容区（Markdown 渲染）───────────────
+        self._content_browser = QTextBrowser()
+        self._content_browser.setOpenExternalLinks(True)
+        self._content_browser.setReadOnly(True)
+        self._content_browser.setFont(Fonts.body(Fonts.SIZE_MD))
+        self._content_browser.setStyleSheet(f"""
+            QTextBrowser {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: transparent;
+                border: none;
+                padding: 0;
+            }}
+        """)
+        self._content_browser.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._content_browser.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._content_browser.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
+        )
+
+        # 设置初始内容 — 高度在 showEvent / resizeEvent 中计算
+        # （此时 viewport().width() 为 0，计算出的高度无效）
+        if content:
+            self._content_browser.setHtml(_render_markdown(content))
+
+        # ── 操作按钮行（仅助手消息）─────────────
+        self._action_widget = QWidget()
+        action_layout = QHBoxLayout(self._action_widget)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(Spacing.XS)
+
         if not is_user:
-            action_controls = [
-                ft.IconButton(
-                    icon=ft.Icons.CONTENT_COPY_OUTLINED,
-                    icon_size=14,
-                    icon_color=Colors.TEXT_SECONDARY,
-                    tooltip="复制",
-                    on_click=on_copy,
-                    style=ft.ButtonStyle(
-                        padding=ft.Padding(left=4, right=4, top=4, bottom=4),
-                    ),
-                ),
-                ft.IconButton(
-                    icon=ft.Icons.REFRESH_OUTLINED,
-                    icon_size=14,
-                    icon_color=Colors.TEXT_SECONDARY,
-                    tooltip="重新生成",
-                    on_click=on_regenerate,
-                    style=ft.ButtonStyle(
-                        padding=ft.Padding(left=4, right=4, top=4, bottom=4),
-                    ),
-                ),
-                ft.IconButton(
-                    ref=self._remember_btn_ref,
-                    icon=ft.Icons.BOOKMARK_ADD_OUTLINED,
-                    icon_size=14,
-                    icon_color=Colors.TEXT_SECONDARY,
-                    tooltip="记住这段对话（写入知识图谱）",
-                    on_click=self._handle_remember,
-                    style=ft.ButtonStyle(
-                        padding=ft.Padding(left=4, right=4, top=4, bottom=4),
-                    ),
-                ),
-            ]
+            self._copy_btn = self._make_icon_button("📋", "复制", Colors.TEXT_SECONDARY)
+            self._copy_btn.clicked.connect(self._on_copy)
 
-        inner = ft.Column(
-            spacing=Spacing.SM,
-            controls=[
-                ft.Row(
-                    controls=[
-                        _role_badge(role),
-                        ft.Container(expand=True),
-                    ],
-                ),
-                ft.Markdown(
-                    ref=self._md_ref,
-                    value=content,
-                    selectable=True,
-                    extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
-                    code_theme="atom-one-dark",
-                    on_tap_link=lambda e: None,
-                ),
-                ft.Row(
-                    ref=self._action_row_ref,
-                    controls=action_controls,
-                    visible=bool(action_controls),
-                    spacing=Spacing.XS,
-                ),
-            ],
+            self._regen_btn = self._make_icon_button("🔄", "重新生成", Colors.TEXT_SECONDARY)
+            self._regen_btn.clicked.connect(self._on_regenerate)
+
+            self._remember_btn = self._make_icon_button("🔖", "记住这段对话（写入知识图谱）", Colors.TEXT_SECONDARY)
+            self._remember_btn.clicked.connect(self._on_remember)
+            self._remember_btn._default_icon = "🔖"
+            self._remember_btn._default_color = Colors.TEXT_SECONDARY
+
+            action_layout.addWidget(self._copy_btn)
+            action_layout.addWidget(self._regen_btn)
+            action_layout.addWidget(self._remember_btn)
+            action_layout.addStretch()
+
+        self._action_widget.setVisible(not is_user)
+
+        # ── 内部布局 ────────────────────────────
+        inner = QVBoxLayout()
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(Spacing.SM)
+        inner.addLayout(badge_row)
+        inner.addWidget(self._content_browser)
+        inner.addWidget(self._action_widget)
+
+        # ── 气泡外层 ────────────────────────────
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(
+            Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD
+        )
+        outer.setSpacing(0)
+        outer.addLayout(inner)
+
+        # ── 气泡样式 ────────────────────────────
+        self._is_user = is_user
+        bg_color = Colors.USER_BG if is_user else Colors.BG_SURFACE
+        if is_user:
+            self._normal_border = f"""
+                border: 1px solid {Colors.BORDER};
+                border-left: 1px solid {Colors.ROLE_USER}55;
+                border-top-left-radius: {Radius.LG}px;
+                border-top-right-radius: {Radius.LG}px;
+                border-bottom-left-radius: {Radius.LG}px;
+                border-bottom-right-radius: {2}px;
+            """
+        else:
+            self._normal_border = f"""
+                border: 1px solid {Colors.BORDER};
+                border-left: 2px solid {Colors.ROLE_ASSISTANT};
+                border-top-left-radius: {Radius.LG}px;
+                border-top-right-radius: {Radius.LG}px;
+                border-bottom-left-radius: {2}px;
+                border-bottom-right-radius: {Radius.LG}px;
+            """
+
+        self._bg_color = bg_color
+        self._apply_stylesheet(highlighted=False)
+
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
         )
 
-        super().__init__(
-            content=inner,
-            padding=ft.Padding(
-                left=Spacing.LG,
-                right=Spacing.LG,
-                top=Spacing.MD,
-                bottom=Spacing.MD,
-            ),
-            border=border,
-            border_radius=radius,
-            bgcolor=bg_color,
-            margin=ft.Margin(
-                left=0, right=0,
-                top=Spacing.XS, bottom=Spacing.XS,
-            ),
-        )
+    # ── 操作按钮工厂 ──────────────────────────
 
-    def _handle_remember(self, e) -> None:
-        """点击记住按钮：变为加载状态，触发回调，完成后变绿色。"""
-        if self._on_remember is None:
+    @staticmethod
+    def _make_icon_button(text: str, tooltip: str, color: str) -> QPushButton:
+        """创建小图标按钮。"""
+        btn = QPushButton(text)
+        btn.setFont(Fonts.body(12))
+        btn.setToolTip(tooltip)
+        btn.setFixedSize(28, 28)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {color};
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+                padding: 2px;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.BG_OVERLAY};
+            }}
+        """)
+        return btn
+
+    # ── 高亮效果 ──────────────────────────────
+
+    def _apply_stylesheet(self, highlighted: bool = False) -> None:
+        """根据高亮状态重新应用样式表。"""
+        if highlighted:
+            border = f"""
+                border: 2px solid {Colors.ACCENT};
+                border-left: 3px solid {Colors.ACCENT};
+                border-top-left-radius: {Radius.LG}px;
+                border-top-right-radius: {Radius.LG}px;
+                border-bottom-left-radius: {2 if not self._is_user else Radius.LG}px;
+                border-bottom-right-radius: {Radius.LG if not self._is_user else 2}px;
+            """
+            bg = f"{Colors.ACCENT}18"
+        else:
+            border = self._normal_border
+            bg = self._bg_color
+
+        self.setStyleSheet(f"""
+            ChatMessage {{
+                background-color: {bg};
+                {border}
+                margin: {Spacing.XS}px 0px;
+            }}
+        """)
+
+    def set_highlighted(self, highlighted: bool) -> None:
+        """应用或移除高亮发光效果。"""
+        self._apply_stylesheet(highlighted=highlighted)
+
+    # ── 高度自适应 ──────────────────────────
+
+    def showEvent(self, event) -> None:
+        """首次显示时计算正确高度（此时 viewport 宽度已确定）。"""
+        super().showEvent(event)
+        self._update_content_height()
+
+    def resizeEvent(self, event) -> None:
+        """
+        窗口 / 容器宽度变化时重新计算内容高度。
+
+        仅响应宽度变化：宽度改变 → 文本重新换行 → 高度需更新。
+        高度变化不触发重算（防止 _update_content_height 的
+        setFixedHeight 导致无限 resizeEvent 循环）。
+        """
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self._update_content_height()
+
+    def _update_content_height(self) -> None:
+        """
+        根据文档内容在可用宽度下的自然高度设置 QTextBrowser 高度。
+
+        - natural_height <= MAX_CONTENT_HEIGHT：禁用滚动，固定为自然高度
+        - natural_height >  MAX_CONTENT_HEIGHT：启用滚动，固定为 MAX_CONTENT_HEIGHT
+        - available_width <= 0：尚无布局（等待 resizeEvent / showEvent），不操作
+        """
+        if self._updating_height:
             return
-        btn = self._remember_btn_ref.current
+        self._updating_height = True
+        try:
+            viewport = self._content_browser.viewport()
+            if viewport is None:
+                return
+            available_width = viewport.width()
+            if available_width <= 0:
+                return
+
+            doc = self._content_browser.document()
+            doc.setTextWidth(available_width)
+            natural = int(doc.size().height()) + 8  # 8px 内边距
+
+            if natural > MAX_CONTENT_HEIGHT:
+                self._content_browser.setVerticalScrollBarPolicy(
+                    Qt.ScrollBarPolicy.ScrollBarAsNeeded
+                )
+                self._content_browser.setFixedHeight(MAX_CONTENT_HEIGHT)
+            else:
+                self._content_browser.setVerticalScrollBarPolicy(
+                    Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+                )
+                self._content_browser.setFixedHeight(max(natural, 24))
+        finally:
+            self._updating_height = False
+
+    # ── 按钮事件 ──────────────────────────────
+
+    def _on_copy(self) -> None:
+        """复制当前内容到剪贴板。"""
+        self.copy_requested.emit(self.current_content)
+
+    def _on_regenerate(self) -> None:
+        """请求重新生成。"""
+        self.regenerate_requested.emit()
+
+    def _on_remember(self) -> None:
+        """请求提取知识图谱。"""
+        self.remember_requested.emit()
+
+    # ── 记住按钮状态 ──────────────────────────
+
+    def set_remember_loading(self) -> None:
+        """设置记住按钮为加载状态。"""
+        btn = getattr(self, "_remember_btn", None)
         if btn is None:
             return
-        # 变为加载状态
-        btn.icon = ft.Icons.HOURGLASS_EMPTY
-        btn.icon_color = Colors.WARNING
-        btn.disabled = True
-        btn.update()
-        # 触发回调（由 app.py 处理异步提取）
-        self._on_remember(e)
+        btn.setText("⏳")
+        btn.setStyleSheet(btn.styleSheet().replace(
+            f"color: {Colors.TEXT_SECONDARY}",
+            f"color: {Colors.WARNING}",
+        ))
+        btn.setEnabled(False)
 
     def set_remember_done(self, success: bool = True) -> None:
-        """提取完成后由外部调用，更新按钮状态。"""
-        btn = self._remember_btn_ref.current
+        """提取完成后更新按钮状态。"""
+        btn = getattr(self, "_remember_btn", None)
         if btn is None:
             return
-        btn.icon = ft.Icons.BOOKMARK_ADDED if success else ft.Icons.BOOKMARK_OUTLINED
-        btn.icon_color = Colors.SUCCESS if success else Colors.ERROR
-        btn.disabled = False
-        btn.tooltip = "已记住" if success else "提取失败，可重试"
-        btn.update()
+        btn.setEnabled(True)
+        if success:
+            btn.setText("✅")
+            btn.setToolTip("已记住")
+            btn.setStyleSheet(btn.styleSheet().replace(
+                f"color: {Colors.WARNING}",
+                f"color: {Colors.SUCCESS}",
+            ))
+        else:
+            btn.setText("🔖")
+            btn.setToolTip("提取失败，可重试")
+            btn.setStyleSheet(btn.styleSheet().replace(
+                f"color: {Colors.WARNING}",
+                f"color: {Colors.ERROR}",
+            ))
+
+    # ── 流式支持 ──────────────────────────────
 
     def start_stream(self) -> None:
+        """开始流式接收。清空缓冲并重置内容。"""
         self._is_streaming = True
         self._stream_buffer = ""
 
     def append_stream(self, delta: str) -> None:
+        """追加流式文本块，自动渲染 Markdown 并更新高度。"""
         self._stream_buffer += delta
-        if self._md_ref.current:
-            self._md_ref.current.value = self._stream_buffer
+        self._content_browser.setHtml(_render_markdown(self._stream_buffer))
+        self._update_content_height()
+        # 流式输出期间自动滚动到文本底部
+        vsb = self._content_browser.verticalScrollBar()
+        if vsb.isVisible():
+            vsb.setValue(vsb.maximum())
 
     def finalize_stream(self) -> None:
+        """结束流式接收。"""
         self._is_streaming = False
+
+    # ── 属性 ──────────────────────────────────
 
     @property
     def current_content(self) -> str:
+        """当前完整文本内容。"""
         return self._stream_buffer
+

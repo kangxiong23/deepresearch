@@ -1,748 +1,979 @@
-# Layer: UI
+# Layer: UI (PySide6)
 # File: app/ui/app.py
-# Flet 0.85 兼容版本
-# Phase 4 — 树形面板集成
+# Responsibility: ChatApp 主应用类 — 持有 MainWindow，连接 Controller，
+#                 管理对话生命周期、流式响应、面板切换。
+# 与原 Flet 版本 app/ui/app.py 的 ChatApp 功能对等
 
 from __future__ import annotations
-import asyncio
-import flet as ft
 
-import config as app_config
+from typing import TYPE_CHECKING
 
-from app.ui.theme import Colors, Fonts, Spacing, build_theme
-from app.ui.widgets.chat_message import ChatMessage
+from PySide6.QtWidgets import (
+    QApplication,
+    QInputDialog,
+    QMessageBox,
+    QFileDialog,
+)
+from PySide6.QtCore import Qt, QThread, QTimer
+
+from app.ui.theme import Colors, build_global_stylesheet
+from app.ui.main_window import MainWindow
+from app.ui.widgets.chat_message import ChatMessage, ThinkingBlock
 from app.ui.widgets.sidebar import Sidebar
-from app.ui.widgets.input_area import InputArea
-from app.ui.widgets.context_panel import ContextPanel
-from app.ui.widgets.kg_panel import KGPanel
+from app.ui.async_bridge import (
+    AsyncStreamWorker,
+    run_async_in_thread,
+)
 
 
 class ChatApp:
+    """
+    DeepResearch 主应用类。
+
+    与原 Flet 版本功能对等：
+    - 持有 QMainWindow（替代 ft.Page）
+    - 接收 AppController + SettingsController 注入
+    - 管理对话生命周期、流式响应、消息列表
+    """
+
     def __init__(self, app_controller, settings_controller) -> None:
         self._ctrl = app_controller
         self._settings_ctrl = settings_controller
+
+        # ── 状态（与 Flet 版本 ChatApp 字段一一对应）──
         self._current_session_id: str = ""
         self._streaming_message: ChatMessage | None = None
+        self._tree_nodes: list = []
 
-        self._sidebar: Sidebar | None = None
-        self._input_area: InputArea | None = None
-        self._context_panel: ContextPanel | None = None
-        self._kg_panel: KGPanel | None = None
-        self._message_list_ref = ft.Ref[ft.ListView]()
-        self._empty_hint_ref = ft.Ref[ft.Container]()
-        self._page: ft.Page | None = None
+        # ── Phase 5: 精确滚动定位 ─────────────
+        # 点击消息节点时暂存目标 message_id，消息加载完成后滚动定位
+        self._pending_scroll_target: str | None = None
+        # 每个对话的滚动位置记录（用于切换对话后恢复）
+        self._scroll_states: dict[str, dict] = {}
+        self._load_scroll_positions()  # 从磁盘恢复
 
-    def build(self, page: ft.Page) -> None:
-        self._page = page
-        self._configure_page(page)
+        # ── 流式工作线程引用（防 GC）───────────
+        self._stream_thread: QThread | None = None
+        self._stream_worker: AsyncStreamWorker | None = None
+        self._async_task_threads: list = []  # 保持引用防止 GC
 
-        # ── 侧边栏（Phase 4 — 树形面板）───────
-        self._sidebar = Sidebar(
-            on_new_conversation=self._handle_new_conversation,
-            on_switch_conversation=self._handle_switch_conversation,
-            on_delete_conversation=self._handle_delete_conversation,
-            on_open_context_panel=self._handle_open_context_panel,
-            on_open_kg_panel=self._handle_open_kg_panel,
-            # Phase 4 — 树操作回调
-            on_create_folder=self._handle_create_folder,
-            on_new_conversation_in_folder=self._handle_new_conversation_in_folder,
-            on_rename_node=self._handle_rename_node,
-            on_delete_node=self._handle_soft_delete_node,
-            on_toggle_enabled=self._handle_toggle_enabled,
-            on_move_node=self._handle_move_node,
-            on_manage_context=self._handle_manage_context,
-            on_attach_file=self._handle_attach_file,
-            on_open_trash=self._handle_open_trash,
+        # ── 构建主窗口 ──────────────────────────
+        self._window = MainWindow()
+
+        # ── 应用全局样式表 ─────────────────────
+        self._apply_theme()
+
+        # ── 连接信号 ────────────────────────────
+        self._connect_signals()
+
+    # ── 主题 ──────────────────────────────────
+
+    def _apply_theme(self) -> None:
+        """应用全局深色主题样式表。"""
+        app = QApplication.instance()
+        if app:
+            app.setStyleSheet(build_global_stylesheet())
+
+    # ── 信号连接 ──────────────────────────────
+
+    def _connect_signals(self) -> None:
+        """连接 InputArea、Sidebar 和 TreePanel 的信号到对应槽。"""
+        # ── InputArea 信号 ────────────────────────
+        input_area = self._window.input_area
+        input_area.send_requested.connect(self._handle_send)
+        input_area.stop_requested.connect(self._handle_stop)
+        input_area.model_changed.connect(
+            lambda m: self._settings_ctrl.on_change_model(m)
         )
-        self._sidebar.set_page(page)
-
-        self._input_area = InputArea(
-            on_send=self._handle_send,
-            on_stop=self._handle_stop,
-            on_model_change=self._settings_ctrl.on_change_model,
-            on_thinking_change=self._settings_ctrl.on_toggle_thinking,
+        input_area.thinking_toggled.connect(
+            lambda v: self._settings_ctrl.on_toggle_thinking(v)
         )
-
-        self._context_panel = ContextPanel(
-            on_remove_block=self._handle_remove_context_block,
-            on_toggle_block=self._handle_toggle_context_block,
-            on_apply_template=self._handle_apply_template,
-            on_delete_template=self._handle_delete_template,
-            on_add_text_block=self._handle_add_text_block,
-            on_close=self._handle_close_context_panel,
-        )
-
-        self._kg_panel = KGPanel(
-            on_delete_entity=self._handle_delete_kg_entity,
-            on_delete_relation=self._handle_delete_kg_relation,
-            on_close=self._handle_close_kg_panel,
+        input_area.search_toggled.connect(
+            lambda v: self._settings_ctrl.on_toggle_search(v)
         )
 
-        message_list = ft.ListView(
-            ref=self._message_list_ref,
-            expand=True,
-            spacing=Spacing.SM,
-            padding=ft.Padding(
-                left=Spacing.XL, right=Spacing.XL,
-                top=Spacing.LG, bottom=Spacing.LG,
-            ),
-            auto_scroll=True,
+        # ── Sidebar 顶部按钮信号 ──────────────────
+        sidebar = self._window.sidebar
+        sidebar.new_conversation_clicked.connect(self._handle_new_conversation)
+        sidebar.new_folder_clicked.connect(self._handle_new_root_folder)
+        sidebar.open_trash_clicked.connect(self._handle_open_trash)
+        sidebar.open_context_panel_clicked.connect(self._handle_open_context_panel)
+        sidebar.open_kg_panel_clicked.connect(self._handle_open_kg_panel)
+
+        # ── TreePanel 信号 ────────────────────────
+        tree = sidebar.tree_panel
+        tree.switch_conversation.connect(self._on_tree_switch)
+        tree.new_conversation.connect(self._on_tree_new_conversation)
+        tree.new_folder.connect(self._on_tree_new_folder)
+        tree.rename_node.connect(self._on_tree_rename)
+        tree.delete_node.connect(self._on_tree_delete)
+        tree.toggle_enabled.connect(self._on_tree_toggle_enabled)
+        tree.move_node.connect(self._on_tree_move)
+        tree.manage_context.connect(self._on_tree_manage_context)
+        tree.attach_file.connect(self._on_tree_attach_file)
+
+        # ── ContextPanel 信号 ────────────────────
+        ctx_panel = self._window.context_panel
+        ctx_panel.remove_block.connect(self._on_ctx_remove_block)
+        ctx_panel.toggle_block.connect(self._on_ctx_toggle_block)
+        ctx_panel.add_text_block.connect(self._on_ctx_add_text_block)
+        ctx_panel.save_as_template.connect(self._on_ctx_save_template)
+        ctx_panel.apply_template.connect(self._on_ctx_apply_template)
+        ctx_panel.delete_template.connect(self._on_ctx_delete_template)
+        ctx_panel.close_requested.connect(self._window.hide_right_panel)
+
+        # ── KGPanel 信号 ─────────────────────────
+        kg_panel = self._window.kg_panel
+        kg_panel.delete_entity.connect(self._on_kg_delete_entity)
+        kg_panel.delete_relation.connect(self._on_kg_delete_relation)
+        kg_panel.close_requested.connect(self._window.hide_right_panel)
+
+    # ── 窗口显示 ──────────────────────────────
+
+    def show(self) -> None:
+        """
+        显示主窗口，加载树数据，并加载所有已启用消息。
+
+        多对话模式：启动时自动聚合所有已启用对话的消息，
+        按时间排序显示，并滚动到列表底部（最新消息）。
+
+        关键顺序：先 show() 窗口（建立有效布局/几何），
+        再加载消息和滚动。否则所有 widget 几何无效，
+        scrollbar.maximum() 返回 0，scroll_to_bottom 无效。
+        """
+        self._load_tree()
+        self._window.show()
+        # 窗口显示后加载消息 — 此时布局有效，scrollbar 能返回正确的 maximum
+        QTimer.singleShot(0, lambda: self._load_all_messages(scroll_to_bottom=True))
+        # 应用关闭时持久化滚动位置
+        app = QApplication.instance()
+        if app:
+            app.aboutToQuit.connect(self._on_app_quit)
+
+    def _on_app_quit(self) -> None:
+        """应用退出前保存当前滚动位置。"""
+        self._scroll_states["_global"] = (
+            self._window.message_list.save_scroll_state()
+        )
+        self._save_scroll_positions()
+
+    # ── 树数据加载 ──────────────────────────
+
+    def _load_tree(self) -> None:
+        """
+        从 Controller 加载完整树数据，刷新侧边栏树面板。
+        在启动、流完成和任何树结构变更后调用。
+        """
+        try:
+            nodes = self._ctrl.get_tree()
+            self._tree_nodes = nodes
+            self._window.sidebar.load_tree(nodes)
+        except Exception as exc:
+            print(f"[UI] _load_tree error: {exc}")
+            import traceback
+            traceback.print_exc()
+
+    # ── 公开属性 ──────────────────────────────
+
+    @property
+    def window(self) -> MainWindow:
+        """返回主窗口实例。"""
+        return self._window
+
+    @property
+    def current_session_id(self) -> str:
+        """当前活跃对话 ID。"""
+        return self._current_session_id
+
+    # ── 对话生命周期 ──────────────────────────
+
+    def _load_all_messages(self, scroll_to_bottom: bool = False) -> None:
+        """
+        加载所有已启用对话的消息（聚合视图），重建消息列表。
+
+        多对话模式核心方法 — 替代旧的单对话 _handle_switch_conversation。
+
+        Args:
+            scroll_to_bottom:
+                True → 重建后滚动到底部（用于启动、流完成）
+                False → 保持阅读位置（用于启用/禁用切换等运行时刷新）
+
+        scroll_to_bottom=True 使用 scrollbar.rangeChanged 信号驱动。
+        scroll_to_bottom=False 使用滚动锚点机制：
+            刷新前记录视口中点最近的消息 ID 和偏移；
+            刷新后定位到该消息，若已消失则向上查找最近幸存消息。
+        """
+        msg_list = self._window.message_list
+
+        if not scroll_to_bottom:
+            # 刷新前：收集当前消息 ID 列表并保存滚动锚点
+            old_ids = self._get_current_message_ids()
+            msg_list.save_scroll_anchor(old_ids)
+
+        messages = self._ctrl.on_get_multi_conversation_messages()
+        self._rebuild_message_list(messages)
+
+        if scroll_to_bottom:
+            # rangeChanged 信号驱动 — 布局完成后滚动到底部
+            scrollbar = msg_list._scroll_area.verticalScrollBar()
+
+            def _scroll_on_range(min_val: int, max_val: int) -> None:
+                if max_val > 0:
+                    scrollbar.setValue(max_val)
+                    try:
+                        scrollbar.rangeChanged.disconnect(_scroll_on_range)
+                    except (TypeError, RuntimeError):
+                        pass
+
+            scrollbar.rangeChanged.connect(_scroll_on_range)
+            if scrollbar.maximum() > 0:
+                scrollbar.setValue(scrollbar.maximum())
+                try:
+                    scrollbar.rangeChanged.disconnect(_scroll_on_range)
+                except (TypeError, RuntimeError):
+                    pass
+        else:
+            # 滚动锚点恢复 — 延迟到布局完成后
+            new_ids = [vm.id for vm in messages if vm.id]
+            QTimer.singleShot(0, lambda: QTimer.singleShot(
+                0, lambda: msg_list.restore_scroll_anchor(new_ids)
+            ))
+
+    def _get_current_message_ids(self) -> list[str]:
+        """收集当前消息列表中所有 ChatMessage 的 ID（按布局顺序）。"""
+        ids: list[str] = []
+        layout = self._window.message_list.message_layout()
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if w is not None and hasattr(w, "message_id") and w.message_id:
+                ids.append(w.message_id)
+        return ids
+
+    def _handle_new_conversation(self) -> None:
+        """
+        新建对话（多对话模式）。
+
+        创建新对话作为当前发送目标，刷新树，但不影响消息列表显示。
+        消息列表始终显示所有已启用消息。
+        """
+        session_id = self._ctrl.on_new_conversation()
+        self._current_session_id = session_id
+        self._window.sidebar.set_active(session_id)
+        QTimer.singleShot(0, self._load_tree)
+        # 新对话无消息，不刷新消息列表
+
+    def _do_scroll_to_target(self, target: str) -> None:
+        """在消息列表中滚动到指定消息并高亮。"""
+        self._window.message_list.scroll_to_message(target)
+        self._window.message_list.highlight_message(target)
+
+    # ── 消息列表操作 ──────────────────────────
+
+    def _append_message(self, msg: ChatMessage) -> None:
+        """追加一条消息到列表底部并隐藏空状态。"""
+        layout = self._window.message_list.message_layout()
+        # 在 stretch 之前插入
+        layout.insertWidget(layout.count() - 1, msg)
+        self._window.message_list.show_empty_hint(False)
+        # Phase 5: 注册消息以便精确滚动定位
+        if msg.message_id:
+            self._window.message_list.register_message(msg.message_id, msg)
+
+    def _insert_before_last(self, widget) -> None:
+        """在最后一条消息之前插入控件（用于 ThinkingBlock）。"""
+        layout = self._window.message_list.message_layout()
+        count = layout.count()
+        # stretch 在末尾，倒数第二个是最后一条消息
+        if count >= 2:
+            layout.insertWidget(count - 2, widget)
+        else:
+            layout.insertWidget(0, widget)
+        self._window.message_list.show_empty_hint(False)
+
+    def _rebuild_message_list(self, message_vms: list) -> None:
+        """用 ViewModel 列表完全重建消息控件。"""
+        self._window.message_list.clear_messages()
+
+        if not message_vms:
+            self._window.message_list.show_empty_hint(True)
+            return
+
+        layout = self._window.message_list.message_layout()
+        for vm in message_vms:
+            msg = ChatMessage(
+                role=vm.role,
+                content=vm.content,
+                message_id=vm.id,
+                is_thinking=getattr(vm, "is_thinking", False),
+            )
+            self._connect_message_signals(msg)
+            # 在 stretch 之前插入
+            layout.insertWidget(layout.count() - 1, msg)
+            # Phase 5: 注册消息以便精确滚动定位
+            if vm.id:
+                self._window.message_list.register_message(vm.id, msg)
+
+        # 强制布局重新计算，确保 QScrollArea 内容高度正确
+        container = self._window.message_list.message_container()
+        container.updateGeometry()
+        container.adjustSize()
+
+        self._window.message_list.show_empty_hint(False)
+
+    def _connect_message_signals(self, msg: ChatMessage) -> None:
+        """连接消息气泡的操作按钮信号。"""
+        msg.copy_requested.connect(self._on_copy_content)
+        msg.regenerate_requested.connect(
+            lambda: self._handle_regenerate(self._current_session_id)
+        )
+        msg.remember_requested.connect(
+            lambda: self._handle_remember(msg)
         )
 
-        empty_hint = ft.Container(
-            ref=self._empty_hint_ref,
-            content=ft.Column(
-                controls=[
-                    ft.Container(
-                        content=ft.Text(
-                            "DR",
-                            size=32,
-                            font_family=Fonts.MONO,
-                            color=Colors.PRIMARY,
-                            weight=ft.FontWeight.BOLD,
-                        ),
-                        width=64, height=64,
-                        border_radius=ft.BorderRadius(
-                            top_left=12, top_right=12,
-                            bottom_left=12, bottom_right=12,
-                        ),
-                        bgcolor=Colors.PRIMARY_GLOW,
-                        alignment=ft.Alignment(0, 0),
-                        border=ft.Border(
-                            top=ft.BorderSide(1, Colors.PRIMARY),
-                            bottom=ft.BorderSide(1, Colors.PRIMARY),
-                            left=ft.BorderSide(1, Colors.PRIMARY),
-                            right=ft.BorderSide(1, Colors.PRIMARY),
-                        ),
-                    ),
-                    ft.Text(
-                        "DeepResearch",
-                        size=Fonts.SIZE_XXL,
-                        font_family=Fonts.MONO,
-                        color=Colors.TEXT_PRIMARY,
-                        weight=ft.FontWeight.W_600,
-                    ),
-                    ft.Text(
-                        "选择或新建一个对话以开始",
-                        size=Fonts.SIZE_MD,
-                        color=Colors.TEXT_SECONDARY,
-                    ),
-                ],
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=Spacing.MD,
-            ),
-            expand=True,
-            alignment=ft.Alignment(0, 0),
-            visible=True,
+    def _on_copy_content(self, text: str) -> None:
+        """复制文本到系统剪贴板。"""
+        clipboard = QApplication.clipboard()
+        if clipboard:
+            clipboard.setText(text)
+
+    # ── 发送消息 ──────────────────────────────
+
+    def _handle_send(self, text: str, files: list[str]) -> None:
+        """
+        发送消息入口。
+
+        1. 中止现有流（如有）
+        2. 自动创建对话（如无活跃对话）
+        3. 追加用户消息气泡
+        4. 清空输入区，切换到生成状态
+        5. 启动流式响应
+        """
+        # 中止现有流
+        if self._stream_worker is not None:
+            self._handle_stop()
+
+        if not self._current_session_id:
+            self._handle_new_conversation()
+
+        if not text and not files:
+            return
+
+        # 追加用户消息
+        user_msg = ChatMessage(role="user", content=text)
+        user_msg.message_id = ""  # 用户消息在流完成后由 tree refresh 更新
+        self._connect_message_signals(user_msg)
+        self._append_message(user_msg)
+
+        # 输入区状态
+        self._window.input_area.clear()
+        self._window.input_area.set_generating(True)
+
+        # 启动流式线程
+        self._start_stream(self._current_session_id, text, files)
+
+    def _handle_stop(self) -> None:
+        """停止当前生成。"""
+        self._ctrl.on_stop_generation()
+        self._window.input_area.set_generating(False)
+        if self._streaming_message:
+            self._streaming_message.finalize_stream()
+            self._streaming_message = None
+        if self._stream_worker:
+            self._stream_worker.request_abort()
+
+    def _handle_regenerate(self, session_id: str) -> None:
+        """
+        重新生成助手回复。
+
+        创建新的 assistant 消息气泡，
+        启动流式 regenerate。
+        """
+        if not session_id:
+            return
+
+        self._window.input_area.set_generating(True)
+
+        self._start_regenerate_stream(session_id)
+
+    # ── 流式引擎 ──────────────────────────────
+
+    def _start_stream(self, session_id: str, text: str, files: list[str]) -> None:
+        """
+        启动异步流式响应。
+
+        创建 AsyncStreamWorker 在后台线程中迭代
+        controller.on_send_message() 的 async generator，
+        通过 Qt 信号将每个 chunk 安全传递到主线程。
+        """
+        # 创建 assistant 消息气泡
+        assistant_msg = ChatMessage(role="assistant", content="")
+        assistant_msg.start_stream()
+        self._streaming_message = assistant_msg
+        self._connect_message_signals(assistant_msg)
+        self._append_message(assistant_msg)
+
+        # thinking block 引用 — 用可变容器在闭包中共享
+        thinking_ref: list = [None]
+
+        # 创建 worker + thread — 用局部变量捕获，防止 lambda 闭包过时
+        stream_thread = QThread()
+        stream_worker = AsyncStreamWorker()
+        stream_worker.moveToThread(stream_thread)
+        self._stream_thread = stream_thread
+        self._stream_worker = stream_worker
+
+        def on_chunk(delta: str, is_done: bool, chunk_type: str, _msg_id: str):
+            """主线程：处理每个流式块。"""
+            if chunk_type == "thinking":
+                if thinking_ref[0] is None:
+                    thinking_ref[0] = ThinkingBlock()
+                    self._insert_before_last(thinking_ref[0])
+                thinking_ref[0].append_text(delta)
+            else:
+                if self._streaming_message:
+                    self._streaming_message.append_stream(delta)
+                    if _msg_id and not self._streaming_message.message_id:
+                        self._streaming_message.message_id = _msg_id
+                        self._window.message_list.register_message(
+                            _msg_id, self._streaming_message
+                        )
+
+            # 多对话模式：仅当用户在底部附近时才自动跟随
+            self._window.message_list.scroll_to_bottom()
+
+        def on_finished():
+            """流结束。"""
+            if self._streaming_message:
+                self._streaming_message.finalize_stream()
+                self._streaming_message = None
+            self._window.input_area.set_generating(False)
+            self._cleanup_stream_thread()
+            QTimer.singleShot(0, self._load_tree)
+            # 流结束后刷新聚合视图：用户若在底部附近则跟随，否则保持位置
+            _near = self._window.message_list.is_near_bottom()
+            QTimer.singleShot(0, lambda: self._load_all_messages(scroll_to_bottom=_near))
+
+        def on_error(error_msg: str):
+            """流出错。"""
+            print(f"[UI] Stream error: {error_msg}")
+            on_finished()
+
+        def on_aborted():
+            """流被用户中止。"""
+            if self._streaming_message:
+                self._streaming_message.finalize_stream()
+                self._streaming_message = None
+            self._window.input_area.set_generating(False)
+            self._cleanup_stream_thread()
+
+        stream_worker.chunk_ready.connect(on_chunk)
+        stream_worker.stream_finished.connect(on_finished)
+        stream_worker.stream_error.connect(on_error)
+        stream_worker.stream_aborted.connect(on_aborted)
+
+        # 清理信号连接
+        stream_thread.finished.connect(
+            lambda: self._cleanup_stream_thread()
         )
 
-        chat_area = ft.Stack(
-            controls=[
-                ft.Container(content=message_list, expand=True),  # 底层：消息列表
-                empty_hint,                                        # 顶层：空状态提示
-            ],
-            expand=True,
-        )
-
-        content_area = ft.Row(
-            controls=[
-                ft.Column(
-                    expand=True,
-                    spacing=0,
-                    controls=[
-                        chat_area,
-                        self._input_area,
-                    ],
-                ),
-                self._context_panel,
-                self._kg_panel,
-            ],
-            expand=True,
-            spacing=0,
-            vertical_alignment=ft.CrossAxisAlignment.STRETCH,
-        )
-
-        page.add(
-            ft.Row(
-                controls=[
-                    self._sidebar,
-                    ft.VerticalDivider(width=1, color=Colors.BORDER),
-                    content_area,
-                ],
-                expand=True,
-                spacing=0,
-                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+        # 在线程启动后运行流 — 用局部变量捕获，防止竞态
+        _ctrl = self._ctrl
+        stream_thread.started.connect(
+            lambda: stream_worker.run_stream(
+                _ctrl.on_send_message, session_id, text, files
             )
         )
 
-        self._load_tree()
+        stream_thread.start()
 
-    def _configure_page(self, page: ft.Page) -> None:
-        page.title = "DeepResearch"
-        page.theme_mode = ft.ThemeMode.DARK
-        page.theme = build_theme()
-        page.bgcolor = Colors.BG_BASE
-        page.padding = 0
-        page.spacing = 0
-        page.fonts = {
-            "JetBrains Mono": "https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4xD-IQ.woff2",
-            "Noto Sans SC": "https://fonts.gstatic.com/s/notosanssc/v36/k3kCo84MPvpLmixcA63oeAL7Iqp5IZJF9bmaG9_FnYxNbPzS5HE.woff2",
-        }
-        page.window.min_width = 900
-        page.window.min_height = 600
+    def _start_regenerate_stream(self, session_id: str) -> None:
+        """
+        启动重新生成流。
+        与 _start_stream 类似，但调用 controller.on_regenerate_message。
+        """
+        assistant_msg = ChatMessage(role="assistant", content="")
+        assistant_msg.start_stream()
+        self._streaming_message = assistant_msg
+        self._connect_message_signals(assistant_msg)
+        self._append_message(assistant_msg)
 
-    # ──────────────────────────────────────────
-    # 树数据加载（Phase 4）
-    # ──────────────────────────────────────────
+        thinking_ref: list = [None]
 
-    def _load_tree(self) -> None:
-        """从 Controller 获取树数据并加载到侧边栏树面板。"""
-        tree_nodes = self._ctrl.get_tree()
-        if self._sidebar:
-            self._sidebar.load_tree(tree_nodes)
+        stream_thread = QThread()
+        stream_worker = AsyncStreamWorker()
+        stream_worker.moveToThread(stream_thread)
+        self._stream_thread = stream_thread
+        self._stream_worker = stream_worker
 
-    def _load_history(self) -> None:
-        """[已弃用] Phase 4 使用 _load_tree() 代替。保留向后兼容。"""
-        self._load_tree()
+        def on_chunk(delta: str, is_done: bool, chunk_type: str, _msg_id: str):
+            if chunk_type == "thinking":
+                if thinking_ref[0] is None:
+                    thinking_ref[0] = ThinkingBlock()
+                    self._insert_before_last(thinking_ref[0])
+                thinking_ref[0].append_text(delta)
+            else:
+                if self._streaming_message:
+                    self._streaming_message.append_stream(delta)
+                    if _msg_id and not self._streaming_message.message_id:
+                        self._streaming_message.message_id = _msg_id
+                        self._window.message_list.register_message(
+                            _msg_id, self._streaming_message
+                        )
+            # 多对话模式：仅当用户在底部附近时才自动跟随
+            self._window.message_list.scroll_to_bottom()
 
-    # ──────────────────────────────────────────
-    # 对话生命周期
-    # ──────────────────────────────────────────
+        def on_finished():
+            if self._streaming_message:
+                self._streaming_message.finalize_stream()
+                self._streaming_message = None
+            self._window.input_area.set_generating(False)
+            self._cleanup_stream_thread()
+            QTimer.singleShot(0, self._load_tree)
+            # 流结束后刷新聚合视图：用户若在底部附近则跟随，否则保持位置
+            _near = self._window.message_list.is_near_bottom()
+            QTimer.singleShot(0, lambda: self._load_all_messages(scroll_to_bottom=_near))
 
-    def _handle_new_conversation(self) -> None:
-        """新建对话（默认放在根目录"未分类"下）。"""
-        session_id = self._ctrl.on_new_conversation()
-        self._current_session_id = session_id
-        self._clear_message_list()
-        self._set_empty_hint(True)
-        if self._sidebar:
-            self._sidebar.set_active(session_id)
-        self._load_tree()
+        def on_error(error_msg: str):
+            print(f"[UI] Regenerate error: {error_msg}")
+            on_finished()
 
-    def _handle_new_conversation_in_folder(self, parent_id: str | None) -> None:
-        """在指定目录下新建对话。"""
-        session_id = self._ctrl.on_new_conversation(parent_id=parent_id)
-        self._current_session_id = session_id
-        self._clear_message_list()
-        self._set_empty_hint(True)
-        if self._sidebar:
-            self._sidebar.set_active(session_id)
-        self._load_tree()
+        def on_aborted():
+            if self._streaming_message:
+                self._streaming_message.finalize_stream()
+                self._streaming_message = None
+            self._window.input_area.set_generating(False)
+            self._cleanup_stream_thread()
 
-    def _handle_switch_conversation(self, session_id: str) -> None:
-        print(f"[UI   ] _handle_switch_conversation: node={session_id}, "
-              f"multi_conv={app_config.multi_conv_mode}")
-        self._current_session_id = session_id
-        if app_config.multi_conv_mode:
-            # Phase 5: 加载所有启用对话的消息（合并时间线）
-            messages = self._ctrl.on_get_multi_conversation_messages()
-            print(f"[UI   ] multi_conv 模式: 获取到 {len(messages)} 条消息")
-            # 如果 multi_conv 模式无结果（例如无 MessageNode），
-            # 回退到加载当前点击节点的消息
-            if not messages:
-                print(f"[UI   ] multi_conv 无消息，回退到按节点加载: {session_id}")
-                messages = self._ctrl.on_load_messages_for_node(session_id)
-            self._rebuild_message_list(messages)
-        else:
-            # Phase 5: 以树结构为依据加载该节点对应的消息
-            # 不再依赖 conversation_id，直接通过树中存储的 message_id 引用查询
-            messages = self._ctrl.on_load_messages_for_node(session_id)
-            print(f"[UI   ] 单节点模式: 获取到 {len(messages)} 条消息")
-            self._rebuild_message_list(messages)
-        if self._sidebar:
-            self._sidebar.set_active(session_id)
-        if self._page:
-            self._page.update()
+        stream_worker.chunk_ready.connect(on_chunk)
+        stream_worker.stream_finished.connect(on_finished)
+        stream_worker.stream_error.connect(on_error)
+        stream_worker.stream_aborted.connect(on_aborted)
 
-    def _handle_delete_conversation(self, session_id: str) -> None:
-        self._ctrl.on_delete_conversation(session_id)
-        if session_id == self._current_session_id:
-            self._current_session_id = ""
-            self._clear_message_list()
-            self._set_empty_hint(True)
-        self._load_tree()
-        if self._page:
-            self._page.update()
-
-    # ──────────────────────────────────────────
-    # 树操作（Phase 4）
-    # ──────────────────────────────────────────
-
-    def _handle_create_folder(self, parent_id: str | None, title: str) -> None:
-        """创建新目录。"""
-        from app.ui.widgets.dialogs import show_new_folder_dialog
-
-        def on_confirm(name: str) -> None:
-            print(f"[TREE] 创建目录: parent={parent_id} name={name}")
-            self._ctrl.on_create_folder(parent_id, name)
-            self._load_tree()
-
-        show_new_folder_dialog(
-            self._page,
-            on_confirm=on_confirm,
-            default_title=title or "新文件夹",
+        stream_thread.finished.connect(
+            lambda: self._cleanup_stream_thread()
         )
 
-    def _handle_rename_node(self, node_id: str) -> None:
-        """重命名节点。"""
-        from app.ui.widgets.dialogs import show_rename_dialog
+        _ctrl = self._ctrl
+        stream_thread.started.connect(
+            lambda: stream_worker.run_stream(
+                _ctrl.on_regenerate_message, session_id, ""
+            )
+        )
 
-        # 获取当前名称
+        stream_thread.start()
+
+
+    def _load_scroll_positions(self) -> None:
+        """Phase 5: 从磁盘加载滚动位置记录。"""
+        import json
+        import os
+
+        path = os.path.join("data", "scroll_positions.json")
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    self._scroll_states = json.load(f)
+        except Exception:
+            self._scroll_states = {}
+
+    def _save_scroll_positions(self) -> None:
+        """Phase 5: 将滚动位置持久化到磁盘。"""
+        import json
+        import os
+
+        os.makedirs("data", exist_ok=True)
+        path = os.path.join("data", "scroll_positions.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._scroll_states, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _cleanup_stream_thread(self) -> None:
+        """清理流式工作线程资源（幂等）。"""
+        worker = self._stream_worker
+        thread = self._stream_thread
+
+        # 置空引用，防止重入
+        self._stream_worker = None
+        self._stream_thread = None
+
+        if worker is not None:
+            try:
+                worker.chunk_ready.disconnect()
+                worker.stream_finished.disconnect()
+                worker.stream_error.disconnect()
+                worker.stream_aborted.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            worker.deleteLater()
+
+        if thread is not None:
+            thread.quit()
+            thread.wait(2000)
+            thread.deleteLater()
+
+    # ── 树形结构操作 ──────────────────────────
+
+    def _on_tree_switch(self, node_id: str) -> None:
+        """
+        树节点点击 → 仅设置活跃对话 + 滚动/高亮，不重新加载消息列表。
+
+        多对话模式：消息列表始终显示所有已启用消息的聚合视图。
+        点击树节点仅用于：
+        1. 设置 _current_session_id（后续发送消息的目标对话）
+        2. 如果是消息节点 → 在消息列表中滚动到该消息并高亮
+        3. 如果是对话/文件夹节点 → 在侧边栏高亮
+        """
+        print(f"[UI] Tree switch to node: {node_id}")
+
+        # 查找节点信息，确定 _current_session_id 和滚动目标
+        target_message_id: str | None = None
+        for n in self._tree_nodes:
+            if n.id == node_id:
+                if n.node_type == "message":
+                    target_message_id = node_id
+                    # 消息节点：发送目标为其所属对话
+                    self._current_session_id = n.parent_id or ""
+                elif n.node_type == "conversation":
+                    self._current_session_id = node_id
+                # folder 节点不改变 _current_session_id
+                break
+
+        # 侧边栏高亮
+        self._window.sidebar.set_active(
+            self._current_session_id or node_id
+        )
+
+        # 如果是消息节点，滚动到该消息并高亮
+        if target_message_id:
+            self._pending_scroll_target = target_message_id
+            QTimer.singleShot(0, lambda: self._do_scroll_to_target(target_message_id))
+
+    def _on_tree_new_conversation(self, parent_id: str) -> None:
+        """
+        右键菜单 → 在指定目录下新建对话。
+        创建后设为当前发送目标，刷新树。不改变消息列表。
+        """
+        session_id = self._ctrl.on_new_conversation(parent_id=parent_id)
+        self._current_session_id = session_id
+        self._window.sidebar.set_active(session_id)
+        QTimer.singleShot(0, self._load_tree)
+
+    def _on_tree_new_folder(self, parent_id: str) -> None:
+        """
+        右键菜单 → 新建文件夹。
+        弹出 QInputDialog 输入目录名称，调用 controller 创建。
+        """
+        name, ok = QInputDialog.getText(
+            self._window,
+            "新建目录",
+            "目录名称:",
+            text="新文件夹",
+        )
+        if ok and name.strip():
+            self._ctrl.on_create_folder(parent_id, name.strip())
+            QTimer.singleShot(0, self._load_tree)
+
+    def _on_tree_rename(self, node_id: str) -> None:
+        """
+        右键菜单 → 重命名节点。
+        弹出 QInputDialog 输入新名称，调用 controller 重命名。
+        """
+        # 从当前树数据中获取当前标题作为预填值
         current_title = ""
-        tree_nodes = self._ctrl.get_tree()
-        for n in tree_nodes:
+        for n in self._tree_nodes:
             if n.id == node_id:
                 current_title = n.title
                 break
 
-        def on_confirm(new_title: str) -> None:
-            print(f"[TREE] 重命名: {node_id} -> {new_title}")
-            self._ctrl.on_rename_node(node_id, new_title)
-            self._load_tree()
+        name, ok = QInputDialog.getText(
+            self._window,
+            "重命名",
+            "新名称:",
+            text=current_title,
+        )
+        if ok and name.strip():
+            self._ctrl.on_rename_node(node_id, name.strip())
+            QTimer.singleShot(0, self._load_tree)
 
-        show_rename_dialog(self._page, current_title, on_confirm=on_confirm)
+    def _on_tree_delete(self, node_id: str) -> None:
+        """
+        右键菜单 → 删除节点（软删除到回收站）。
+        弹出 QMessageBox 确认对话框。
+        """
+        # 从树数据中获取节点信息用于确认消息
+        node_title = node_id
+        is_folder = False
+        for n in self._tree_nodes:
+            if n.id == node_id:
+                node_title = n.title or node_id
+                is_folder = (n.node_type == "folder")
+                break
 
-    def _handle_toggle_enabled(self, node_id: str) -> None:
-        """切换节点启用/禁用状态（含级联）。"""
-        print(f"[TREE] 切换启用状态(级联): {node_id}")
-        self._ctrl.on_toggle_enabled(node_id)
-        self._load_tree()
-        # Phase 5: 多对话模式下，刷新聊天区的消息列表
-        if app_config.multi_conv_mode and self._current_session_id:
-            self._refresh_multi_conv_messages()
+        if is_folder:
+            msg = f"确定要删除目录「{node_title}」及其所有内容吗？\n\n删除后将移入回收站，可以恢复。"
+        else:
+            msg = f"确定要删除「{node_title}」吗？\n\n删除后将移入回收站，可以恢复。"
 
-    def _handle_move_node(self, node_id: str, target_parent_id: str) -> None:
-        """拖拽移动节点。"""
-        print(f"[TREE] 移动节点: {node_id} -> {target_parent_id}")
-        self._ctrl.on_move_node(node_id, target_parent_id)
-        self._load_tree()
-
-    def _handle_soft_delete_node(self, node_id: str) -> None:
-        """软删除节点（移入回收站）。"""
-        from app.ui.widgets.dialogs import show_confirm_dialog
-
-        def on_confirm() -> None:
-            print(f"[TREE] 软删除节点: {node_id}")
-
-            # 检查当前活跃对话是否在待删除子树中
-            should_clear = False
-            if self._current_session_id and self._current_session_id != node_id:
-                # 收集被删节点的所有后代 ID
-                tree_nodes = self._ctrl.get_tree()
-                children_map: dict[str | None, list] = {}
-                for n in tree_nodes:
-                    pid = n.parent_id
-                    if pid not in children_map:
-                        children_map[pid] = []
-                    children_map[pid].append(n)
-
-                descendant_ids: set[str] = set()
-                queue = [node_id]
-                while queue:
-                    cur = queue.pop(0)
-                    for child in children_map.get(cur, []):
-                        descendant_ids.add(child.id)
-                        queue.append(child.id)
-
-                if self._current_session_id in descendant_ids:
-                    should_clear = True
-
-            self._ctrl.on_soft_delete_node(node_id)
-            if node_id == self._current_session_id or should_clear:
-                self._current_session_id = ""
-                self._clear_message_list()
-                self._set_empty_hint(True)
-            self._load_tree()
-
-        show_confirm_dialog(
-            self._page,
-            title="删除确认",
-            message="确定要删除吗？将移入回收站，可恢复。",
-            on_confirm=on_confirm,
+        reply = QMessageBox.question(
+            self._window,
+            "确认删除",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
 
-    def _handle_manage_context(self, folder_id: str) -> None:
-        """管理目录关联的 ContextBlock。"""
-        from app.ui.widgets.dialogs import show_context_block_manager_dialog
+        if reply == QMessageBox.StandardButton.Yes:
+            self._ctrl.on_soft_delete_node(node_id, mode="recursive")
+            QTimer.singleShot(0, self._load_tree)
+            # 如果删除的是当前发送目标对话，清空 _current_session_id
+            if node_id == self._current_session_id:
+                self._current_session_id = ""
+            # 被删除节点的消息从列表中消失，静默刷新
+            QTimer.singleShot(0, lambda: self._load_all_messages(scroll_to_bottom=False))
 
+    def _on_tree_toggle_enabled(self, node_id: str) -> None:
+        """
+        复选框点击 / 右键菜单 → 切换节点启用/禁用状态。
+
+        1. 持久化级联状态变更
+        2. 增量刷新树节点的 checkState（避免 _rebuild 竞态）
+        3. 静默刷新消息列表（保持当前滚动位置不变）
+        """
+        self._ctrl.on_toggle_enabled(node_id)
+        tree_nodes = self._ctrl.get_tree()
+        self._tree_nodes = tree_nodes
+        self._window.sidebar.tree_panel.refresh_enabled_states(tree_nodes)
+
+        # 静默刷新消息列表 — 保持滚动位置
+        QTimer.singleShot(0, lambda: self._load_all_messages(scroll_to_bottom=False))
+
+    def _refresh_multi_conv_messages(self) -> None:
+        """刷新多对话模式消息列表，保持滚动位置不变。"""
+        self._load_all_messages(scroll_to_bottom=False)
+
+    def _on_tree_move(self, node_id: str, target_parent_id: str) -> None:
+        """
+        拖拽放置 → 移动节点到目标目录下。
+        调用 controller 移动后刷新树。
+        """
+        print(f"[UI] Tree move: {node_id} -> {target_parent_id}")
+        self._ctrl.on_move_node(node_id, target_parent_id)
+        QTimer.singleShot(0, self._load_tree)
+
+    def _on_tree_manage_context(self, folder_id: str) -> None:
+        """
+        右键菜单 → 管理上下文块（仅目录节点）。
+        弹出上下文块管理对话框，选择要关联的块并保存。
+        """
         folder_info = self._ctrl.on_get_folder_context(folder_id)
+        folder_title = folder_info.get("title", "目录")
+        current_ids = folder_info.get("context_block_ids", [])
+
         all_blocks = self._ctrl.on_get_context_blocks()
 
-        def on_save(new_ids: list[str]) -> None:
-            print(f"[TREE] 更新上下文块 {folder_id}: {len(new_ids)} 个块")
-            self._ctrl.on_update_context_blocks(folder_id, new_ids)
-            self._load_tree()
-
+        from app.ui.widgets.dialogs import show_context_block_manager_dialog
         show_context_block_manager_dialog(
-            self._page,
-            folder_title=folder_info["title"],
-            all_blocks=all_blocks,
-            current_block_ids=folder_info["context_block_ids"],
-            on_save=on_save,
+            self._window,
+            folder_title,
+            all_blocks,
+            current_ids,
+            on_save=lambda selected_ids: self._on_ctx_save_folder_blocks(
+                folder_id, selected_ids
+            ),
         )
 
-    def _handle_attach_file(self, folder_id: str) -> None:
-        """挂载附件到目录。"""
+    def _on_ctx_save_folder_blocks(
+        self, folder_id: str, selected_ids: list[str]
+    ) -> None:
+        """保存目录关联的上下文块。"""
+        self._ctrl.on_update_context_blocks(folder_id, selected_ids)
+        QTimer.singleShot(0, self._load_tree)
 
-        def on_result(e: ft.FilePickerResultEvent) -> None:
-            if e.files:
-                for f in e.files:
-                    print(f"[TREE] 挂载附件到 {folder_id}: {f.path}")
-                    self._ctrl.on_attach_file(folder_id, f.path)
-                self._load_tree()
+    def _on_tree_attach_file(self, folder_id: str) -> None:
+        """
+        右键菜单 → 添加附件（仅目录节点）。
+        打开原生文件对话框，选择文件后调用 controller 挂载。
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self._window,
+            "选择附件",
+            "",
+            "支持的文件 (*.txt *.md *.json *.docx *.pdf);;所有文件 (*.*)",
+        )
+        if paths:
+            for p in paths:
+                self._ctrl.on_attach_file(folder_id, p)
+            QTimer.singleShot(0, self._load_tree)
 
-        fp = ft.FilePicker()
-        fp.on_result = on_result
-        self._page.overlay.append(fp)
-        self._page.update()
-        fp.pick_files(allow_multiple=True)
+    # ── Sidebar 顶部按钮 ─────────────────────
+
+    def _handle_new_root_folder(self) -> None:
+        """
+        Sidebar 顶部"文件夹"按钮 → 在根目录下创建新文件夹。
+        使用默认名称"新文件夹"。
+        """
+        self._ctrl.on_create_folder(None, "新文件夹")
+        QTimer.singleShot(0, self._load_tree)
+
+    # ── Sidebar 底部入口 ─────────────────────
 
     def _handle_open_trash(self) -> None:
-        """打开回收站对话框。"""
-        from app.ui.widgets.dialogs import show_recycle_bin_dialog
-
-        entries = self._ctrl.on_list_trash()
-
-        def on_restore(trash_entry_id: str) -> None:
-            print(f"[TREE] 恢复: {trash_entry_id}")
-            self._ctrl.on_restore_from_trash(trash_entry_id)
-            self._load_tree()
-
-        def on_permanent_delete(trash_entry_id: str) -> None:
-            print(f"[TREE] 彻底删除: {trash_entry_id}")
-            self._ctrl.on_permanently_delete(trash_entry_id)
-            self._load_tree()
-
-        def on_clear_all() -> None:
-            count = self._ctrl.on_clear_trash()
-            print(f"[TREE] 清空回收站: {count} 个条目")
-            self._load_tree()
-
-        show_recycle_bin_dialog(
-            self._page,
-            trash_entries=entries,
-            on_restore=on_restore,
-            on_permanent_delete=on_permanent_delete,
-            on_clear_all=on_clear_all,
-        )
-
-    # ──────────────────────────────────────────
-    # 消息发送
-    # ──────────────────────────────────────────
-
-    def _handle_send(self, text: str, files: list[str]) -> None:
-        if not self._current_session_id:
-            self._handle_new_conversation()
-        if not text and not files:
+        """
+        Sidebar 底部"回收站"入口。
+        弹出回收站对话框，列出所有已删除条目，
+        支持恢复、彻底删除和清空。
+        """
+        try:
+            entries = self._ctrl.on_list_trash()
+        except Exception as exc:
+            print(f"[UI] List trash error: {exc}")
+            QMessageBox.warning(self._window, "错误", f"无法加载回收站: {exc}")
             return
 
-        self._append_message(ChatMessage(role="user", content=text))
-        self._set_empty_hint(False)
-
-        if self._input_area:
-            self._input_area.clear()
-            self._input_area.set_generating(True)
-
-        if self._page:
-            self._page.run_task(
-                self._stream_response,
-                self._current_session_id,
-                text,
-                files,
-            )
-
-    def _handle_stop(self) -> None:
-        self._ctrl.on_stop_generation()
-        if self._input_area:
-            self._input_area.set_generating(False)
-        if self._streaming_message:
-            self._streaming_message.finalize_stream()
-            self._streaming_message = None
-
-    async def _stream_response(
-        self, session_id: str, text: str, files: list[str]
-    ) -> None:
-        from app.ui.widgets.chat_message import ThinkingBlock
-
-        # 思考块（仅 Reasoner 模式有）
-        thinking_block: ThinkingBlock | None = None
-
-        # 助手回复气泡
-        _msg_holder: list = []
-        def _on_remember(e):
-            msg = _msg_holder[0] if _msg_holder else None
-            self._page.run_task(self._do_remember, session_id, msg)
-        assistant_msg = ChatMessage(
-            role="assistant",
-            content="",
-            on_copy=self._make_copy_handler(),
-            on_regenerate=self._make_regenerate_handler(session_id),
-            on_remember=_on_remember,
+        from app.ui.widgets.dialogs import show_recycle_bin_dialog
+        show_recycle_bin_dialog(
+            self._window,
+            entries,
+            on_restore=self._on_trash_restore,
+            on_permanent_delete=self._on_trash_permanent_delete,
+            on_clear_all=self._on_trash_clear_all,
         )
-        _msg_holder.append(assistant_msg)
-        assistant_msg.start_stream()
-        self._streaming_message = assistant_msg
-        self._append_message(assistant_msg)
 
-        try:
-            async for chunk_vm in self._ctrl.on_send_message(session_id, text, files):
-                if chunk_vm.is_done:
-                    break
+    def _on_trash_restore(self, trash_entry_id: str) -> None:
+        """回收站：恢复条目。"""
+        self._ctrl.on_restore_from_trash(trash_entry_id)
+        QTimer.singleShot(0, self._load_tree)
 
-                if chunk_vm.chunk_type == "thinking":
-                    if thinking_block is None:
-                        thinking_block = ThinkingBlock()
-                        self._insert_before_last(thinking_block)
-                    thinking_block.append_text(chunk_vm.delta)
-                else:
-                    assistant_msg.append_stream(chunk_vm.delta)
+    def _on_trash_permanent_delete(self, trash_entry_id: str) -> None:
+        """回收站：彻底删除条目。"""
+        self._ctrl.on_permanently_delete(trash_entry_id)
+        QTimer.singleShot(0, self._load_tree)
 
-                if self._page:
-                    self._page.update()
-                await asyncio.sleep(0)
-        finally:
-            assistant_msg.finalize_stream()
-            self._streaming_message = None
-            if self._input_area:
-                self._input_area.set_generating(False)
-            if self._page:
-                self._page.update()
-            # 刷新树面板以更新摘要/消息计数
-            self._load_tree()
-
-    # ──────────────────────────────────────────
-    # 上下文面板
-    # ──────────────────────────────────────────
+    def _on_trash_clear_all(self) -> None:
+        """回收站：清空全部。"""
+        count = self._ctrl.on_clear_trash()
+        QTimer.singleShot(0, self._load_tree)
+        print(f"[UI] Cleared {count} items from trash")
 
     def _handle_open_context_panel(self) -> None:
-        if self._context_panel:
-            self._refresh_context_panel()
-            self._context_panel.show()
+        """
+        Sidebar 底部"上下文管理"入口。
+        显示右侧上下文管理面板并刷新数据。
+        """
+        self._refresh_context_panel()
+        self._window.show_context_panel()
 
-    def _handle_close_context_panel(self) -> None:
-        if self._context_panel:
-            self._context_panel.hide()
+    def _handle_open_kg_panel(self) -> None:
+        """
+        Sidebar 底部"知识图谱"入口。
+        显示右侧知识图谱面板并刷新数据。
+        """
+        self._refresh_kg_panel()
+        self._window.show_kg_panel()
 
-    def _handle_remove_context_block(self, block_id: str) -> None:
+    # ── 上下文面板操作 ──────────────────────
+
+    def _refresh_context_panel(self) -> None:
+        """
+        刷新上下文管理面板数据：
+        - 加载所有上下文块
+        - 加载拼接预览
+        - 加载模板库
+        """
+        ctx_panel = self._window.context_panel
+        blocks = self._ctrl.on_get_context_blocks()
+        ctx_panel.load_blocks(blocks)
+
+        preview = self._ctrl.on_get_context_preview()
+        ctx_panel.set_preview(preview)
+
+        templates = self._ctrl.on_get_templates()
+        ctx_panel.load_templates(templates)
+
+    def _on_ctx_remove_block(self, block_id: str) -> None:
+        """上下文面板：移除上下文块。"""
         self._ctrl.on_remove_context_block(block_id)
         self._refresh_context_panel()
 
-    def _handle_toggle_context_block(self, block_id: str, enabled: bool) -> None:
+    def _on_ctx_toggle_block(self, block_id: str, enabled: bool) -> None:
+        """上下文面板：切换块启用/禁用状态。"""
         self._ctrl.on_toggle_context_block(block_id, enabled)
         self._refresh_context_panel()
 
-    def _handle_delete_template(self, template_id: str) -> None:
-        self._ctrl.on_delete_template(template_id)
-        self._refresh_context_panel()
-
-    def _handle_apply_template(self, template_id: str) -> None:
-        if template_id.startswith("__save__:"):
-            name = template_id[len("__save__:"):]
-            self._ctrl.on_save_current_as_template(name)
-        else:
-            self._ctrl.on_apply_template(template_id)
-        self._refresh_context_panel()
-
-    def _handle_add_text_block(self, text: str) -> None:
+    def _on_ctx_add_text_block(self, text: str) -> None:
+        """上下文面板：添加自定义文本块。"""
         self._ctrl.on_add_text_block(text)
         self._refresh_context_panel()
 
-    def _handle_open_kg_panel(self) -> None:
-        if self._kg_panel is None:
-            return
-        self._kg_panel.load_data(
-            entities=self._ctrl.on_get_all_entities(),
-            relations=self._ctrl.on_get_all_relations(),
-            stats=self._ctrl.on_get_kg_stats(),
-        )
-        self._kg_panel.show()
+    def _on_ctx_save_template(self, name: str) -> None:
+        """上下文面板：保存当前块为模板。"""
+        result = self._ctrl.on_save_current_as_template(name)
+        print(f"[UI] Template saved: {result}")
+        self._refresh_context_panel()
 
-    def _handle_close_kg_panel(self) -> None:
-        if self._kg_panel:
-            self._kg_panel.hide()
+    def _on_ctx_apply_template(self, template_id: str) -> None:
+        """上下文面板：应用模板。"""
+        self._ctrl.on_apply_template(template_id)
+        self._refresh_context_panel()
 
-    def _handle_delete_kg_entity(self, entity_name: str) -> None:
+    def _on_ctx_delete_template(self, template_id: str) -> None:
+        """上下文面板：删除模板。"""
+        self._ctrl.on_delete_template(template_id)
+        self._refresh_context_panel()
+
+    # ── 知识图谱面板操作 ────────────────────
+
+    def _refresh_kg_panel(self) -> None:
+        """
+        刷新知识图谱面板数据：
+        - 加载实体列表
+        - 加载关系列表
+        - 加载统计信息
+        """
+        kg_panel = self._window.kg_panel
+        entities = self._ctrl.on_get_all_entities()
+        relations = self._ctrl.on_get_all_relations()
+        stats = self._ctrl.on_get_kg_stats()
+        kg_panel.load_data(entities, relations, stats)
+
+    def _on_kg_delete_entity(self, entity_name: str) -> None:
+        """知识图谱面板：删除实体（同时删除相关关系）。"""
         self._ctrl.on_delete_kg_entity(entity_name)
-        self._handle_open_kg_panel()
+        self._refresh_kg_panel()
 
-    def _handle_delete_kg_relation(self, relation_id: str) -> None:
+    def _on_kg_delete_relation(self, relation_id: str) -> None:
+        """知识图谱面板：删除单条关系。"""
         self._ctrl.on_delete_kg_relation(relation_id)
-        self._handle_open_kg_panel()
+        self._refresh_kg_panel()
 
-    def _refresh_context_panel(self) -> None:
-        if not self._context_panel:
-            return
-        from app.controllers.view_models import ContextBlockVM
-        blocks_data = self._ctrl.on_get_context_blocks()
-        block_vms = [
-            ContextBlockVM(
-                id=b["id"],
-                label=b["label"],
-                preview=b["preview"],
-                enabled=b["enabled"],
-            )
-            for b in blocks_data
-        ]
-        self._context_panel.load_blocks(block_vms)
-        preview = self._ctrl.on_get_context_preview()
-        self._context_panel.set_preview(preview)
-        from app.controllers.view_models import TemplateVM
-        templates_data = self._ctrl.on_get_templates()
-        template_vms = [
-            TemplateVM(id=t["id"], name=t["name"], description=t["description"])
-            for t in templates_data
-        ]
-        self._context_panel.load_templates(template_vms)
+    # ── 知识图谱提取（记住按钮）───────────────
 
-    def _insert_before_last(self, control) -> None:
-        if not self._message_list_ref.current:
-            return
-        lst = self._message_list_ref.current.controls
-        if lst:
-            lst.insert(len(lst) - 1, control)
-        else:
-            lst.append(control)
-        self._message_list_ref.current.update()
-
-    def _append_message(self, msg: ChatMessage) -> None:
-        if self._message_list_ref.current:
-            self._message_list_ref.current.controls.append(msg)
-            self._message_list_ref.current.update()
-
-    def _clear_message_list(self) -> None:
-        if self._message_list_ref.current:
-            self._message_list_ref.current.controls.clear()
-            self._message_list_ref.current.update()
-
-    def _refresh_multi_conv_messages(self) -> None:
-        """Phase 5: 刷新聊天区，展示所有启用对话的消息（合并时间线）。"""
+    def _handle_remember(self, msg: ChatMessage) -> None:
+        """处理"记住"按钮点击。"""
         if not self._current_session_id:
             return
-        messages = self._ctrl.on_get_multi_conversation_messages()
-        self._rebuild_message_list(messages)
-        if self._page:
-            self._page.update()
 
-    def _rebuild_message_list(self, message_vms: list) -> None:
-        if not self._message_list_ref.current:
-            print("[UI   ] _rebuild_message_list: message_list_ref 未就绪，跳过")
-            return
-        print(f"[UI   ] _rebuild_message_list: 重建消息列表，{len(message_vms)} 条消息")
-        self._message_list_ref.current.controls.clear()
-        has_messages = bool(message_vms)
-        self._set_empty_hint(not has_messages)
-        for vm in message_vms:
-            self._message_list_ref.current.controls.append(
-                ChatMessage(
-                    role=vm.role,
-                    content=vm.content,
-                    message_id=vm.id,
-                    is_thinking=getattr(vm, "is_thinking", False),
-                    on_copy=self._make_copy_handler(),
-                    on_regenerate=self._make_regenerate_handler(
-                        self._current_session_id
-                    ),
-                    on_remember=self._make_remember_handler_simple(
-                        self._current_session_id
-                    ),
-                )
-            )
-        self._message_list_ref.current.update()
+        msg.set_remember_loading()
 
-    def _set_empty_hint(self, visible: bool) -> None:
-        if self._empty_hint_ref.current:
-            self._empty_hint_ref.current.visible = visible
-            self._empty_hint_ref.current.update()
-
-    async def _do_remember(
-        self, session_id: str, msg: "ChatMessage | None"
-    ) -> None:
-        try:
-            result = await self._ctrl.on_remember_conversation(session_id)
-            print(f"[KG] {result}")
+        def on_result(result: str):
             success = "提取完成" in result or "✓" in result
-        except Exception as ex:
-            print(f"[KG] 提取异常: {ex}")
-            success = False
-        if msg is not None:
             msg.set_remember_done(success)
-        if self._page:
-            self._page.update()
 
-    def _make_remember_handler_simple(self, session_id: str):
-        def _handler(e):
-            control = e.control
-            msg = None
-            parent = getattr(control, 'parent', None)
-            while parent is not None:
-                from app.ui.widgets.chat_message import ChatMessage as CM
-                if isinstance(parent, CM):
-                    msg = parent
-                    break
-                parent = getattr(parent, 'parent', None)
-            if self._page:
-                self._page.run_task(self._do_remember, session_id, msg)
-        return _handler
+        def on_error(error_msg: str):
+            print(f"[KG] Extract error: {error_msg}")
+            msg.set_remember_done(False)
 
-    def _make_copy_handler(self):
-        def _handler(e):
-            if isinstance(e.control.parent, ChatMessage):
-                self._page.set_clipboard(e.control.parent.current_content)
-        return _handler
-
-    def _make_regenerate_handler(self, session_id: str):
-        def _handler(e):
-            if self._page:
-                self._page.run_task(
-                    self._stream_regenerate, session_id
-                )
-        return _handler
-
-    async def _stream_regenerate(self, session_id: str) -> None:
-        """流式重新生成最后一条助手回复。"""
-        from app.ui.widgets.chat_message import ThinkingBlock
-
-        thinking_block: ThinkingBlock | None = None
-
-        _msg_holder: list = []
-        def _on_remember(e):
-            msg = _msg_holder[0] if _msg_holder else None
-            self._page.run_task(self._do_remember, session_id, msg)
-        assistant_msg = ChatMessage(
-            role="assistant",
-            content="",
-            on_copy=self._make_copy_handler(),
-            on_regenerate=self._make_regenerate_handler(session_id),
-            on_remember=_on_remember,
+        thread, runner = run_async_in_thread(
+            self._ctrl.on_remember_conversation,
+            self._current_session_id,
+            on_result=on_result,
+            on_error=on_error,
         )
-        _msg_holder.append(assistant_msg)
-        assistant_msg.start_stream()
-        self._streaming_message = assistant_msg
-        self._append_message(assistant_msg)
-
-        try:
-            async for chunk_vm in self._ctrl.on_regenerate_message(
-                session_id, ""
-            ):
-                if chunk_vm.is_done:
-                    break
-
-                if chunk_vm.chunk_type == "thinking":
-                    if thinking_block is None:
-                        thinking_block = ThinkingBlock()
-                        self._insert_before_last(thinking_block)
-                    thinking_block.append_text(chunk_vm.delta)
-                else:
-                    assistant_msg.append_stream(chunk_vm.delta)
-
-                if self._page:
-                    self._page.update()
-                await asyncio.sleep(0)
-        finally:
-            assistant_msg.finalize_stream()
-            self._streaming_message = None
-            if self._input_area:
-                self._input_area.set_generating(False)
-            if self._page:
-                self._page.update()
-            self._load_tree()
+        self._async_task_threads.append(thread)
+        # 清理已完成线程的引用
+        thread.finished.connect(
+            lambda t=thread: self._async_task_threads.remove(t)
+            if t in self._async_task_threads else None
+        )

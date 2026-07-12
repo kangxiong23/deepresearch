@@ -133,6 +133,7 @@ def _migrate_if_needed(conn: sqlite3.Connection) -> None:
         print("[MIGRATE] tree.json 已存在，清理残留的旧 conversations 表")
         conn.execute("PRAGMA foreign_keys=OFF")
         conn.execute("ALTER TABLE conversations RENAME TO conversations_bak")
+        conn.commit()
         conn.execute("PRAGMA foreign_keys=ON")
         return
 
@@ -259,10 +260,12 @@ def _finalize_migration(conn: sqlite3.Connection) -> None:
             SELECT id, conversation_id, role, content, is_thinking, created_at, token_count
             FROM messages_old
         """)
+        conn.commit()  # 确保 INSERT 持久化
         copied = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         print(f"[MIGRATE] 从 messages_old 复制了 {result} 条 → messages 表现在有 {copied} 行")
 
     conn.execute("DROP TABLE IF EXISTS messages_old")
+    conn.commit()  # 确保 DROP 持久化
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation "
@@ -275,6 +278,7 @@ def _finalize_migration(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if conv_exists:
         conn.execute("ALTER TABLE conversations RENAME TO conversations_bak")
+        conn.commit()  # 确保 RENAME 持久化
         print("[MIGRATE] conversations → conversations_bak")
 
     conn.execute("PRAGMA foreign_keys=ON")

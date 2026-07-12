@@ -1,11 +1,18 @@
 # File: main.py
-# Responsibility: 应用入口——装配完整依赖树，启动 Flet 应用。
+# Responsibility: 应用入口——装配完整依赖树，启动 PySide6 桌面应用。
 #                 这是整个项目依赖关系最集中、最透明的地方：
 #                 调试时只需在此文件看清楚"谁注入了谁"，调用链立刻清晰。
 # Input:  无
-# Output: 运行中的 Flet 桌面应用
+# Output: 运行中的 PySide6 桌面应用
 
-import flet as ft
+import sys
+import faulthandler
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QPalette, QColor
+
+# 启用 faulthandler — segfault 时输出 Python 堆栈到 stderr
+faulthandler.enable()
 
 # ── 基础设施 ──────────────────────────────────
 from app.storage.database import initialize_database
@@ -32,7 +39,7 @@ from app.storage.kg_store import KGStore
 from app.controllers.app_controller import AppController
 from app.controllers.settings_controller import SettingsController
 
-# ── UI ────────────────────────────────────────
+# ── UI (PySide6) ──────────────────────────────
 from app.ui.app import ChatApp
 
 # ── 日志 ─────────────────────────────────────
@@ -41,7 +48,7 @@ from app.utils.async_utils import get_logger
 logger = get_logger("MAIN", "main")
 
 
-def main(page: ft.Page) -> None:
+def assemble_app() -> ChatApp:
     """
     依赖树装配顺序：
         Storage → Adapters → Core Services → Controllers → UI
@@ -107,15 +114,60 @@ def main(page: ft.Page) -> None:
     app_controller.set_knowledge_service(knowledge_service)
     settings_controller = SettingsController()
 
-    # ── 6. UI ─────────────────────────────────
+    # ── 6. UI (PySide6) ───────────────────────
     chat_app = ChatApp(
         app_controller=app_controller,
         settings_controller=settings_controller,
     )
-    chat_app.build(page)
+
+    logger.info("=== Dependency assembly complete ===")
+    return chat_app
+
+
+def _apply_dark_palette(app: QApplication) -> None:
+    """为 QApplication 设置深色调色板，确保原生控件（展开箭头等）在深色背景下可见。"""
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#0D0F14"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#E8EAF0"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#13161D"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#1A1E28"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#E8EAF0"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#1A1E28"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#E8EAF0"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#4A9EFF"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#0D0F14"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#1A1E28"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#E8EAF0"))
+    # 禁用态颜色组 — 确保禁用文字在深色背景上也可见
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#3D4255"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor("#3D4255"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#3D4255"))
+    app.setPalette(palette)
+
+
+def main() -> int:
+    """应用程序主入口。"""
+    # PySide6 要求在创建任何 QWidget 之前先创建 QApplication
+    app = QApplication(sys.argv)
+    app.setApplicationName("DeepResearch")
+    app.setOrganizationName("DeepResearch")
+
+    # 使用 Fusion 风格获得跨平台一致的渲染效果，
+    # 深色背景下的原生控件（树展开箭头等）需要 Fusion 风格才能正确使用调色板颜色
+    app.setStyle("Fusion")
+
+    # 应用深色调色板，确保原生控件（树展开箭头等）在深色背景下可见
+    _apply_dark_palette(app)
+
+    # 装配依赖树并构建 UI
+    chat_app = assemble_app()
+    chat_app.show()
 
     logger.info("=== UI mounted, app ready ===")
 
+    # 进入 Qt 事件循环
+    return app.exec()
+
 
 if __name__ == "__main__":
-    ft.run(main, view=ft.AppView.FLET_APP)
+    sys.exit(main())
