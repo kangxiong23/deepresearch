@@ -268,13 +268,17 @@ class ContextService:
             return ([], [])
 
         # 第一步：收集祖先链（从近到远，即 node→root 方向）
-        ancestors: list = []  # list of FolderNode, bottom-up order
+        # 包括 ConversationNode 自身（它也可能挂载了上下文块和附件）
+        ancestors: list = []  # list of FolderNode | ConversationNode, bottom-up order
+        # 首先检查节点自身（如果是 ConversationNode，它自己的资源也要收集）
+        if isinstance(node, ConversationNode):
+            ancestors.append(node)
         current_id: str | None = node.parent_id
         while current_id is not None:
             parent = self._tree.get_node(current_id)
             if parent is None:
                 break
-            if isinstance(parent, FolderNode):
+            if isinstance(parent, (FolderNode, ConversationNode)):
                 ancestors.append(parent)
             current_id = parent.parent_id
 

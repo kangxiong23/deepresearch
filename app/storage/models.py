@@ -212,9 +212,12 @@ class ConversationNode(TreeNode):
 
     id 沿用原 Conversation.id（UUID 格式），确保 messages 表外键不受影响。
     作为目录节点，可包含 MessageNode 子节点（每条 message 表记录对应一个 MessageNode）。
+    与 FolderNode 一样支持挂载上下文块和附件。
     """
     summary: str = ""
     message_count: int = 0
+    context_block_ids: list[str] = field(default_factory=list)
+    attachment_paths: list[str] = field(default_factory=list)
     node_type: NodeType = field(default=NodeType.CONVERSATION, init=False)
 
 

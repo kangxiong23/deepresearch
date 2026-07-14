@@ -29,6 +29,7 @@ Thumbs.db
 *.db
 *.db-shm
 *.db-wal
+*.json
 data/context/
 data/knowledge_graph/
 data/tree/

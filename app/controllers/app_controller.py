@@ -584,6 +584,8 @@ class AppController:
                     has_children=has_children,
                     depth=depth,
                     message_count=getattr(node, "message_count", 0),
+                    context_block_count=len(getattr(node, "context_block_ids", [])),
+                    attachment_count=len(getattr(node, "attachment_paths", [])),
                 )
             result.append(vm)
 
@@ -656,16 +658,16 @@ class AppController:
 
     def on_get_folder_context(self, folder_id: str) -> dict:
         """
-        UI 调用：获取目录的上下文块信息（供管理对话框使用）。
+        UI 调用：获取节点（目录或对话）的上下文块信息（供管理对话框使用）。
 
         Returns:
             {"title": str, "context_block_ids": list[str]}
         """
         node = self._conversation_svc.get_node(folder_id)
         if node is None:
-            return {"title": "目录", "context_block_ids": []}
+            return {"title": "节点", "context_block_ids": []}
         return {
-            "title": getattr(node, "title", "目录"),
+            "title": getattr(node, "title", "节点"),
             "context_block_ids": list(getattr(node, "context_block_ids", [])),
         }
 

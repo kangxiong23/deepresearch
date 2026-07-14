@@ -57,6 +57,7 @@ class Sidebar(QWidget):
     open_context_panel_clicked = Signal()
     open_kg_panel_clicked = Signal()
     search_requested = Signal(str)  # 携带搜索关键词（去抖后）
+    multi_select_toggled = Signal(bool)  # True=进入多选, False=退出多选
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -189,7 +190,7 @@ class Sidebar(QWidget):
     # ── 操作按钮行 ────────────────────────────────
 
     def _build_button_row(self) -> QWidget:
-        """构建操作按钮行：新建对话 + 新建文件夹。"""
+        """构建操作按钮行：新建对话 + 新建文件夹 + 多选切换。"""
         # 新建对话按钮
         new_conv_btn = QPushButton("  ＋  对话")
         new_conv_btn.setFont(Fonts.body(Fonts.SIZE_SM, QFont.Weight.Medium))
@@ -226,15 +227,50 @@ class Sidebar(QWidget):
         """)
         new_folder_btn.clicked.connect(self.new_folder_clicked.emit)
 
-        # 按钮行布局
-        btn_layout = QHBoxLayout()
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.setSpacing(Spacing.SM)
-        btn_layout.addWidget(new_conv_btn, stretch=1)
-        btn_layout.addWidget(new_folder_btn, stretch=1)
+        # 多选切换按钮
+        self._multi_select_btn = QPushButton("  ☐  多选")
+        self._multi_select_btn.setFont(Fonts.body(Fonts.SIZE_SM, QFont.Weight.Medium))
+        self._multi_select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._multi_select_btn.setCheckable(True)
+        self._multi_select_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.BG_ELEVATED};
+                border: 1px solid {Colors.BORDER};
+                border-radius: {Radius.MD}px;
+                padding: 10px 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.BG_OVERLAY};
+            }}
+            QPushButton:checked {{
+                color: {Colors.BG_BASE};
+                background-color: {Colors.PRIMARY};
+                border-color: {Colors.PRIMARY};
+            }}
+        """)
+        self._multi_select_btn.toggled.connect(self._on_multi_select_toggled)
+
+        # 按钮行布局（两行：第一行"对话+文件夹"，第二行"多选"）
+        row1_layout = QHBoxLayout()
+        row1_layout.setContentsMargins(0, 0, 0, 0)
+        row1_layout.setSpacing(Spacing.SM)
+        row1_layout.addWidget(new_conv_btn, stretch=1)
+        row1_layout.addWidget(new_folder_btn, stretch=1)
+
+        row2_layout = QHBoxLayout()
+        row2_layout.setContentsMargins(0, 0, 0, 0)
+        row2_layout.setSpacing(Spacing.SM)
+        row2_layout.addWidget(self._multi_select_btn, stretch=1)
+
+        inner_layout = QVBoxLayout()
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        inner_layout.setSpacing(Spacing.SM)
+        inner_layout.addLayout(row1_layout)
+        inner_layout.addLayout(row2_layout)
 
         btn_row = QWidget()
-        btn_row.setLayout(btn_layout)
+        btn_row.setLayout(inner_layout)
 
         # 外层容器（添加 padding）
         wrapper = QWidget()
@@ -247,6 +283,14 @@ class Sidebar(QWidget):
         wrapper_layout.addWidget(btn_row)
 
         return wrapper
+
+    def _on_multi_select_toggled(self, checked: bool) -> None:
+        """多选按钮切换。"""
+        if checked:
+            self._multi_select_btn.setText("  ✕  退出多选")
+        else:
+            self._multi_select_btn.setText("  ☐  多选")
+        self.multi_select_toggled.emit(checked)
 
     # ── 底部入口 ──────────────────────────────────
 

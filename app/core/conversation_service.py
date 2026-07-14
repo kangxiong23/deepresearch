@@ -163,11 +163,13 @@ class ConversationService:
         - FolderNode → 递归收集所有后代 MessageNode.message_id，
                        批量加载全部消息
 
+        消息按 DFS 前序遍历（树结构顺序）排列。
+
         Args:
             node_id: 目标节点 ID（任意类型）
 
         Returns:
-            list[Message] — 按 created_at 升序排列的消息列表
+            list[Message] — 按 DFS 前序遍历排列的消息列表
         """
         node = self._tree.get_node(node_id)
         if node is None:
@@ -189,8 +191,7 @@ class ConversationService:
                 print(f"[CORE ] get_messages_for_node: 对话 {node_id} 无 MessageNode，"
                       f"回退到 conversation_id 查询")
                 messages = self._msg_repo.get_messages(node_id)
-                messages.sort(key=lambda m: m.created_at)
-                return messages
+                return messages  # 旧数据保持原顺序
         elif isinstance(node, FolderNode):
             message_ids = [
                 n.message_id
@@ -204,9 +205,13 @@ class ConversationService:
             print(f"[CORE ] get_messages_for_node: 节点 {node_id} 无 message_id 可查")
             return []
 
+        # ── 按 DFS 前序遍历排序 ──
+        ordered_ids = self._tree.get_message_ids_in_tree_order(node_id)
+        id_order: dict[str, int] = {mid: i for i, mid in enumerate(ordered_ids)}
+
         messages = self._msg_repo.get_messages_by_ids(message_ids)
-        messages.sort(key=lambda m: m.created_at)
-        print(f"[CORE ] get_messages_for_node: 节点 {node_id} → {len(messages)} 条消息")
+        messages.sort(key=lambda m: id_order.get(m.id, 999999))
+        print(f"[CORE ] get_messages_for_node: 节点 {node_id} → {len(messages)} 条消息（树序遍历）")
         return messages
 
     def delete_conversation(
@@ -277,17 +282,17 @@ class ConversationService:
 
     def get_effective_enabled_messages(self) -> list[Message]:
         """
-        收集树中所有有效启用的 MessageNode 对应的消息，按时间合并。
+        收集树中所有有效启用的 MessageNode 对应的消息，按 DFS 前序遍历排列。
 
         遍历所有 MessageNode，对每个节点通过 ancestors 级联规则判断
         是否 effectively enabled，如果是则收集其 message_id。最后批量
-        从 SQLite 加载实际消息内容，按 created_at 排序。
+        从 SQLite 加载实际消息内容，按 DFS 前序遍历排序。
 
         回退：若无任何 MessageNode（Phase 5 迁移前），则收集所有有效
         启用的 ConversationNode，通过 conversation_id 批量查询消息。
 
         Returns:
-            list[Message] — 所有有效启用对话的消息，按 created_at 升序
+            list[Message] — 所有有效启用对话的消息，按 DFS 前序遍历排列
         """
         all_msg_nodes = self._tree.get_all_message_nodes()
 
@@ -305,23 +310,26 @@ class ConversationService:
             print(f"[CORE ] get_effective_enabled_messages: 回退模式，"
                   f"{len(enabled_conv_ids)} 个启用对话")
             messages = self._msg_repo.get_messages_by_conversation_ids(enabled_conv_ids)
-            messages.sort(key=lambda m: m.created_at)
             return messages
 
         # 逐个判断 effective enabled（考虑祖先级联）
-        enabled_message_ids: list[str] = []
+        enabled_message_ids: set[str] = set()
         for node in all_msg_nodes:
             if self._context_svc.is_node_effectively_enabled(node.id):
-                enabled_message_ids.append(node.message_id)
+                enabled_message_ids.add(node.message_id)
 
         if not enabled_message_ids:
             print("[CORE ] get_effective_enabled_messages: 无有效启用的 MessageNode")
             return []
 
-        messages = self._msg_repo.get_messages_by_ids(enabled_message_ids)
-        messages.sort(key=lambda m: m.created_at)
+        # ── 按 DFS 前序遍历排序 ──
+        ordered_ids = self._tree.get_message_ids_in_tree_order()
+        id_order: dict[str, int] = {mid: i for i, mid in enumerate(ordered_ids)}
+
+        messages = self._msg_repo.get_messages_by_ids(list(enabled_message_ids))
+        messages.sort(key=lambda m: id_order.get(m.id, 999999))
         print(f"[CORE ] get_effective_enabled_messages: "
-              f"{len(enabled_message_ids)} 个 MessageNode → {len(messages)} 条消息")
+              f"{len(enabled_message_ids)} 个 MessageNode → {len(messages)} 条消息（树序遍历）")
         return messages
 
     def get_tree(self) -> TreeRoot:
@@ -340,14 +348,15 @@ class ConversationService:
         position: int | None = None,
     ) -> None:
         """
-        移动对话到新父级下。
+        移动节点到新父级下（支持所有节点类型：目录/对话/消息）。
 
         Args:
-            conversation_id: 对话节点 ID
-            new_parent_id:   新父节点 ID
-            position:        插入位置索引
+            conversation_id: 要移动的节点 ID
+            new_parent_id:   新父节点 ID（None 或空串 = 根级）
+            position:        插入位置索引（None = 末尾）
         """
-        self._tree.move_node(conversation_id, new_parent_id, position)
+        parent = new_parent_id if new_parent_id else None
+        self._tree.move_node(conversation_id, parent, position)
 
     def update_conversation_meta(
         self,
@@ -397,7 +406,7 @@ class ConversationService:
             keywords: 已分割且小写的关键词列表
 
         Returns:
-            list[MessageSearchResult] — 按 created_at 降序排列
+            list[MessageSearchResult] — 按 DFS 前序遍历排列
         """
         if not keywords:
             return []
@@ -410,6 +419,10 @@ class ConversationService:
         node_map: dict[str, MessageNode] = {}
         for n in all_msg_nodes:
             node_map[n.message_id] = n
+
+        # ── 构建 tree-order 排序索引 ──
+        ordered_ids = self._tree.get_message_ids_in_tree_order()
+        id_order: dict[str, int] = {mid: i for i, mid in enumerate(ordered_ids)}
 
         results: list[MessageSearchResult] = []
         for msg in all_messages:
@@ -440,6 +453,8 @@ class ConversationService:
                     created_at=msg.created_at,
                 ))
 
+        # ── 按 DFS 前序遍历排序 ──
+        results.sort(key=lambda r: id_order.get(r.message_id, 999999))
         return results
 
     # ──────────────────────────────────────────
@@ -528,34 +543,34 @@ class ConversationService:
         context_block_ids: list[str],
     ) -> None:
         """
-        更新目录关联的 ContextBlock ID 列表。
+        更新节点（目录或对话）关联的 ContextBlock ID 列表。
 
         Args:
-            folder_id:          目录节点 ID
+            folder_id:          节点 ID（目录或对话）
             context_block_ids:  新的 ContextBlock ID 列表
         """
         node = self._tree.get_node(folder_id)
         if node is None:
             return
-        if not isinstance(node, FolderNode):
-            print(f"[TREE] update_folder_context: {folder_id} 不是目录节点")
+        if not isinstance(node, (FolderNode, ConversationNode)):
+            print(f"[TREE] update_folder_context: {folder_id} 不支持上下文块")
             return
         self._tree.update_node(folder_id, context_block_ids=context_block_ids)
-        print(f"[TREE] 更新目录上下文块 {folder_id}: {len(context_block_ids)} 个块")
+        print(f"[TREE] 更新节点上下文块 {folder_id}: {len(context_block_ids)} 个块")
 
     def attach_file(self, folder_id: str, file_path: str) -> None:
         """
-        将文件路径挂载到目录节点。
+        将文件路径挂载到节点（目录或对话）。
 
         Args:
-            folder_id: 目录节点 ID
+            folder_id: 节点 ID（目录或对话）
             file_path: 文件绝对路径
         """
         node = self._tree.get_node(folder_id)
         if node is None:
             return
-        if not isinstance(node, FolderNode):
-            print(f"[TREE] attach_file: {folder_id} 不是目录节点")
+        if not isinstance(node, (FolderNode, ConversationNode)):
+            print(f"[TREE] attach_file: {folder_id} 不支持附件")
             return
         paths: list[str] = list(node.attachment_paths)
         if file_path not in paths:
@@ -565,17 +580,17 @@ class ConversationService:
 
     def detach_file(self, folder_id: str, file_path: str) -> None:
         """
-        从目录节点移除文件路径。
+        从节点（目录或对话）移除文件路径。
 
         Args:
-            folder_id: 目录节点 ID
+            folder_id: 节点 ID（目录或对话）
             file_path: 要移除的文件路径
         """
         node = self._tree.get_node(folder_id)
         if node is None:
             return
-        if not isinstance(node, FolderNode):
-            print(f"[TREE] detach_file: {folder_id} 不是目录节点")
+        if not isinstance(node, (FolderNode, ConversationNode)):
+            print(f"[TREE] detach_file: {folder_id} 不支持附件")
             return
         paths: list[str] = list(node.attachment_paths)
         if file_path in paths:

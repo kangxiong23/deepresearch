@@ -293,6 +293,10 @@ class TreeStoreProtocol(Protocol):
         """返回树中所有 MessageNode 实例。"""
         ...
 
+    def get_message_ids_in_tree_order(self, root_id: str | None = None) -> list[str]:
+        """以 DFS 前序遍历收集树中的 MessageNode.message_id，按树结构排序。"""
+        ...
+
     def get_descendants(self, node_id: str) -> list[AnyTreeNode]:
         """收集节点的所有后代（BFS，不包含节点自身）。"""
         ...

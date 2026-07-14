@@ -281,6 +281,40 @@ class TreeStore:
         """返回树中所有 MessageNode 实例。"""
         return [n for n in self._root.nodes if isinstance(n, MessageNode)]
 
+    def get_message_ids_in_tree_order(self, root_id: str | None = None) -> list[str]:
+        """
+        以 DFS 前序遍历收集树中的 MessageNode.message_id，按树结构排序。
+
+        DFS 前序遍历：
+        1. 访问当前节点（若是 MessageNode，收集 message_id）
+        2. 按 sort_order 依次遍历子节点及子树
+
+        Args:
+            root_id: 起始节点 ID，None 表示从根级开始
+
+        Returns:
+            list[str] — 按 DFS 前序排列的 message_id 列表
+        """
+        result: list[str] = []
+
+        def dfs(node_id: str) -> None:
+            node = self._find_node(node_id)
+            if node is None:
+                return
+            if isinstance(node, MessageNode):
+                result.append(node.message_id)
+            children = self._find_children(node_id)
+            for child in children:
+                dfs(child.id)
+
+        if root_id is not None:
+            dfs(root_id)
+        else:
+            for root_node in self._find_children(None):
+                dfs(root_node.id)
+
+        return result
+
     def get_descendants(self, node_id: str) -> list[AnyTreeNode]:
         """
         收集节点的所有后代（BFS，不包含节点自身）。
@@ -455,15 +489,38 @@ class TreeStore:
 
         Args:
             node_id:       要移动的节点 ID
-            new_parent_id: 新父节点 ID，None 表示移到根级
+            new_parent_id: 新父节点 ID，None 或空串表示移到根级
             position:      插入位置索引（0-based），None 表示末尾
 
         Raises:
             ValueError: 节点不存在、尝试移动根目录、或移动会产生循环时抛出
         """
+        # 规范化：空串 → None（根级）
+        if new_parent_id == "":
+            new_parent_id = None
+
         node = self._find_node(node_id)
         if node is None:
             raise ValueError(f"Node not found: {node_id}")
+
+        # ── 根目录保护 ──
+        if node.parent_id is None and isinstance(node, FolderNode) and node.id == "root":
+            raise ValueError("Cannot move the root folder")
+
+        # ── 类型验证：目标父节点必须能接受此类型的子节点 ──
+        # None / "" → 根级，接受任何类型
+        if new_parent_id:
+            new_parent = self._find_node(new_parent_id)
+            if new_parent is not None:
+                if isinstance(new_parent, ConversationNode) and not isinstance(node, MessageNode):
+                    raise ValueError(
+                        f"Cannot move a {type(node).__name__} under a ConversationNode: "
+                        f"only MessageNode allowed"
+                    )
+                if isinstance(new_parent, MessageNode):
+                    raise ValueError(
+                        f"Cannot move a node under a MessageNode: messages are leaves"
+                    )
 
         # 循环检测：新父级不能是 node_id 自身或其子孙
         if new_parent_id is not None:
@@ -530,7 +587,7 @@ class TreeStore:
         node = self._find_node(node_id)
         if node is None:
             raise ValueError(f"Node not found: {node_id}")
-        if node.parent_id is None:
+        if node.parent_id is None and node.id == "root":
             raise ValueError("Cannot delete the root folder")
 
         old_parent_id = node.parent_id
@@ -736,6 +793,8 @@ def _node_to_dict(node: AnyTreeNode) -> dict:
     else:
         d["summary"] = node.summary
         d["message_count"] = node.message_count
+        d["context_block_ids"] = node.context_block_ids
+        d["attachment_paths"] = node.attachment_paths
     return d
 
 
@@ -775,4 +834,6 @@ def _dict_to_node(d: dict) -> AnyTreeNode:
             **common,
             summary=d.get("summary", ""),
             message_count=d.get("message_count", 0),
+            context_block_ids=d.get("context_block_ids", []),
+            attachment_paths=d.get("attachment_paths", []),
         )

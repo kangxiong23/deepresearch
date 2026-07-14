@@ -120,6 +120,7 @@ class ChatApp:
         sidebar.open_context_panel_clicked.connect(self._handle_open_context_panel)
         sidebar.open_kg_panel_clicked.connect(self._handle_open_kg_panel)
         sidebar.search_requested.connect(self._on_search)
+        sidebar.multi_select_toggled.connect(self._on_multi_select_toggled)
 
         # ── TreePanel 信号 ────────────────────────
         tree = sidebar.tree_panel
@@ -132,6 +133,9 @@ class ChatApp:
         tree.move_node.connect(self._on_tree_move)
         tree.manage_context.connect(self._on_tree_manage_context)
         tree.attach_file.connect(self._on_tree_attach_file)
+        # 多选批量操作
+        tree.batch_operation.connect(self._on_batch_operation)
+        tree.batch_move_nodes.connect(self._on_batch_move_nodes)
 
         # ── ContextPanel 信号 ────────────────────
         ctx_panel = self._window.context_panel
@@ -776,14 +780,161 @@ class ChatApp:
         """刷新多对话模式消息列表，保持滚动位置不变。"""
         self._load_all_messages(scroll_to_bottom=False)
 
-    def _on_tree_move(self, node_id: str, target_parent_id: str) -> None:
+    def _on_tree_move(self, node_id: str, target_parent_id: str, position: object) -> None:
         """
-        拖拽放置 → 移动节点到目标目录下。
-        调用 controller 移动后刷新树。
+        拖拽放置 → 移动节点到目标位置。
+        target_parent_id 为空时移到根级，position 为 None 时追加到末尾。
         """
-        print(f"[UI] Tree move: {node_id} -> {target_parent_id}")
-        self._ctrl.on_move_node(node_id, target_parent_id)
+        parent = target_parent_id if target_parent_id else None
+        print(f"[UI] Tree move: {node_id} -> parent={parent}, pos={position}")
+        self._ctrl.on_move_node(node_id, parent, position)
         QTimer.singleShot(0, self._load_tree)
+        # 移动后静默刷新消息列表（父级变化可能影响可见性）
+        QTimer.singleShot(50, lambda: self._load_all_messages(scroll_to_bottom=False))
+
+    # ── 多选模式操作 ──────────────────────────
+
+    def _on_multi_select_toggled(self, enabled: bool) -> None:
+        """侧边栏多选按钮切换。"""
+        self._window.sidebar.tree_panel.set_multi_select_mode(enabled)
+
+    def _on_batch_operation(self, operation: str, node_ids: list[str]) -> None:
+        """
+        处理多选批量操作。
+        对每个选中节点依次调用对应的单节点操作。
+        """
+        if not node_ids:
+            return
+
+        if operation == "toggle_enabled":
+            for nid in node_ids:
+                try:
+                    self._ctrl.on_toggle_enabled(nid)
+                except Exception as exc:
+                    print(f"[UI] Batch toggle error for {nid}: {exc}")
+            # 增量刷新树状态 + 消息列表
+            tree_nodes = self._ctrl.get_tree()
+            self._tree_nodes = tree_nodes
+            self._window.sidebar.tree_panel.refresh_enabled_states(tree_nodes)
+            QTimer.singleShot(0, lambda: self._load_all_messages(scroll_to_bottom=False))
+
+        elif operation == "delete":
+            # 构建确认消息
+            count = len(node_ids)
+            titles = []
+            for nid in node_ids:
+                for n in self._tree_nodes:
+                    if n.id == nid:
+                        titles.append(n.title or nid)
+                        break
+            title_preview = "、".join(titles[:3])
+            if count > 3:
+                title_preview += f" 等{count}个节点"
+            msg = f"确定要删除 {count} 个选中节点吗？\n\n{title_preview}\n\n删除后将移入回收站，可以恢复。"
+
+            reply = QMessageBox.question(
+                self._window,
+                "确认批量删除",
+                msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                for nid in node_ids:
+                    try:
+                        self._ctrl.on_soft_delete_node(nid, mode="recursive")
+                    except Exception as exc:
+                        print(f"[UI] Batch delete error for {nid}: {exc}")
+                # 清理被删除的当前对话
+                if self._current_session_id in node_ids:
+                    self._current_session_id = ""
+                QTimer.singleShot(0, self._load_tree)
+                QTimer.singleShot(50, lambda: self._load_all_messages(scroll_to_bottom=False))
+
+        elif operation == "rename":
+            # 批量重命名：用一个新名称
+            current_title = ""
+            for n in self._tree_nodes:
+                if n.id == node_ids[0]:
+                    current_title = n.title
+                    break
+            name, ok = QInputDialog.getText(
+                self._window,
+                f"批量重命名 ({len(node_ids)} 个节点)",
+                "新名称:",
+                text=current_title,
+            )
+            if ok and name.strip():
+                for nid in node_ids:
+                    try:
+                        self._ctrl.on_rename_node(nid, name.strip())
+                    except Exception as exc:
+                        print(f"[UI] Batch rename error for {nid}: {exc}")
+                QTimer.singleShot(0, self._load_tree)
+
+        elif operation == "manage_context":
+            # 批量管理上下文块：取第一个节点的当前设置
+            first_id = node_ids[0]
+            folder_info = self._ctrl.on_get_folder_context(first_id)
+            folder_title = folder_info.get("title", "节点")
+            current_ids = folder_info.get("context_block_ids", [])
+            all_blocks = self._ctrl.on_get_context_blocks()
+
+            from app.ui.widgets.dialogs import show_context_block_manager_dialog
+            show_context_block_manager_dialog(
+                self._window,
+                f"{folder_title} 等{len(node_ids)}个节点",
+                all_blocks,
+                current_ids,
+                on_save=lambda selected_ids: self._on_batch_ctx_save(node_ids, selected_ids),
+            )
+
+        elif operation == "attach_file":
+            # 批量添加附件
+            paths, _ = QFileDialog.getOpenFileNames(
+                self._window,
+                f"选择附件（将添加到 {len(node_ids)} 个节点）",
+                "",
+                "支持的文件 (*.txt *.md *.json *.docx *.pdf);;所有文件 (*.*)",
+            )
+            if paths:
+                for nid in node_ids:
+                    for p in paths:
+                        try:
+                            self._ctrl.on_attach_file(nid, p)
+                        except Exception as exc:
+                            print(f"[UI] Batch attach error for {nid}: {exc}")
+                QTimer.singleShot(0, self._load_tree)
+
+    def _on_batch_ctx_save(self, node_ids: list[str], selected_ids: list[str]) -> None:
+        """批量保存上下文块关联。"""
+        for nid in node_ids:
+            try:
+                self._ctrl.on_update_context_blocks(nid, selected_ids)
+            except Exception as exc:
+                print(f"[UI] Batch context save error for {nid}: {exc}")
+        QTimer.singleShot(0, self._load_tree)
+
+    def _on_batch_move_nodes(self, dragged_ids_str: str, target_parent_id: str, position: object) -> None:
+        """
+        多选批量拖拽放置。
+        按 DFS 反转顺序依次移动节点，保持相对顺序。
+        反转移动确保所有节点插入到同一位置时顺次排列。
+        """
+        dragged_ids = [i for i in dragged_ids_str.split(",") if i]
+        parent = target_parent_id if target_parent_id else None
+
+        print(f"[UI] Batch tree move: {len(dragged_ids)} nodes -> parent={parent}, pos={position}")
+
+        # 反转顺序移动：最后一个先移，确保所有节点插入到同一 position 时相对顺序不变
+        for nid in reversed(dragged_ids):
+            try:
+                self._ctrl.on_move_node(nid, parent, position)
+            except Exception as exc:
+                print(f"[UI] Batch move error for {nid}: {exc}")
+
+        QTimer.singleShot(0, self._load_tree)
+        QTimer.singleShot(50, lambda: self._load_all_messages(scroll_to_bottom=False))
 
     def _on_tree_manage_context(self, folder_id: str) -> None:
         """

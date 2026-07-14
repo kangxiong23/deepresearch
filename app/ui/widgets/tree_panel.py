@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QProxyStyle,
     QStyle,
+    QStyleOptionViewItem, QStyleOption,
 )
 from PySide6.QtCore import (
     Qt,
@@ -28,6 +29,7 @@ from PySide6.QtCore import (
     QPoint,
     QPointF,
     QRectF,
+    QRect, QSize,
 )
 from PySide6.QtGui import (
     QStandardItemModel,
@@ -41,6 +43,8 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPolygonF,
+    QPixmap,
+    QCursor,
 )
 
 from app.controllers.view_models import TreeNodeVM
@@ -50,15 +54,16 @@ from app.ui.theme import Colors, Fonts, Spacing
 # 自定义数据角色（存储在 QStandardItem 中）
 # ──────────────────────────────────────────────
 
-ROLE_NODE_TYPE = Qt.ItemDataRole.UserRole + 1       # "folder"|"conversation"|"message"
-ROLE_NODE_ID = Qt.ItemDataRole.UserRole + 2          # str — node.id
-ROLE_ENABLED = Qt.ItemDataRole.UserRole + 3          # True|False|"some"
-ROLE_DEPTH = Qt.ItemDataRole.UserRole + 4            # int
-ROLE_IS_ACTIVE = Qt.ItemDataRole.UserRole + 5        # bool
-ROLE_MESSAGE_COUNT = Qt.ItemDataRole.UserRole + 6    # int
-ROLE_TIMESTAMP = Qt.ItemDataRole.UserRole + 7        # str — formatted time
-ROLE_ROLE = Qt.ItemDataRole.UserRole + 8             # str — message role
-ROLE_PREVIEW = Qt.ItemDataRole.UserRole + 9          # str — message preview
+ROLE_NODE_TYPE = Qt.ItemDataRole.UserRole + 1  # "folder"|"conversation"|"message"
+ROLE_NODE_ID = Qt.ItemDataRole.UserRole + 2  # str — node.id
+ROLE_ENABLED = Qt.ItemDataRole.UserRole + 3  # True|False|"some"
+ROLE_DEPTH = Qt.ItemDataRole.UserRole + 4  # int
+ROLE_IS_ACTIVE = Qt.ItemDataRole.UserRole + 5  # bool
+ROLE_MESSAGE_COUNT = Qt.ItemDataRole.UserRole + 6  # int
+ROLE_TIMESTAMP = Qt.ItemDataRole.UserRole + 7  # str — formatted time
+ROLE_ROLE = Qt.ItemDataRole.UserRole + 8  # str — message role
+ROLE_PREVIEW = Qt.ItemDataRole.UserRole + 9  # str — message preview
+ROLE_IS_SELECTED = Qt.ItemDataRole.UserRole + 10  # bool — 多选模式选中
 
 # ──────────────────────────────────────────────
 # 节点类型图标映射
@@ -70,21 +75,44 @@ _NODE_ICONS: dict[str, str] = {
 }
 
 _MESSAGE_ROLE_ICONS: dict[str, str] = {
-    "user":      "👤",
+    "user": "👤",
     "assistant": "🤖",
-    "thinking":  "🧠",
-    "system":    "⚙️",
+    "thinking": "🧠",
+    "system": "⚙️",
 }
 
 _MESSAGE_ROLE_LABELS: dict[str, str] = {
-    "user":      "用户",
+    "user": "用户",
     "assistant": "助手",
-    "thinking":  "思考",
-    "system":    "系统",
+    "thinking": "思考",
+    "system": "系统",
 }
 
 # 消息节点预览最大字符数
 _MESSAGE_PREVIEW_MAX = 30
+
+# ──────────────────────────────────────────────
+# 多选模式 — 每种节点类型的可用操作集合
+# ──────────────────────────────────────────────
+
+_FOLDER_OPS = {
+    "new_folder", "new_conversation", "rename",
+    "toggle_enabled", "manage_context", "attach_file", "delete",
+}
+_CONVERSATION_OPS = {
+    "rename", "toggle_enabled", "manage_context", "attach_file", "delete",
+}
+_MESSAGE_OPS = {"toggle_enabled", "delete"}
+
+_OPS_BY_TYPE: dict[str, set[str]] = {
+    "folder": _FOLDER_OPS,
+    "conversation": _CONVERSATION_OPS,
+    "message": _MESSAGE_OPS,
+}
+
+# 选中高亮颜色（蓝紫调，区别于激活绿色和拖拽暗绿）
+SELECTION_BG = QColor("#1E2A4A")
+SELECTION_BORDER = QColor("#5B7EC2")
 
 
 def _icon_for_node(node_type: str, role: str = "") -> str:
@@ -110,86 +138,371 @@ def _enabled_tooltip(enabled) -> str:
 
 class _TreeView(QTreeView):
     """
-    自定义 QTreeView 子类，覆写 dropEvent 以拦截拖拽放置事件，
-    不调用 super().dropEvent() 从而阻止 Qt 自动修改 Model，
-    改为通过信号通知上层执行业务操作。
+    自定义 QTreeView 子类，实现完整的拖拽放置体验。
+
+    拖拽规则：
+    - 所有节点（目录/对话/消息）均可拖拽
+    - 目录接受任何节点作为子节点
+    - 对话仅接受消息节点作为子节点
+    - 消息不接受任何子节点
+    - 不允许自拖放、不允许循环
+    - 支持在兄弟节点间插入（排序重排）
+
+    视觉反馈：
+    - 拖拽时显示半透明副本
+    - 有效目标：绿色边框高亮（放在目标上）或插入线（放在兄弟间）
+    - 无效目标：禁止光标
+    - dragLeaveEvent 清除所有反馈
+
+    放置位置判断（dragMoveEvent/dropEvent）：
+    - 上方 25% 区域 → 插入到目标兄弟节点之前（同父级）
+    - 下方 25% 区域 → 插入到目标兄弟节点之后（同父级）
+    - 中间 50% 区域 → 若目标为有效容器则作为子节点放入
 
     同时覆写 mousePressEvent 以检测 checkbox 区域点击，
     避免 clicked 和 itemChanged 双重信号导致重复处理。
     """
 
-    drop_occurred = Signal(str, str)  # dragged_node_id, target_folder_id
+    # 信号：dragged_node_id, target_parent_id, position (0-based 插入位置，None=末尾)
+    drop_occurred = Signal(str, str, object)
+    # 多选模式 — 批量拖拽：逗号分隔的 dragged_ids, target_parent_id, position
+    batch_drop_occurred = Signal(str, str, object)
+    # 选中状态变化
+    selection_changed = Signal()
+
+    # ── 拖拽高亮颜色常量 ──
+    DROP_HIGHLIGHT_BORDER = QColor("#4CAF82")  # 绿色边框
+    DROP_HIGHLIGHT_BG = QColor("#1A3A2A")  # 暗绿背景
+    INSERT_LINE_COLOR = QColor("#4CAF82")  # 绿色插入线
+    INSERT_LINE_WIDTH = 2  # 插入线宽度
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._last_click_on_checkbox: bool = False
+        # 拖拽状态跟踪
+        self._drag_active: bool = False
+        self._drag_node_type: str = ""
+        self._drag_node_id: str = ""
+        # 手动拖拽检测
+        self._drag_press_pos: QPoint | None = None
+        self._drag_press_index: QModelIndex = QModelIndex()
+        # 当前拖拽悬停的目标信息
+        self._hover_target_index: QModelIndex | None = None
+        self._hover_drop_zone: str = ""  # "on_item" | "above" | "below" | ""
+        # 上一个被高亮的 item（用于清除旧高亮）
+        self._last_highlighted_row: int = -1
+        self._last_highlighted_parent: QStandardItem | None = None
+
+        # ── 多选模式状态 ──
+        self._multi_select_mode: bool = False
+        self._selected_ids: set[str] = set()
+        # 跟踪上次点击是否含 Ctrl（用于延迟的 clicked 信号到达时正确判断）
+        self._last_click_was_ctrl: bool = False
+        self._last_click_was_multi: bool = False
+        # 鼠标悬停跟踪（替代被移除的 QSS ::item:hover 规则）
+        self._hovered_index: QModelIndex | None = None
+
+        # 复选框变化标志（mousePressEvent 期间检测 itemChanged 信号）
+        self._checkbox_changed_during_press: bool = False
+
+    # ──────────────────────────────────────────
+    # 多选模式公开 API
+    # ──────────────────────────────────────────
+
+    def set_multi_select_mode(self, enabled: bool) -> None:
+        """启用/禁用多选模式，切换时清空选中状态。"""
+        self._multi_select_mode = enabled
+        self._clear_all_selections()
+        self.selection_changed.emit()
+
+    @property
+    def multi_select_mode(self) -> bool:
+        return self._multi_select_mode
+
+    @property
+    def selected_ids(self) -> set[str]:
+        return self._selected_ids
+
+    def clear_selection(self) -> None:
+        """清空所有选中状态。"""
+        self._clear_all_selections()
+        self.selection_changed.emit()
+
+    def _clear_all_selections(self) -> None:
+        """内部：清空所有选中视觉并重置 _selected_ids。"""
+        for nid in list(self._selected_ids):
+            item = self._find_item_by_node_id(nid)
+            if item is not None:
+                self._apply_selection_visual(item, False)
+        self._selected_ids.clear()
+
+    def _apply_selection_visual(self, item: QStandardItem, selected: bool) -> None:
+        """更新单个 item 的选中视觉（多选模式）。"""
+        if selected:
+            item.setBackground(QBrush(SELECTION_BG))
+            item.setData(True, ROLE_IS_SELECTED)
+        else:
+            # 恢复默认背景（保留 active 状态的颜色）
+            is_active = item.data(ROLE_IS_ACTIVE)
+            if is_active:
+                item.setBackground(QBrush(QColor(Colors.BG_OVERLAY)))
+            else:
+                item.setBackground(QBrush(QColor("transparent")))
+            item.setData(False, ROLE_IS_SELECTED)
+
+    def _update_selection_visual(self, item: QStandardItem, selected: bool) -> None:
+        """更新选中视觉（_apply_selection_visual 的别名，对外统一命名）。"""
+        self._apply_selection_visual(item, selected)
+
+    def _get_descendant_ids(self, node_id: str) -> set[str]:
+        """递归获取 node_id 下的所有后代节点 ID（不含自身）。"""
+        descendants: set[str] = set()
+        item = self._find_item_by_node_id(node_id)
+        if item is None:
+            return descendants
+
+        def collect(parent: QStandardItem) -> None:
+            for row in range(parent.rowCount()):
+                child = parent.child(row)
+                if child is None:
+                    continue
+                cid = child.data(ROLE_NODE_ID)
+                if cid:
+                    descendants.add(cid)
+                collect(child)
+
+        collect(item)
+        return descendants
+
+    def _has_selected_ancestor(self, node_id: str) -> bool:
+        """检查 node_id 是否有已选中的祖先节点（用于级联去重）。"""
+        if not self._selected_ids:
+            return False
+        item = self._find_item_by_node_id(node_id)
+        if item is None:
+            return False
+        parent = item.parent()
+        while parent is not None:
+            pid = parent.data(ROLE_NODE_ID)
+            if pid and pid in self._selected_ids:
+                return True
+            parent = parent.parent()
+        return False
+
+    # ──────────────────────────────────────────
+    # 鼠标事件（checkbox 检测 + 手动拖拽启动 + 多选）
+    # ──────────────────────────────────────────
 
     def mousePressEvent(self, event) -> None:
-        """记录本次点击是否在 checkbox 区域，供 _on_item_clicked 判断。"""
+        """处理鼠标按下事件：检测复选框/箭头点击，多选切换，拖拽起始记录"""
         self._last_click_on_checkbox = False
-        index: QModelIndex = self.indexAt(event.position().toPoint())
+        self._last_click_was_ctrl = False
+        self._last_click_was_multi = False
+        pos = event.position().toPoint()
+        index: QModelIndex = self.indexAt(pos)
+
+        ctrl_held = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        is_multi = self._multi_select_mode
+
+        # ── 存储当前点击的节点ID ──
+        clicked_node_id: str | None = None
+        item: QStandardItem | None = None
         if index.isValid():
             item = self.model().itemFromIndex(index)
-            if item is not None and item.isCheckable():
-                # checkbox 位于 item 左边缘到 indentation 之间
-                # 对于顶层节点(depth=0)，checkbox 从 x≈indent-14 到 x≈indent+2
-                # 更简便的方法：点击位置 x 在 visualRect 左边缘 22px 以内认为是 checkbox
-                rect = self.visualRect(index)
-                rel_x = event.position().toPoint().x() - rect.x()
-                if 0 <= rel_x <= 22:
-                    self._last_click_on_checkbox = True
+            if item is not None:
+                clicked_node_id = item.data(ROLE_NODE_ID)
+
+        # ── 提前检测复选框区域（使用手动计算，避免访问样式导致崩溃） ──
+        is_checkbox_click = False
+        if index.isValid() and item is not None and item.isCheckable():
+            rect = self.visualRect(index)
+            rel_x = pos.x() - rect.x()
+            depth = item.data(ROLE_DEPTH) or 0
+            # 缩进宽度 = depth * indentation(18)
+            # 复选框通常位于缩进之后，起始偏移约为 8px，宽度约为 16px
+            checkbox_left = depth + 8
+            checkbox_right = checkbox_left + 16
+            if checkbox_left <= rel_x <= checkbox_right:
+                is_checkbox_click = True
+
+        self._last_click_on_checkbox = is_checkbox_click
+
+        # ── 记录展开状态（用于箭头检测） ──
+        was_expanded = self.isExpanded(index) if index.isValid() else None
+
+        # 让 Qt 处理事件：展开/折叠箭头、复选框切换等
+        # 注意：不要在 super() 之前调用 initViewItemOption / subElementRect，
+        # 那会破坏 Qt 内部状态导致 access violation 崩溃。
+        # ── 调用父类处理默认事件（安全，不访问样式） ──
         super().mousePressEvent(event)
 
-    def dropEvent(self, event) -> None:
+        # ── 检测箭头点击（展开状态变化） ──
+        is_arrow_click = False
+        if was_expanded is not None and clicked_node_id:
+            found_item = self._find_item_by_node_id(clicked_node_id)
+            if found_item is not None:
+                idx = self.model().indexFromItem(found_item)
+                if idx.isValid() and self.isExpanded(idx) != was_expanded:
+                    is_arrow_click = True
+
+        # ── 如果是复选框或箭头点击，不处理多选切换 ──
+        if is_checkbox_click or is_arrow_click:
+            # 不处理多选切换，不记录拖拽起始
+            self._drag_press_pos = None
+            self._drag_press_index = QModelIndex()
+            return
+
+        # ── 多选模式或 Ctrl+点击 → 切换选中状态 ──
+        # 仅当不是箭头点击且不是复选框点击时才触发多选
+        if (is_multi or ctrl_held) and clicked_node_id:
+            found_item = self._find_item_by_node_id(clicked_node_id)
+            if found_item is not None:
+                if clicked_node_id in self._selected_ids:
+                    # ── 取消选中 ──
+                    self._selected_ids.discard(clicked_node_id)
+                    self._apply_selection_visual(found_item, False)
+                    self.selection_changed.emit()
+                else:
+                    # ── 选中：级联去重 ──
+                    # 1) 若有祖先已选中 → 拒绝（祖先选中已覆盖该节点）
+                    if self._has_selected_ancestor(clicked_node_id):
+                        self._drag_press_pos = None
+                        self._drag_press_index = QModelIndex()
+                        return
+                    # 2) 清除所有后代选中（避免重复级联操作）
+                    for desc_id in self._get_descendant_ids(clicked_node_id):
+                        if desc_id in self._selected_ids:
+                            self._selected_ids.discard(desc_id)
+                            desc_item = self._find_item_by_node_id(desc_id)
+                            if desc_item is not None:
+                                self._apply_selection_visual(desc_item, False)
+                    # 3) 选中当前节点
+                    self._selected_ids.add(clicked_node_id)
+                    self._apply_selection_visual(found_item, True)
+                    self.selection_changed.emit()
+
+                # 记录以便 _on_item_clicked 跳过导航（clicked 信号延迟到达时 Ctrl 可能已松开）
+                self._last_click_was_ctrl = ctrl_held
+                self._last_click_was_multi = is_multi
+                # 多选切换后不启动拖拽
+                self._drag_press_pos = None
+                self._drag_press_index = QModelIndex()
+                return
+
+        # ── 正常模式：记录拖拽起始 ──
+        self._drag_press_pos = pos
+        self._drag_press_index = index if index.isValid() else QModelIndex()
+
+    def mouseMoveEvent(self, event) -> None:
         """
-        拦截拖拽放置事件。
-        提取被拖拽节点 ID 和目标文件夹 ID，
-        通过 drop_occurred 信号通知上层，不修改 Model。
+        手动检测拖拽阈值 + 鼠标悬停背景跟踪。
+
+        - 达到拖拽阈值 → 启动拖拽
+        - 未在拖拽 → 更新悬停背景（替代被移除的 QSS ::item:hover）
         """
-        index: QModelIndex = self.indexAt(event.position().toPoint())
-        if not index.isValid():
-            event.ignore()
-            return
+        if self._drag_press_pos is not None and self._drag_press_index.isValid():
+            distance = (event.position().toPoint() - self._drag_press_pos).manhattanLength()
+            if distance >= QApplication.startDragDistance():
+                press_index = self._drag_press_index
+                self._drag_press_pos = None
+                self._drag_press_index = QModelIndex()
 
-        target_item: QStandardItem = self.model().itemFromIndex(index)
-        if target_item is None:
-            event.ignore()
-            return
+                # 多选模式：只允许从已选中节点拖拽
+                if self._multi_select_mode:
+                    item = self.model().itemFromIndex(press_index)
+                    node_id = item.data(ROLE_NODE_ID) if item else None
+                    if node_id not in self._selected_ids:
+                        return
 
-        target_node_type = target_item.data(ROLE_NODE_TYPE)
-        if target_node_type != "folder":
-            event.ignore()
-            return
+                self._start_manual_drag(press_index)
+                return
+        else:
+            # ── 悬停背景跟踪（非拖拽状态）──
+            idx = self.indexAt(event.position().toPoint())
+            if idx != self._hovered_index:
+                # 清除旧悬停
+                if self._hovered_index is not None and self._hovered_index.isValid():
+                    old_item = self.model().itemFromIndex(self._hovered_index)
+                    if old_item is not None:
+                        self._restore_item_background(old_item)
+                # 设置新悬停
+                self._hovered_index = idx
+                if idx.isValid():
+                    hover_item = self.model().itemFromIndex(idx)
+                    if hover_item is not None:
+                        is_selected = hover_item.data(ROLE_IS_SELECTED)
+                        is_active = hover_item.data(ROLE_IS_ACTIVE)
+                        if not is_selected and not is_active:
+                            hover_item.setBackground(QBrush(QColor(Colors.BG_OVERLAY)))
 
-        target_id = target_item.data(ROLE_NODE_ID)
-        if target_id is None:
-            event.ignore()
-            return
+        super().mouseMoveEvent(event)
 
-        # 从 mimeData 中获取被拖拽的节点 ID
-        mime: QMimeData = event.mimeData()
-        if mime is None:
-            event.ignore()
-            return
+    def _restore_item_background(self, item: QStandardItem) -> None:
+        """按优先级恢复 item 背景：选中 > 激活 > 透明。"""
+        is_selected = item.data(ROLE_IS_SELECTED)
+        is_active = item.data(ROLE_IS_ACTIVE)
+        if is_selected:
+            item.setBackground(QBrush(SELECTION_BG))
+        elif is_active:
+            item.setBackground(QBrush(QColor(Colors.BG_OVERLAY)))
+        else:
+            item.setBackground(QBrush(QColor("transparent")))
 
-        dragged_bytes = mime.data("application/x-treenode-id")
-        if dragged_bytes is None or not dragged_bytes:
-            event.ignore()
-            return
+    def leaveEvent(self, event) -> None:
+        """鼠标离开视图 → 清除悬停背景。"""
+        if self._hovered_index is not None and self._hovered_index.isValid():
+            old_item = self.model().itemFromIndex(self._hovered_index)
+            if old_item is not None:
+                self._restore_item_background(old_item)
+            self._hovered_index = None
+        super().leaveEvent(event)
 
-        dragged_id = dragged_bytes.data().decode("utf-8")
-        if dragged_id == target_id:
-            event.ignore()
-            return
+    def mouseReleaseEvent(self, event) -> None:
+        """清除拖拽按下状态。"""
+        self._drag_press_pos = None
+        self._drag_press_index = QModelIndex()
+        super().mouseReleaseEvent(event)
 
-        event.accept()
-        self.drop_occurred.emit(dragged_id, target_id)
+    # ──────────────────────────────────────────
+    # 键盘事件（Ctrl 临时多选模式）
+    # ──────────────────────────────────────────
 
-    def startDrag(self, supported_actions) -> None:
+    def keyPressEvent(self, event) -> None:
+        """Ctrl 按下 → 若非多选模式则临时进入。"""
+        if (
+                event.key() == Qt.Key.Key_Control
+                and not self._multi_select_mode
+                and not event.isAutoRepeat()
+        ):
+            # Ctrl 按下不立刻切换模式，由 mousePressEvent 实时检测 modifiers
+            pass
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:
         """
-        覆写拖拽启动，将节点 ID 写入 mimeData 以便 dropEvent 读取。
+        Ctrl 松开 → 若非多选模式，视为退出临时多选，清空选中。
+        event.isAutoRepeat() 排除长按产生的重复释放事件。
         """
-        index: QModelIndex = self.currentIndex()
+        if (
+                event.key() == Qt.Key.Key_Control
+                and not self._multi_select_mode
+                and not event.isAutoRepeat()
+        ):
+            if self._selected_ids:
+                self._clear_all_selections()
+                self.selection_changed.emit()
+        super().keyReleaseEvent(event)
+
+    # ──────────────────────────────────────────
+    # 拖拽启动（手动触发）
+    # ──────────────────────────────────────────
+
+    def _start_manual_drag(self, index: QModelIndex) -> None:
+        """
+        手动启动拖拽：从给定 index 创建 QDrag。
+        所有节点均可拖拽（包括消息节点）。
+        多选模式下，若有多个选中节点，序列化所有选中 ID。
+        """
         if not index.isValid():
             return
 
@@ -198,19 +511,536 @@ class _TreeView(QTreeView):
             return
 
         node_type = item.data(ROLE_NODE_TYPE)
-        if node_type == "message":
-            return  # 消息节点不可拖拽
-
         node_id = item.data(ROLE_NODE_ID)
         if node_id is None:
             return
 
+        # ── 多选模式：序列化所有选中节点 ID ──
+        dragged_ids: list[str] = [node_id]
+        if self._multi_select_mode and len(self._selected_ids) > 1 and node_id in self._selected_ids:
+            dragged_ids = self._get_selected_in_dfs_order()
+
+        # ── 构建 mimeData ──
         mime = QMimeData()
         mime.setData("application/x-treenode-id", node_id.encode("utf-8"))
+        mime.setData("application/x-treenode-type", node_type.encode("utf-8"))
+        if len(dragged_ids) > 1:
+            mime.setData(
+                "application/x-treenode-ids",
+                ",".join(dragged_ids).encode("utf-8"),
+            )
+
+        # ── 半透明拖拽图像 ──
+        rect = self.visualRect(index)
+        pixmap = QPixmap(rect.size())
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setOpacity(0.6)
+        opt = QStyleOptionViewItem()
+        self.initViewItemOption(opt)
+        opt.rect = QRect(0, 0, rect.width(), rect.height())
+        opt.state |= QStyle.StateFlag.State_Selected
+        self.itemDelegate().paint(painter, opt, index)
+        painter.end()
+
+        # ── 设置拖拽状态 ──
+        self._drag_active = True
+        self._drag_node_type = node_type
+        self._drag_node_id = node_id
 
         drag = QDrag(self)
         drag.setMimeData(mime)
-        drag.exec(Qt.DropAction.MoveAction)
+        drag.setPixmap(pixmap)
+        # 热点设为鼠标在 pixmap 内的相对位置
+        cursor_pos = self.viewport().mapFromGlobal(QCursor.pos())
+        drag.setHotSpot(cursor_pos - rect.topLeft())
+        if len(dragged_ids) > 1:
+            drag.exec(Qt.DropAction.MoveAction)
+        else:
+            drag.exec(Qt.DropAction.MoveAction)
+
+        # ── 清理拖拽状态 ──
+        self._drag_active = False
+        self._drag_node_type = ""
+        self._drag_node_id = ""
+        self._clear_drag_feedback()
+
+    def _get_selected_in_dfs_order(self) -> list[str]:
+        """
+        按树中 DFS 前序遍历顺序返回 _selected_ids。
+        保持多节点拖拽时相对顺序不变。
+        """
+        if self.model() is None:
+            return list(self._selected_ids)
+
+        ordered: list[str] = []
+
+        def dfs(item: QStandardItem) -> None:
+            nid = item.data(ROLE_NODE_ID)
+            if nid and nid in self._selected_ids:
+                ordered.append(nid)
+            for row in range(item.rowCount()):
+                child = item.child(row)
+                if child is not None:
+                    dfs(child)
+
+        root = self.model().invisibleRootItem()
+        if root is not None:
+            for row in range(root.rowCount()):
+                child = root.child(row)
+                if child is not None:
+                    dfs(child)
+
+        # 追加任何不在树中（可能已删除）但仍被选中的 ID
+        for nid in self._selected_ids:
+            if nid not in ordered:
+                ordered.append(nid)
+
+        return ordered
+
+    # ──────────────────────────────────────────
+    # 拖拽进入
+    # ──────────────────────────────────────────
+
+    def dragEnterEvent(self, event) -> None:
+        """拖拽进入视图区域时检查 MIME 类型是否有效。"""
+        if event.mimeData().hasFormat("application/x-treenode-id"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    # ──────────────────────────────────────────
+    # 拖拽移动（逐像素判定放置位置和有效性）
+    # ──────────────────────────────────────────
+
+    def dragMoveEvent(self, event) -> None:
+        """
+        拖拽在视图上移动时：
+        1. 判断放置位置（上方/中间/下方）
+        2. 验证是否可放置（含多选批量验证）
+        3. 更新视觉反馈
+        """
+        mime = event.mimeData()
+        if not mime.hasFormat("application/x-treenode-id"):
+            event.ignore()
+            return
+
+        # 解析拖拽节点信息（支持多选批量拖拽）
+        dragged_id = mime.data("application/x-treenode-id").data().decode("utf-8")
+        dragged_type = (
+            mime.data("application/x-treenode-type").data().decode("utf-8")
+            if mime.hasFormat("application/x-treenode-type") else ""
+        )
+        # 多选批量拖拽 ID 列表
+        all_dragged_ids: list[str] = [dragged_id]
+        if mime.hasFormat("application/x-treenode-ids"):
+            ids_str = mime.data("application/x-treenode-ids").data().decode("utf-8")
+            all_dragged_ids = [i for i in ids_str.split(",") if i]
+
+        # 定位目标
+        index: QModelIndex = self.indexAt(event.position().toPoint())
+        if not index.isValid():
+            # 拖到空白区域 → 移到根级
+            self._clear_drag_feedback()
+            if self._can_drop_at_root_multi(all_dragged_ids):
+                event.acceptProposedAction()
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            else:
+                event.ignore()
+                self.setCursor(Qt.CursorShape.ForbiddenCursor)
+            return
+
+        target_item: QStandardItem = self.model().itemFromIndex(index)
+        if target_item is None:
+            event.ignore()
+            return
+
+        target_type = target_item.data(ROLE_NODE_TYPE)
+        target_id = target_item.data(ROLE_NODE_ID)
+
+        # ── 确定放置区域 ──
+        rect = self.visualRect(index)
+        rel_y = event.position().toPoint().y() - rect.y()
+        ratio = rel_y / rect.height() if rect.height() > 0 else 0.5
+
+        if ratio < 0.25:
+            zone = "above"
+        elif ratio > 0.75:
+            zone = "below"
+        else:
+            zone = "on_item"
+
+        # ── 验证放置有效性（含多选批量验证）──
+        valid, parent_id, position = self._validate_drop_multi(
+            all_dragged_ids, dragged_type,
+            target_item, target_type, target_id,
+            zone, index,
+        )
+
+        # ── 更新视觉反馈 ──
+        self._clear_drag_feedback()
+        self._hover_target_index = index
+        self._hover_drop_zone = zone
+
+        if valid:
+            event.acceptProposedAction()
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self._apply_drag_feedback(index, target_item, zone)
+        else:
+            event.ignore()
+            self.setCursor(Qt.CursorShape.ForbiddenCursor)
+
+    # ──────────────────────────────────────────
+    # 拖拽离开
+    # ──────────────────────────────────────────
+
+    def dragLeaveEvent(self, event) -> None:
+        """拖拽离开视图 → 清除所有反馈。"""
+        self._clear_drag_feedback()
+        self._hover_target_index = None
+        self._hover_drop_zone = ""
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        event.accept()
+
+    # ──────────────────────────────────────────
+    # 放置
+    # ──────────────────────────────────────────
+
+    def dropEvent(self, event) -> None:
+        """
+        拦截拖拽放置事件，计算目标父节点和插入位置，
+        通过 drop_occurred（单拖）或 batch_drop_occurred（多选批量拖）信号通知上层。
+        """
+        mime = event.mimeData()
+        if not mime.hasFormat("application/x-treenode-id"):
+            event.ignore()
+            return
+
+        dragged_id = mime.data("application/x-treenode-id").data().decode("utf-8")
+        dragged_type = (
+            mime.data("application/x-treenode-type").data().decode("utf-8")
+            if mime.hasFormat("application/x-treenode-type") else ""
+        )
+        # 多选批量拖拽 ID 列表
+        all_dragged_ids: list[str] = [dragged_id]
+        if mime.hasFormat("application/x-treenode-ids"):
+            ids_str = mime.data("application/x-treenode-ids").data().decode("utf-8")
+            all_dragged_ids = [i for i in ids_str.split(",") if i]
+
+        index: QModelIndex = self.indexAt(event.position().toPoint())
+
+        if not index.isValid():
+            # 拖到空白区域 → 移到根级
+            if self._can_drop_at_root_multi(all_dragged_ids):
+                event.acceptProposedAction()
+                if len(all_dragged_ids) > 1:
+                    self.batch_drop_occurred.emit(
+                        ",".join(all_dragged_ids), "", None
+                    )
+                else:
+                    self.drop_occurred.emit(dragged_id, "", None)
+            else:
+                event.ignore()
+            self._clear_drag_feedback()
+            return
+
+        target_item: QStandardItem = self.model().itemFromIndex(index)
+        if target_item is None:
+            event.ignore()
+            self._clear_drag_feedback()
+            return
+
+        target_type = target_item.data(ROLE_NODE_TYPE)
+        target_id = target_item.data(ROLE_NODE_ID)
+
+        # ── 确定放置区域 ──
+        rect = self.visualRect(index)
+        rel_y = event.position().toPoint().y() - rect.y()
+        ratio = rel_y / rect.height() if rect.height() > 0 else 0.5
+
+        if ratio < 0.25:
+            zone = "above"
+        elif ratio > 0.75:
+            zone = "below"
+        else:
+            zone = "on_item"
+
+        # ── 验证并计算目标 ──
+        valid, parent_id, position = self._validate_drop_multi(
+            all_dragged_ids, dragged_type,
+            target_item, target_type, target_id,
+            zone, index,
+        )
+
+        self._clear_drag_feedback()
+
+        if valid:
+            event.acceptProposedAction()
+            if len(all_dragged_ids) > 1:
+                self.batch_drop_occurred.emit(
+                    ",".join(all_dragged_ids), parent_id, position
+                )
+            else:
+                self.drop_occurred.emit(dragged_id, parent_id, position)
+        else:
+            event.ignore()
+
+    # ──────────────────────────────────────────
+    # 放置验证逻辑
+    # ──────────────────────────────────────────
+
+    def _validate_drop(
+            self,
+            dragged_id: str,
+            dragged_type: str,
+            target_item: QStandardItem,
+            target_type: str,
+            target_id: str,
+            zone: str,
+            index: QModelIndex,
+    ) -> tuple[bool, str, int | None]:
+        """
+        验证拖拽放置是否有效。
+
+        Returns:
+            (valid, parent_id, position)
+            - valid: 是否有效
+            - parent_id: 目标父节点 ID（空串 "" 表示根级）
+            - position: 插入位置索引（None 表示末尾）
+        """
+        # ── 不允许拖到自己身上 ──
+        if dragged_id == target_id:
+            return (False, "", None)
+
+        # ── 不允许将非消息节点放入对话 ──
+        if zone == "on_item":
+            if target_type == "message":
+                # 消息不接受子节点
+                return (False, "", None)
+            elif target_type == "conversation":
+                # 对话只接受消息
+                if dragged_type != "message":
+                    return (False, "", None)
+                # 消息放入对话：parent = 对话, position = 末尾
+                return (True, target_id, None)
+            elif target_type == "folder":
+                # 目录接受任何节点
+                return (True, target_id, None)
+            else:
+                return (False, "", None)
+        else:
+            # above / below → 插入为兄弟节点
+            target_parent = target_item.parent()
+            if target_parent is None:
+                # 根级兄弟
+                parent_id_str = ""
+            else:
+                parent_type = target_parent.data(ROLE_NODE_TYPE)
+                # 如果父节点是对话且拖拽的不是消息 → 不允许
+                if parent_type == "conversation" and dragged_type != "message":
+                    return (False, "", None)
+                if parent_type == "message":
+                    return (False, "", None)
+                parent_id_str = target_parent.data(ROLE_NODE_ID) or ""
+
+            # 计算位置
+            target_row = target_item.row()
+            pos = target_row if zone == "above" else target_row + 1
+
+            # ── 防循环：不允许拖到自己的子树中 ──
+            if dragged_id == parent_id_str:
+                return (False, "", None)
+            # 检查 parent 是否是 dragged 的后代
+            if self._is_descendant_of(dragged_id, parent_id_str):
+                return (False, "", None)
+
+            return (True, parent_id_str, pos)
+
+    def _can_drop_at_root(self, dragged_id: str) -> bool:
+        """检查是否可以将节点放到根级（空白区域）。"""
+        # 如果拖拽的是根目录本身 → 不允许
+        root_item = self._find_item_by_node_id("root")
+        if root_item is not None and dragged_id == "root":
+            return False
+        return True
+
+    def _can_drop_at_root_multi(self, dragged_ids: list[str]) -> bool:
+        """批量检查：所有拖拽节点是否都可放到根级。"""
+        for did in dragged_ids:
+            if not self._can_drop_at_root(did):
+                return False
+        return True
+
+    def _validate_drop_multi(
+            self,
+            dragged_ids: list[str],
+            dragged_type: str,
+            target_item: QStandardItem,
+            target_type: str,
+            target_id: str,
+            zone: str,
+            index: QModelIndex,
+    ) -> tuple[bool, str, int | None]:
+        """
+        批量验证拖拽放置（多选模式下多个节点同时拖拽）。
+
+        规则：
+        - 任意拖拽节点 = 目标节点 → 无效
+        - 目标父节点在任意拖拽节点的子树中 → 无效（防循环）
+        - 目标父节点是任意拖拽节点自身 → 无效（防把节点放入自身）
+        - 类型检查针对每种拖拽节点类型
+        - 消息节点不接受子节点
+
+        Returns:
+            (valid, parent_id, position)
+        """
+        # ── 禁止拖到任意选中节点自身 ──
+        if target_id in dragged_ids and zone == "on_item":
+            return (False, "", None)
+
+        # ── 确定目标父节点 ──
+        if zone == "on_item":
+            if target_type == "message":
+                return (False, "", None)
+            elif target_type == "conversation":
+                # 对话只接受消息节点
+                for did in dragged_ids:
+                    d_item = self._find_item_by_node_id(did)
+                    if d_item is None:
+                        continue
+                    dt = d_item.data(ROLE_NODE_TYPE)
+                    if dt != "message":
+                        return (False, "", None)
+                return (True, target_id, None)
+            elif target_type == "folder":
+                return (True, target_id, None)
+            else:
+                return (False, "", None)
+        else:
+            # above / below → 插入为兄弟节点
+            target_parent = target_item.parent()
+            if target_parent is None:
+                parent_id_str = ""
+            else:
+                parent_type = target_parent.data(ROLE_NODE_TYPE)
+                # 若父节点是对话且拖拽的有非消息 → 不允许
+                if parent_type == "conversation":
+                    for did in dragged_ids:
+                        d_item = self._find_item_by_node_id(did)
+                        if d_item is None:
+                            continue
+                        dt = d_item.data(ROLE_NODE_TYPE)
+                        if dt != "message":
+                            return (False, "", None)
+                if parent_type == "message":
+                    return (False, "", None)
+                parent_id_str = target_parent.data(ROLE_NODE_ID) or ""
+
+            # ── 防循环：检查每个拖拽节点 ──
+            for did in dragged_ids:
+                # 不能拖到自己身上
+                if did == parent_id_str:
+                    return (False, "", None)
+                # target parent 不能是任何拖拽节点的后代
+                if self._is_descendant_of(did, parent_id_str):
+                    return (False, "", None)
+                # target parent 不能是任何拖拽节点自身（防止 A 拖入 B 而 B 也是被拖拽的）
+                if parent_id_str in dragged_ids:
+                    return (False, "", None)
+
+            # 计算位置
+            target_row = target_item.row()
+            pos = target_row if zone == "above" else target_row + 1
+
+            return (True, parent_id_str, pos)
+
+    def _is_descendant_of(self, ancestor_id: str, descendant_id: str) -> bool:
+        """检查 descendant_id 是否是 ancestor_id 的后代。"""
+        if not ancestor_id or not descendant_id:
+            return False
+        item = self._find_item_by_node_id(descendant_id)
+        if item is None:
+            return False
+        # 向上遍历父链
+        parent = item.parent()
+        while parent is not None:
+            pid = parent.data(ROLE_NODE_ID)
+            if pid == ancestor_id:
+                return True
+            parent = parent.parent()
+        return False
+
+    def _find_item_by_node_id(self, node_id: str) -> QStandardItem | None:
+        """在 model 中递归搜索指定 node_id 的 QStandardItem。"""
+        if not node_id or self.model() is None:
+            return None
+
+        def search(parent: QStandardItem) -> QStandardItem | None:
+            for row in range(parent.rowCount()):
+                child = parent.child(row)
+                if child is None:
+                    continue
+                cid = child.data(ROLE_NODE_ID)
+                if cid == node_id:
+                    return child
+                found = search(child)
+                if found is not None:
+                    return found
+            return None
+
+        root = self.model().invisibleRootItem()
+        if root is not None:
+            return search(root)
+        return None
+
+    # ──────────────────────────────────────────
+    # 视觉反馈
+    # ──────────────────────────────────────────
+
+    def _apply_drag_feedback(
+            self,
+            index: QModelIndex,
+            target_item: QStandardItem,
+            zone: str,
+    ) -> None:
+        """
+        应用拖拽悬停视觉反馈。
+
+        - zone == "on_item" → 绿色边框高亮目标行
+        - zone in ("above", "below") → 暂用 item 背景色区分
+        """
+        if zone == "on_item":
+            target_item.setBackground(QBrush(self.DROP_HIGHLIGHT_BG))
+            target_item.setData(True, ROLE_IS_ACTIVE)  # 触发特殊渲染
+            self._last_highlighted_row = target_item.row()
+            # 在目标行的父节点中记录
+            parent = target_item.parent()
+            if parent is not None:
+                self._last_highlighted_parent = parent
+        elif zone in ("above", "below"):
+            # 插入线由 Qt 内置 drop indicator 绘制
+            target_item.setBackground(QBrush(QColor("#2A2D3A")))
+            self._last_highlighted_row = target_item.row()
+
+    def _clear_drag_feedback(self) -> None:
+        """清除所有拖拽反馈，尊重选中和激活状态。"""
+        if self._hover_target_index is not None and self._hover_target_index.isValid():
+            item = self.model().itemFromIndex(self._hover_target_index)
+            if item is not None:
+                # 恢复原始背景（选中 > 激活 > 默认）
+                is_selected = item.data(ROLE_IS_SELECTED)
+                is_active = item.data(ROLE_IS_ACTIVE)
+                if is_selected:
+                    item.setBackground(QBrush(SELECTION_BG))
+                elif is_active:
+                    item.setBackground(QBrush(QColor(Colors.BG_OVERLAY)))
+                else:
+                    item.setBackground(QBrush(QColor("transparent")))
+                # 不清除 ROLE_IS_ACTIVE（由 set_active 管理）
+        self._last_highlighted_row = -1
+        self._last_highlighted_parent = None
+        self._hover_target_index = None
+        self._hover_drop_zone = ""
 
 
 # ──────────────────────────────────────────────
@@ -247,18 +1077,18 @@ class _TreeStyle(QProxyStyle):
     """
 
     # ── 复选框颜色常量 ──
-    CHECK_FILL_CHECKED   = QColor("#4CAF82")  # 绿色
-    CHECK_FILL_PARTIAL   = QColor("#E8A838")  # 黄色
-    CHECK_BORDER         = QColor("#3D4255")  # 灰色边框
-    CHECK_SYMBOL         = QColor("#FFFFFF")  # 白色符号
-    ARROW_COLOR          = QColor("#B0B8CC")  # 浅灰白箭头
+    CHECK_FILL_CHECKED = QColor("#4CAF82")  # 绿色
+    CHECK_FILL_PARTIAL = QColor("#E8A838")  # 黄色
+    CHECK_BORDER = QColor("#3D4255")  # 灰色边框
+    CHECK_SYMBOL = QColor("#FFFFFF")  # 白色符号
+    ARROW_COLOR = QColor("#B0B8CC")  # 浅灰白箭头
 
     def drawPrimitive(
-        self,
-        element: QStyle.PrimitiveElement,
-        option: QStyleOption,
-        painter: QPainter,
-        widget: QWidget | None = None,
+            self,
+            element: QStyle.PrimitiveElement,
+            option: QStyleOption,
+            painter: QPainter,
+            widget: QWidget | None = None,
     ) -> None:
         # ── 1. 复选框 ──────────────────────────
         if element == QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck:
@@ -280,7 +1110,8 @@ class _TreeStyle(QProxyStyle):
                 painter.setBrush(self.CHECK_FILL_CHECKED)
                 painter.drawRoundedRect(r, 2, 2)
                 # 白色对勾 ✓
-                painter.setPen(QPen(self.CHECK_SYMBOL, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                painter.setPen(QPen(self.CHECK_SYMBOL, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                    Qt.PenJoinStyle.RoundJoin))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 cx, cy = r.center().x(), r.center().y()
                 w, h = r.width(), r.height()
@@ -364,7 +1195,7 @@ class TreePanel(QWidget):
         rename_node(str)         — 右键：重命名
         delete_node(str)         — 右键：删除
         toggle_enabled(str)      — 点击复选框 / 右键：切换启用状态
-        move_node(str, str)      — 拖拽完成（node_id, target_parent_id）
+        move_node(str, str, object) — 拖拽完成（node_id, target_parent_id, position）
         manage_context(str)      — 右键：管理上下文块（仅目录）
         attach_file(str)         — 右键：添加附件（仅目录）
     """
@@ -375,9 +1206,16 @@ class TreePanel(QWidget):
     rename_node = Signal(str)
     delete_node = Signal(str)
     toggle_enabled = Signal(str)
-    move_node = Signal(str, str)
+    move_node = Signal(str, str, object)  # node_id, target_parent_id, position
     manage_context = Signal(str)
     attach_file = Signal(str)
+
+    # ── 多选模式批量操作信号 ──
+    # operation: str ("toggle_enabled", "delete", "rename", "manage_context", "attach_file")
+    # node_ids:  list[str]
+    batch_operation = Signal(str, list)
+    # 批量拖拽：comma-separated node_ids, target_parent_id, position
+    batch_move_nodes = Signal(str, str, object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -433,8 +1271,9 @@ class TreePanel(QWidget):
         # ── 复选框状态变化 ────────────────────────
         self._model.itemChanged.connect(self._on_item_changed)
 
-        # ── 拖拽放置 ──────────────────────────────
+        # ── 拖拽放置（单拖 + 多选批量拖）─────────
         self._tree_view.drop_occurred.connect(self._on_drop)
+        self._tree_view.batch_drop_occurred.connect(self._on_batch_drop)
 
         # ── 样式 ──────────────────────────────────
         self._apply_styles()
@@ -448,7 +1287,12 @@ class TreePanel(QWidget):
     # ── 样式 ──────────────────────────────────────
 
     def _apply_styles(self) -> None:
-        """应用 QTreeView 深色主题样式，包含消息子节点的展开/折叠箭头。"""
+        """应用 QTreeView 深色主题样式。
+
+        注意：QSS 中不设置 background-color 规则，
+        让 QStandardItem.setBackground() 和 _TreeStyle 自定义绘制完全控制背景色，
+        避免 QSS 覆盖多选高亮 / 激活高亮 / 拖拽反馈。
+        """
         self._tree_view.setStyleSheet(f"""
             QTreeView {{
                 background-color: {Colors.BG_SURFACE};
@@ -457,14 +1301,6 @@ class TreePanel(QWidget):
                 font-family: "{Fonts.BODY}";
                 font-size: {Fonts.SIZE_SM}px;
                 color: {Colors.TEXT_SECONDARY};
-            }}
-            QTreeView::item {{
-                padding: 6px {Spacing.SM}px;
-                border: none;
-                border-left: 2px solid transparent;
-            }}
-            QTreeView::item:hover {{
-                background-color: {Colors.BG_OVERLAY};
             }}
         """)
 
@@ -545,13 +1381,19 @@ class TreePanel(QWidget):
             # 清除旧激活节点的背景
             old_item = self._find_item_by_node_id(previous_id)
             if old_item is not None:
-                old_item.setBackground(QBrush(QColor("transparent")))
+                if old_item.data(ROLE_IS_SELECTED):
+                    old_item.setBackground(QBrush(SELECTION_BG))
+                else:
+                    old_item.setBackground(QBrush(QColor("transparent")))
                 old_item.setData(False, ROLE_IS_ACTIVE)
 
             # 设置新激活节点的背景
             new_item = self._find_item_by_node_id(node_id)
             if new_item is not None:
-                new_item.setBackground(QBrush(QColor(Colors.BG_OVERLAY)))
+                if new_item.data(ROLE_IS_SELECTED):
+                    new_item.setBackground(QBrush(SELECTION_BG))
+                else:
+                    new_item.setBackground(QBrush(QColor(Colors.BG_OVERLAY)))
                 new_item.setData(True, ROLE_IS_ACTIVE)
                 # 滚动到可见
                 idx = self._model.indexFromItem(new_item)
@@ -565,6 +1407,26 @@ class TreePanel(QWidget):
     def refresh(self) -> None:
         """强制刷新树视图。"""
         self._tree_view.viewport().update()
+
+    # ──────────────────────────────────────────────
+    # 多选模式公开接口
+    # ──────────────────────────────────────────────
+
+    def set_multi_select_mode(self, enabled: bool) -> None:
+        """启用/禁用多选模式。"""
+        self._tree_view.set_multi_select_mode(enabled)
+
+    @property
+    def multi_select_mode(self) -> bool:
+        return self._tree_view._multi_select_mode
+
+    @property
+    def selected_ids(self) -> set[str]:
+        return self._tree_view._selected_ids
+
+    def clear_selection(self) -> None:
+        """清空所有选中。"""
+        self._tree_view.clear_selection()
 
     # ──────────────────────────────────────────────
     # 树重建（核心）
@@ -652,6 +1514,14 @@ class TreePanel(QWidget):
                 if active_item is not None:
                     active_item.setBackground(QBrush(QColor(Colors.BG_OVERLAY)))
                     active_item.setData(True, ROLE_IS_ACTIVE)
+
+            # ── 7. 恢复多选选中视觉 ────────────────
+            if self._tree_view._selected_ids:
+                for nid in list(self._tree_view._selected_ids):
+                    sel_item = self._find_item_by_node_id(nid)
+                    if sel_item is not None:
+                        sel_item.setBackground(QBrush(SELECTION_BG))
+                        sel_item.setData(True, ROLE_IS_SELECTED)
         finally:
             self._building = False
 
@@ -707,20 +1577,21 @@ class TreePanel(QWidget):
             item.setCheckState(Qt.CheckState.PartiallyChecked)
 
         # ── 标志位（控制拖拽和放置）────────────────
+        # 所有节点均可拖拽；目录和对话可作为放置目标
         if node.node_type == "message":
             flags = (
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemNeverHasChildren
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                    | Qt.ItemFlag.ItemNeverHasChildren
             )
         else:
             flags = (
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsDragEnabled
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                    | Qt.ItemFlag.ItemIsDropEnabled
             )
-        if node.node_type == "folder":
-            flags |= Qt.ItemFlag.ItemIsDropEnabled
         item.setFlags(flags)
 
         # ── 自定义数据角色 ────────────────────────
@@ -736,6 +1607,11 @@ class TreePanel(QWidget):
 
         # ── 文本颜色 ──────────────────────────────
         item.setForeground(QBrush(QColor(Colors.TEXT_SECONDARY)))
+
+        # ── 设置尺寸提示 ────────────────────────
+        # 补偿因移除 QSS padding: 6px 而丢失的行高
+        # 宽度设为 -1 让 Qt 自动管理，高度设为 34px (约等于默认高度 + 上下 6px padding)
+        item.setSizeHint(QSize(-1, 34))
 
         return item
 
@@ -830,17 +1706,26 @@ class TreePanel(QWidget):
     def _on_item_clicked(self, index: QModelIndex) -> None:
         """
         节点点击处理：
+        - 多选模式 / Ctrl+点击 → 选中切换已在 mousePressEvent 完成，此处跳过导航
         - 对话节点 / 消息节点 → 加载该节点对应的消息
         - 目录节点 → 切换展开/折叠
 
         注意：如果点击位置在 checkbox 指示器上，跳过此处理逻辑，
         避免与 itemChanged → toggle_enabled 信号产生竞争。
+
+        使用 _last_click_was_ctrl/_last_click_was_multi 而非实时检测键盘，
+        因为 clicked 信号在 setExpandsOnDoubleClick 模式下会延迟 ~400ms，
+        到那时 Ctrl 可能已松开。
         """
         if not index.isValid():
             return
 
         # 跳过 checkbox 区域的点击 — 该区域由 itemChanged 信号处理
         if self._tree_view._last_click_on_checkbox:
+            return
+
+        # 多选模式或 Ctrl+点击 → 选中切换已在 mousePressEvent 处理，不导航
+        if self._tree_view._last_click_was_multi or self._tree_view._last_click_was_ctrl:
             return
 
         item: QStandardItem = self._model.itemFromIndex(index)
@@ -886,6 +1771,8 @@ class TreePanel(QWidget):
         """
         检测复选框状态变化（所有节点类型，含消息节点）。
         仅在非重建期间响应，避免程序化设置复选框时误触发。
+
+        多选模式下：若变更节点在选中集合中，批量切换所有选中节点。
         """
         if self._building:
             return
@@ -896,22 +1783,48 @@ class TreePanel(QWidget):
         if node_id is None:
             return
 
+        # ★ 设置标志：通知 mousePressEvent 复选框被用户切换
+        # 这解决了级联回调 refresh_enabled_states 将 checkState 改回原值
+        # 导致状态比较法失效的问题
+        self._tree_view._checkbox_changed_during_press = True
+
         old_enabled = item.data(ROLE_ENABLED)
 
         # 判断是否真正变化
+        changed = False
         if new_check == Qt.CheckState.Checked and old_enabled is not True:
-            self.toggle_enabled.emit(node_id)
+            changed = True
         elif new_check == Qt.CheckState.Unchecked and old_enabled is not False:
-            self.toggle_enabled.emit(node_id)
+            changed = True
         elif new_check == Qt.CheckState.PartiallyChecked and old_enabled != "some":
+            changed = True
+
+        if not changed:
+            return
+
+        # ── 多选模式批量操作 ──
+        if self._tree_view._multi_select_mode and node_id in self._tree_view._selected_ids and len(
+                self._tree_view._selected_ids) > 1:
+            selected = list(self._tree_view._selected_ids)
+            self.batch_operation.emit("toggle_enabled", selected)
+        else:
             self.toggle_enabled.emit(node_id)
 
-    def _on_drop(self, dragged_id: str, target_folder_id: str) -> None:
+    def _on_drop(self, dragged_id: str, target_parent_id: str, position: object) -> None:
         """
         拖拽放置完成。
         发射 move_node 信号让上层处理业务逻辑。
+        target_parent_id 为空串时表示根级。
+        position 为 None 时表示追加到末尾。
         """
-        self.move_node.emit(dragged_id, target_folder_id)
+        self.move_node.emit(dragged_id, target_parent_id, position)
+
+    def _on_batch_drop(self, dragged_ids_str: str, target_parent_id: str, position: object) -> None:
+        """
+        多选批量拖拽放置完成。
+        发射 batch_move_nodes 信号让上层处理。
+        """
+        self.batch_move_nodes.emit(dragged_ids_str, target_parent_id, position)
 
     # ──────────────────────────────────────────────
     # 右键上下文菜单
@@ -921,6 +1834,9 @@ class TreePanel(QWidget):
         """
         在鼠标位置弹出右键上下文菜单。
         根据节点类型构建不同的菜单项。
+
+        多选模式下：仅当右键节点在选中集合中时才弹出菜单，
+        菜单项 = 所有选中节点操作集合的交集。
         """
         index: QModelIndex = self._tree_view.indexAt(pos)
         if not index.isValid():
@@ -936,6 +1852,22 @@ class TreePanel(QWidget):
 
         if node_id is None:
             return
+
+        # ── 多选模式：仅已选中节点可弹出菜单 ──
+        multi_mode = self._tree_view._multi_select_mode
+        selected = self._tree_view._selected_ids
+
+        # 多选模式下，仅已选中节点可弹出菜单
+        if multi_mode and node_id not in selected:
+            return
+
+        # ── 计算可用操作交集 ──
+        # 多选模式 + 多个选中，或正常模式 Ctrl+多选
+        is_batch = len(selected) > 1 and node_id in selected
+        if is_batch:
+            available_ops = self._compute_intersection_ops(selected)
+        else:
+            available_ops = _OPS_BY_TYPE.get(node_type, set())
 
         menu = QMenu(self)
         menu.setFont(Fonts.body(Fonts.SIZE_SM))
@@ -953,6 +1885,9 @@ class TreePanel(QWidget):
             QMenu::item:selected {{
                 background-color: {Colors.BG_OVERLAY};
             }}
+            QMenu::item:disabled {{
+                color: {Colors.TEXT_DISABLED};
+            }}
             QMenu::separator {{
                 height: 1px;
                 background-color: {Colors.DIVIDER};
@@ -961,47 +1896,74 @@ class TreePanel(QWidget):
         """)
 
         nid = node_id
+        batch_ids = list(selected) if is_batch else [nid]
 
-        if node_type == "folder":
-            # 新建文件夹
+        # ── 新建文件夹（非批量 + 目录节点）──
+        if "new_folder" in available_ops and node_type == "folder" and not is_batch:
             menu.addAction("📁 新建文件夹", lambda: self.new_folder.emit(nid))
-            # 新建对话
+
+        # ── 新建对话（非批量 + 目录节点）──
+        if "new_conversation" in available_ops and node_type == "folder" and not is_batch:
             menu.addAction("💬 新建对话", lambda: self.new_conversation.emit(nid))
-            menu.addSeparator()
-            # 重命名
-            menu.addAction("✏️ 重命名", lambda: self.rename_node.emit(nid))
-            # 启用/禁用
+
+        # ── 分隔线（如果有新建操作）──
+        if ("new_folder" in available_ops or "new_conversation" in available_ops) and not is_batch:
+            if node_type == "folder":
+                menu.addSeparator()
+
+        # ── 重命名 ──
+        if "rename" in available_ops:
+            menu.addAction("✏️ 重命名", lambda: self.batch_operation.emit("rename", batch_ids))
+
+        # ── 启用/禁用 ──
+        if "toggle_enabled" in available_ops:
             toggle_label = "🔳 禁用" if is_enabled is True else "🔲 启用"
-            menu.addAction(toggle_label, lambda: self.toggle_enabled.emit(nid))
-            menu.addSeparator()
-            # 管理上下文块
-            menu.addAction("📚 管理上下文块", lambda: self.manage_context.emit(nid))
-            # 添加附件
-            menu.addAction("📎 添加附件", lambda: self.attach_file.emit(nid))
+            menu.addAction(toggle_label, lambda: self.batch_operation.emit("toggle_enabled", batch_ids))
+
+        # ── 分隔线 ──
+        if "manage_context" in available_ops or "attach_file" in available_ops:
             menu.addSeparator()
 
-        elif node_type == "conversation":
-            # 重命名
-            menu.addAction("✏️ 重命名", lambda: self.rename_node.emit(nid))
-            # 启用/禁用
-            toggle_label = "🔳 禁用" if is_enabled is True else "🔲 启用"
-            menu.addAction(toggle_label, lambda: self.toggle_enabled.emit(nid))
-            menu.addSeparator()
+        # ── 管理上下文块 ──
+        if "manage_context" in available_ops:
+            menu.addAction("📚 管理上下文块", lambda: self.batch_operation.emit("manage_context", batch_ids))
 
-        elif node_type == "message":
-            # 启用/禁用
-            toggle_label = "🔳 禁用" if is_enabled is True else "🔲 启用"
-            menu.addAction(toggle_label, lambda: self.toggle_enabled.emit(nid))
-            menu.addSeparator()
+        # ── 添加附件 ──
+        if "attach_file" in available_ops:
+            menu.addAction("📎 添加附件", lambda: self.batch_operation.emit("attach_file", batch_ids))
 
-        # 删除（所有节点通用）
-        delete_action = menu.addAction("🗑️ 删除")
-        delete_action.setData(nid)
-        # 为删除项设置红色文字
-        delete_action.triggered.connect(lambda: self.delete_node.emit(nid))
+        menu.addSeparator()
+
+        # ── 删除（所有节点通用）──
+        if "delete" in available_ops:
+            menu.addAction("🗑️ 删除", lambda: self.batch_operation.emit("delete", batch_ids))
 
         # 弹出菜单
         menu.exec(self._tree_view.viewport().mapToGlobal(pos))
+
+    def _compute_intersection_ops(self, selected_ids: set[str]) -> set[str]:
+        """
+        计算所有选中节点操作集合的交集。
+        每个节点按其 node_type 获取操作集合，取交集。
+        """
+        if not selected_ids:
+            return set()
+
+        ops = None
+        for nid in selected_ids:
+            item = self._find_item_by_node_id(nid)
+            if item is None:
+                continue
+            ntype = item.data(ROLE_NODE_TYPE)
+            node_ops = _OPS_BY_TYPE.get(ntype, set())
+            if ops is None:
+                ops = node_ops.copy()
+            else:
+                ops &= node_ops
+            if not ops:
+                break
+
+        return ops or set()
 
 
 # ──────────────────────────────────────────────
@@ -1040,7 +2002,7 @@ def _build_tooltip(node: TreeNodeVM) -> str:
 
     if node.node_type == "conversation" and node.message_count > 0:
         parts.append(f"消息: {node.message_count}")
-    if node.node_type == "folder":
+    if node.node_type in ("folder", "conversation"):
         if node.context_block_count > 0:
             parts.append(f"上下文块: {node.context_block_count}")
         if node.attachment_count > 0:
