@@ -93,14 +93,14 @@ class ConversationService:
 
         Args:
             title:     对话标题
-            parent_id: 父节点 ID，None 表示放在默认"未分类"目录下
+            parent_id: 父节点 ID。
+                       None → 树顶层（parent_id=null，真正的根目录）。
+                       指定文件夹 id → 在该文件夹内创建（如右键菜单）。
+                       注意：id="root" 的"未分类"文件夹只是普通文件夹，不是根目录。
 
         Returns:
             新对话节点的 ID（UUID），同时也是 messages 表的 conversation_id
         """
-        if parent_id is None:
-            parent_id = "root"
-
         new_id = str(uuid.uuid4())
         now = datetime.utcnow()
         node = ConversationNode(
@@ -114,7 +114,7 @@ class ConversationService:
         )
         self._tree.create_node(node)
 
-        # 新节点可能改变父级的 "some" 状态
+        # 新节点可能改变父级的 "some" 状态（顶层节点 parent_id=None 无祖先可更新）
         if parent_id:
             self._tree.recompute_ancestors_enabled(new_id)
 
@@ -350,8 +350,9 @@ class ConversationService:
         """
         判断是否应强制在新（空）对话中开始（不重定向）。
 
-        条件：conv_id 是一个没有任何消息的 ConversationNode，且其位置位于
-        所有已启用消息之后（DFS 前序）。满足则允许直接在新对话开始。
+        条件：conv_id 是一个**有效启用**、没有任何消息的 ConversationNode，
+        且其位置位于所有已启用消息之后（DFS 前序）。满足则允许直接在新对话开始。
+        禁用的空对话不会复用（其中的消息不会显示）。
 
         Args:
             conv_id: 对话节点 id（可为 None）
@@ -364,10 +365,33 @@ class ConversationService:
         node = self._tree.get_node(conv_id)
         if node is None or not isinstance(node, ConversationNode):
             return False
+        # 必须有效启用：禁用的对话即使为空，其中消息也不会显示
+        if not self._context_svc.is_node_effectively_enabled(conv_id):
+            return False
         # 空对话：无任何 MessageNode 后代
         if any(isinstance(n, MessageNode) for n in self._tree.get_descendants(conv_id)):
             return False
         return self.conversation_is_after_all_enabled(conv_id)
+
+    def is_conversation_usable(self, conv_id: str | None) -> bool:
+        """
+        判断 conv_id 是否是可接收消息的对话节点（存在、是 ConversationNode、且有效启用）。
+
+        用于「无任何启用消息」场景：若当前会话不可用（空 / 已禁用 / 不存在），
+        则在根目录自动新建对话，确保新对话被记录并可见。
+
+        Args:
+            conv_id: 对话节点 id（可为 None）
+
+        Returns:
+            bool — True 表示该对话可用作消息插入目标
+        """
+        if not conv_id:
+            return False
+        node = self._tree.get_node(conv_id)
+        if node is None or not isinstance(node, ConversationNode):
+            return False
+        return self._context_svc.is_node_effectively_enabled(conv_id)
 
     def get_tree(self) -> TreeRoot:
         """

@@ -621,6 +621,20 @@ class MessageListView(QWidget):
         scrollbar.setValue(scrollbar.maximum())
         self._programmatic_scroll = False
 
+    def force_scroll_to_bottom(self) -> None:
+        """
+        无条件滚动到消息列表底部（不受 is_near_bottom 限制）。
+
+        用于流式输出首次输出时：无论用户当前滚动位置，都把页面拉到底部一次，
+        让用户看到本轮对话的起始输出。随后由 scroll_to_bottom() 的自动跟随接管。
+        """
+        self._message_container.updateGeometry()
+        self._programmatic_scroll = True
+        scrollbar = self._scroll_area.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        self._programmatic_scroll = False
+        self._auto_follow = True
+
     def save_scroll_state(self) -> dict:
         """
         保存当前滚动状态，供对话切换后恢复。

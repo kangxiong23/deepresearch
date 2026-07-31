@@ -142,7 +142,7 @@ class AppController:
         """
         判断是否应强制在新（空）对话中开始（不重定向）。
 
-        条件：conv_id 是空对话，且其位置位于所有已启用消息之后（DFS 前序）。
+        条件：conv_id 是有效启用的空对话，且其位置位于所有已启用消息之后（DFS 前序）。
         供 UI 发送前决定是否重定向到最后一个启用消息所在对话。
 
         Args:
@@ -152,6 +152,21 @@ class AppController:
             bool — True 表示应使用该新对话，不重定向
         """
         return self._conversation_svc.should_continue_in_new_conversation(conv_id)
+
+    def is_conversation_usable(self, conv_id: str | None) -> bool:
+        """
+        判断 conv_id 是否是可接收消息的对话节点（存在、是 ConversationNode、且有效启用）。
+
+        用于「无任何启用消息」场景：若当前会话不可用（空 / 已禁用 / 不存在），
+        则在根目录自动新建对话，确保新对话被记录并可见。
+
+        Args:
+            conv_id: 对话节点 id（可为 None）
+
+        Returns:
+            bool — True 表示该对话可用作消息插入目标
+        """
+        return self._conversation_svc.is_conversation_usable(conv_id)
 
     def on_search(self, keywords_text: str) -> list[SearchResultVM]:
         """

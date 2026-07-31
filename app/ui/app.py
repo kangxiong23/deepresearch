@@ -324,6 +324,9 @@ class ChatApp:
 
     def _rebuild_message_list(self, message_vms: list) -> None:
         """用 ViewModel 列表完全重建消息控件。"""
+        # 记录现有 thinking 块的展开状态（按 message_id），重建后恢复；
+        # 新增的 thinking 一律默认折叠（折叠状态不持久化）。
+        expanded_map = self._capture_thinking_states()
         self._window.message_list.clear_messages()
 
         if not message_vms:
@@ -332,6 +335,18 @@ class ChatApp:
 
         layout = self._window.message_list.message_layout()
         for vm in message_vms:
+            # thinking 消息统一用可折叠的 ThinkingBlock 展示（与流式一致，重启后也如此）
+            if vm.role == "thinking":
+                block = ThinkingBlock()
+                block.append_text(vm.content or "")
+                block.message_id = vm.id
+                # 已显示的 thinking 保持原展开状态；新增的默认折叠
+                if vm.id in expanded_map:
+                    block.set_expanded(expanded_map[vm.id])
+                layout.insertWidget(layout.count() - 1, block)
+                if vm.id:
+                    self._window.message_list.register_message(vm.id, block)
+                continue
             msg = ChatMessage(
                 role=vm.role,
                 content=vm.content,
@@ -351,6 +366,48 @@ class ChatApp:
         container.adjustSize()
 
         self._window.message_list.show_empty_hint(False)
+
+    def _capture_thinking_states(self) -> dict[str, bool]:
+        """收集当前消息列表中 ThinkingBlock 的展开状态（message_id → is_expanded）。"""
+        layout = self._window.message_list.message_layout()
+        states: dict[str, bool] = {}
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if isinstance(w, ThinkingBlock) and w.message_id:
+                states[w.message_id] = w.is_expanded
+        return states
+
+    def _sync_message_widget_ids(self) -> None:
+        """
+        流式结束后轻量同步消息控件 ID（不重建页面，避免整页重绘闪烁）。
+
+        流式期间，用户消息的 message_id 为占位空串（在 _handle_send 中置空，
+        注释为"流完成后由 tree refresh 更新"）。本方法从树中取到真实 ID，
+        按 role + 内容前缀匹配到对应控件并注册，供"点击树中消息 → 滚动定位"使用。
+        流式结果本身已正确显示在页面上，无需重建。
+        """
+        message_vms = self._ctrl.on_get_multi_conversation_messages()
+        msg_list = self._window.message_list
+        layout = msg_list.message_layout()
+
+        # 收集现有 ChatMessage 控件中 message_id 为空的（通常是本轮用户消息）
+        unused: list = [
+            layout.itemAt(i).widget()
+            for i in range(layout.count())
+            if isinstance(layout.itemAt(i).widget(), ChatMessage)
+            and not layout.itemAt(i).widget().message_id
+        ]
+
+        for vm in message_vms:
+            if not getattr(vm, "id", ""):
+                continue
+            for w in unused:
+                content = getattr(w, "current_content", "") or ""
+                if w.role == vm.role and content[:30] == (vm.content or "")[:30]:
+                    w.message_id = vm.id
+                    msg_list.register_message(vm.id, w)
+                    unused.remove(w)
+                    break
 
     def _connect_message_signals(self, msg: ChatMessage) -> None:
         """连接消息气泡的操作按钮信号。"""
@@ -389,12 +446,14 @@ class ChatApp:
         #   - 若当前会话是「新建空对话」且位于所有已启用消息之后（DFS 前序），
         #     则强制在该新对话开始，不重定向。
         #   - 否则重定向到树中最后一个有效启用消息所在的对话（聚合时间线末尾）。
+        #   - 若树中无任何启用消息、且当前会话不可用（空/禁用/不存在），
+        #     则在根目录自动新建对话，保证这场对话被记录并可见。
         if not self._ctrl.should_continue_in_new_conversation(self._current_session_id):
             target = self._ctrl.find_last_enabled_conversation_id()
             if target:
                 self._current_session_id = target
                 self._window.sidebar.set_active(target)
-            elif not self._current_session_id:
+            elif not self._ctrl.is_conversation_usable(self._current_session_id):
                 self._handle_new_conversation()
 
         if not text and not files:
@@ -448,6 +507,8 @@ class ChatApp:
         通过 Qt 信号将每个 chunk 安全传递到主线程。
         """
         # 创建 assistant 消息气泡
+        # ★ 本轮对话首次输出时强制滚动到底部一次（标志位，见 on_chunk）
+        self._first_chunk_scrolled = False
         assistant_msg = ChatMessage(role="assistant", content="")
         assistant_msg.start_stream()
         self._streaming_message = assistant_msg
@@ -466,6 +527,12 @@ class ChatApp:
 
         def on_chunk(delta: str, is_done: bool, chunk_type: str, _msg_id: str):
             """主线程：处理每个流式块。"""
+            # ★ 本轮对话首次输出：强制滚动到底部一次（无论是否开思考模式）。
+            #   thinking + assistant 两条消息也只触发这一次。
+            if not self._first_chunk_scrolled:
+                self._first_chunk_scrolled = True
+                self._window.message_list.force_scroll_to_bottom()
+
             if chunk_type == "thinking":
                 if thinking_ref[0] is None:
                     thinking_ref[0] = ThinkingBlock()
@@ -498,9 +565,8 @@ class ChatApp:
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
             QTimer.singleShot(0, self._load_tree)
-            # 流结束后刷新聚合视图：用户若在底部附近则跟随，否则保持位置
-            _near = self._window.message_list.is_near_bottom()
-            QTimer.singleShot(0, lambda: self._load_all_messages(scroll_to_bottom=_near))
+            # 流结束后仅轻量同步消息 ID，不整页重建（流式结果已显示，避免页面重绘闪烁）
+            QTimer.singleShot(0, self._sync_message_widget_ids)
 
         def on_error(error_msg: str):
             """流出错。"""
@@ -572,6 +638,8 @@ class ChatApp:
         启动重新生成流。
         与 _start_stream 类似，但调用 controller.on_regenerate_message。
         """
+        # ★ 本轮对话首次输出时强制滚动到底部一次（标志位，见 on_chunk）
+        self._first_chunk_scrolled = False
         assistant_msg = ChatMessage(role="assistant", content="")
         assistant_msg.start_stream()
         self._streaming_message = assistant_msg
@@ -587,6 +655,12 @@ class ChatApp:
         self._stream_worker = stream_worker
 
         def on_chunk(delta: str, is_done: bool, chunk_type: str, _msg_id: str):
+            # ★ 本轮对话首次输出：强制滚动到底部一次（无论是否开思考模式）。
+            #   thinking + assistant 两条消息也只触发这一次。
+            if not self._first_chunk_scrolled:
+                self._first_chunk_scrolled = True
+                self._window.message_list.force_scroll_to_bottom()
+
             if chunk_type == "thinking":
                 if thinking_ref[0] is None:
                     thinking_ref[0] = ThinkingBlock()
@@ -616,9 +690,8 @@ class ChatApp:
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
             QTimer.singleShot(0, self._load_tree)
-            # 流结束后刷新聚合视图：用户若在底部附近则跟随，否则保持位置
-            _near = self._window.message_list.is_near_bottom()
-            QTimer.singleShot(0, lambda: self._load_all_messages(scroll_to_bottom=_near))
+            # 流结束后仅轻量同步消息 ID，不整页重建（流式结果已显示，避免页面重绘闪烁）
+            QTimer.singleShot(0, self._sync_message_widget_ids)
 
         def on_error(error_msg: str):
             print(f"[UI] Regenerate error: {error_msg}")

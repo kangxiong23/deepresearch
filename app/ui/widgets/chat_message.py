@@ -218,8 +218,9 @@ class ThinkingBlock(QFrame):
         super().__init__(parent)
         self.setObjectName("thinkingBlock")
 
-        self._expanded: bool = True
+        self._expanded: bool = False  # 默认折叠（折叠状态不持久化）
         self._buffer: str = ""
+        self.message_id: str = ""  # 供滚动定位注册（与 ChatMessage 对齐）
 
         # ── 折叠按钮 ────────────────────────────
         self._toggle_btn = QPushButton("▾")
@@ -304,6 +305,21 @@ class ThinkingBlock(QFrame):
         self._update_content_height()
         self.content_changed.emit()
 
+    def set_expanded(self, expanded: bool) -> None:
+        """程序化设置展开/折叠状态（用于重建时保持原有状态）。"""
+        if self._expanded == expanded:
+            return
+        self._expanded = expanded
+        self._content_browser.setVisible(self._expanded)
+        self._toggle_btn.setText("▾" if self._expanded else "▸")
+        self._update_content_height()
+        self.content_changed.emit()
+
+    @property
+    def is_expanded(self) -> bool:
+        """当前是否展开。"""
+        return self._expanded
+
     def append_text(self, delta: str) -> None:
         """追加文本（流式），自动更新显示。"""
         self._buffer += delta
@@ -324,6 +340,8 @@ class ThinkingBlock(QFrame):
 
     def _update_content_height(self) -> None:
         """根据可见性、内容和可用宽度调整高度。"""
+        # 折叠时隐藏内容区（与 _on_toggle / set_expanded 的 setVisible 行为一致）
+        self._content_browser.setVisible(self._expanded)
         if not self._expanded or not self._buffer:
             self._content_browser.setFixedHeight(0)
             return
