@@ -106,10 +106,13 @@ class DeepSeekClient:
         将 LLMContext 转换为 DeepSeek API JSON payload。
 
         system_prompt 作为首条 system 消息插入（如果非空）。
-        思考模式通过 max_tokens 映射：
-            DeepSeek reasoner 不接受 temperature 参数；
-            thinking_enabled 对 reasoner 模型无额外开关，
-            选择 "deepseek-v4-pro" 本身即开启推理链。
+        思考模式 & 思考强度（flash / pro 平等对待）：
+            - config.thinking_enabled 是前后端同步的唯一数据源。
+            - thinking 启用时：下发 thinking.type=enabled，并携带
+              reasoning_effort（low/high/max，来自 config.reasoning_effort）。
+            - thinking 未启用时：下发 thinking.type=disabled，且【不得】传
+              reasoning_effort —— API 会因此报错。
+            - temperature：reasoner 场景不传（保留：非 pro 模型传 temperature）。
         """
         # 从 config 读取当前模型（覆盖 context 中的值，确保用最新选择）
         model = app_config.model_type
@@ -139,6 +142,15 @@ class DeepSeekClient:
             if temp is None:
                 temp = app_config.temperature
             payload["temperature"] = temp
+
+        # 思考模式 & 思考强度：flash / pro 平等对待
+        if app_config.thinking_enabled:
+            payload["thinking"] = {"type": "enabled"}
+            effort = app_config.reasoning_effort or "high"
+            payload["reasoning_effort"] = effort
+        else:
+            payload["thinking"] = {"type": "disabled"}
+            # 不传 reasoning_effort —— API 要求 thinking 未启用时不得携带
 
         return payload
 

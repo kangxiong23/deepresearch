@@ -18,6 +18,7 @@ from app.storage.models import (
     ConversationNode,
     FolderNode,
     Message,
+    MessageNode,
     Role,
 )
 from app.storage.tree_store import TreeStore
@@ -323,6 +324,78 @@ class TestContextServiceTreeIntegration(unittest.TestCase):
         )
         # "[Shared]" 应只出现一次（在树块段）
         self.assertEqual(prompt.count("[Shared]"), 1)
+
+    def test_history_excludes_deleted_message(self) -> None:
+        """
+        删除 MessageNode 后，get_enabled_history_messages 不应包含该消息。
+
+        即：历史以 tree.json 为准，即使 DB 中消息行仍然存在。
+        """
+        conv = ConversationNode(
+            id="conv-hist", parent_id="root", title="历史测试",
+        )
+        self.tree_store.create_node(conv)
+
+        # 保存两条消息到 DB
+        m1 = Message(
+            id="m1", conversation_id="conv-hist", role=Role.USER,
+            content="问题1", created_at=datetime.utcnow(), token_count=2,
+        )
+        m2 = Message(
+            id="m2", conversation_id="conv-hist", role=Role.ASSISTANT,
+            content="回答1", created_at=datetime.utcnow(), token_count=2,
+        )
+        self.message_repo.save_message(m1)
+        self.message_repo.save_message(m2)
+
+        # 创建对应 MessageNode
+        n1 = MessageNode(
+            id="m1", parent_id="conv-hist", message_id="m1",
+            role=Role.USER.value, preview="问题1", title="User: 问题1",
+        )
+        n2 = MessageNode(
+            id="m2", parent_id="conv-hist", message_id="m2",
+            role=Role.ASSISTANT.value, preview="回答1", title="Asst: 回答1",
+        )
+        self.tree_store.create_node(n1)
+        self.tree_store.create_node(n2)
+
+        # 初始：两条消息都在历史中（DFS 前序）
+        history = self.context_service.get_enabled_history_messages()
+        self.assertEqual([m.id for m in history], ["m1", "m2"])
+
+        # 软删除 m1 的 MessageNode（模拟删除操作 —— 只动 tree.json）
+        self.tree_store.soft_delete_node("m1")
+
+        # DB 中 m1 仍然存在，但历史不应包含它
+        self.assertEqual(len(self.message_repo.get_messages_by_ids(["m1"])), 1)
+        history2 = self.context_service.get_enabled_history_messages()
+        self.assertEqual([m.id for m in history2], ["m2"])
+
+    def test_history_excludes_disabled_folder(self) -> None:
+        """禁用父目录后，其下对话的消息不应出现在历史中（启用级联）。"""
+        fa = FolderNode(
+            id="fa-dis", parent_id="root", title="禁用目录", enabled=False,
+        )
+        conv = ConversationNode(
+            id="cv-dis", parent_id="fa-dis", title="禁用对话",
+        )
+        self.tree_store.create_node(fa)
+        self.tree_store.create_node(conv)
+
+        m = Message(
+            id="m-dis", conversation_id="cv-dis", role=Role.USER,
+            content="禁用内容", created_at=datetime.utcnow(), token_count=2,
+        )
+        self.message_repo.save_message(m)
+        node = MessageNode(
+            id="m-dis", parent_id="cv-dis", message_id="m-dis",
+            role=Role.USER.value, preview="禁用内容", title="User: 禁用内容",
+        )
+        self.tree_store.create_node(node)
+
+        history = self.context_service.get_enabled_history_messages()
+        self.assertNotIn("m-dis", [mm.id for mm in history])
 
 
 if __name__ == "__main__":

@@ -27,6 +27,20 @@ python main.py 2>&1 | grep "\[CTRL \]"      # Controller layer
 LOG_LEVEL=DEBUG python main.py
 ```
 
+## One-time maintenance scripts (`scripts/`)
+
+One-time / maintenance utilities live in `scripts/`. They are **not** part of the app and must be run manually from the project root. Both follow a **dry-run by default, `--execute` to apply** pattern and read paths via `config.py`:
+
+```bash
+# Prune orphan message rows from SQLite (based on tree.json / recycle_bin.json)
+python scripts/sync_db_with_tree.py            # dry-run: show orphan count + rows
+python scripts/sync_db_with_tree.py --execute  # actually delete orphans
+
+# Fix message ordering where assistant precedes thinking (thinking = LLM draft, must come first)
+python scripts/fix_thinking_order.py            # dry-run: show affected conversations
+python scripts/fix_thinking_order.py --execute  # rewrite tree.json
+```
+
 ## Architecture
 
 This is a desktop AI chat application (DeepResearch) built with **PySide6** (Qt for Python), powered by the **DeepSeek API**. It supports streaming chat, thinking/reasoning mode, web search, file upload/parsing, context block management, and a knowledge graph extracted from conversations.
@@ -47,7 +61,7 @@ Dependencies flow one way: `Storage → Adapters → Core → Controllers → UI
 
 ### Key architectural decisions
 
-**Config is a global mutable module (`config.py`).** Every layer imports `config` directly. Static values (API key, DB path) are loaded from `.env` at import time. Mutable values (`model_type`, `thinking_enabled`, `search_enabled`) are written by the UI and read by Core/Adapters — no dependency injection for config.
+**Config is a global mutable module (`config.py`).** Every layer imports `config` directly. Static values (API key, DB path) are loaded from `.env` at import time. Mutable values (`model_type`, `thinking_enabled`, `reasoning_effort`, `search_enabled`) are written by the UI and read by Core/Adapters — no dependency injection for config. **These four mutable vars are the single sync point between frontend and backend**: the UI writes them (InputArea/ModelSelector → `SettingsController`) and Core/Adapters read them fresh on each call. In particular, `DeepSeekClient._build_payload` honors `thinking_enabled` for **both** `deepseek-v4-pro` and `deepseek-v4-flash` (treated equally): when enabled it sends `thinking: {type: enabled}` plus `reasoning_effort` (`config.reasoning_effort`, one of `low|high|max`); when disabled it sends `thinking: {type: disabled}` and **must not** include `reasoning_effort` (the API rejects it). `SearchService` gates on `search_enabled`.
 
 **Protocol-based dependency inversion (`app/core/protocols.py`).** Core services depend on `typing.Protocol` classes (`LLMClientProtocol`, `SearchAdapterProtocol`, `FileParserProtocol`, `MessageRepoProtocol`, `ContextStoreProtocol`, `TreeStoreProtocol`), not concrete implementations. Adapters and Storage implement these protocols. This means you can swap the LLM backend or search provider by writing a new adapter — no Core changes needed.
 
@@ -157,6 +171,8 @@ Conversations, folders, and messages are organized in a hierarchical tree stored
 | `app/ui/widgets/dialogs.py` | Reusable dialogs (rename, new folder, confirm, context block manager, recycle bin) |
 | `tests/test_tree_store.py` | TreeStore unit tests (25 tests) |
 | `tests/test_conversation_service.py` | ConversationService + ContextService unit tests (14 tests) |
+| `scripts/sync_db_with_tree.py` | One-time: prune orphan SQLite message rows based on tree.json/recycle_bin.json |
+| `scripts/fix_thinking_order.py` | One-time: fix tree.json message order where assistant precedes thinking |
 
 ### Legacy Flet code
 

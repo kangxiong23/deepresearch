@@ -127,7 +127,12 @@ class ContextService:
                       f"{self._knowledge_svc.get_stats().get('relation_count',0)}）")
 
         # 2. 获取历史消息并截断
-        history = self._repo.get_messages(conversation_id)
+        #    ⚠️ 以 tree.json 为唯一数据源：仅收集有效启用的 MessageNode，
+        #    保证删除/禁用的消息不会进入 LLM 历史（与前端展示一致）。
+        #    ⚠️ 去除 THINKING（LLM 草稿）：不进历史、不占 token 预算，
+        #    保持上下文轻量。
+        history = self.get_enabled_history_messages()
+        history = [m for m in history if m.role != Role.THINKING]
         truncated = self._truncate_history(
             history,
             budget_tokens=app_config.max_history_tokens,
@@ -136,8 +141,6 @@ class ContextService:
         # 3. 组装 messages 列表（OpenAI 格式）
         messages: list[dict] = []
         for msg in truncated:
-            if msg.role == Role.THINKING:
-                continue
             messages.append({
                 "role": msg.role.value if hasattr(msg.role, "value") else msg.role,
                 "content": msg.content,
@@ -318,6 +321,63 @@ class ContextService:
             bool — 节点是否实际启用
         """
         return self._is_node_enabled(node_id)
+
+    def get_enabled_history_messages(self) -> list[Message]:
+        """
+        收集 LLM 历史消息，以 tree.json 为唯一数据源。
+
+        规则（与前端 `get_effective_enabled_messages` 完全一致）：
+        - 遍历树中所有 MessageNode，逐个通过祖先级联规则判断是否 effectively enabled
+        - 仅收集 enabled 的 message_id，批量从 messages 表加载实际内容
+        - 按 DFS 前序遍历（树结构顺序）排列
+        - 包含 THINKING 消息（由调用方在组装 messages 时过滤，保证前端展示一致）
+
+        回退：若树中无任何 MessageNode（Phase 5 迁移前创建的旧对话），
+        则收集所有有效启用的 ConversationNode，通过 conversation_id 批量查询。
+
+        Returns:
+            list[Message] — 所有有效启用对话的消息，按 DFS 前序遍历排列
+        """
+        if self._tree is None:
+            return []
+
+        all_msg_nodes = self._tree.get_all_message_nodes()
+
+        if not all_msg_nodes:
+            # 回退：无 MessageNode，使用 ConversationNode + conversation_id 查询
+            tree = self._tree.get_tree()
+            conv_nodes = [n for n in tree.nodes if isinstance(n, ConversationNode)]
+            enabled_conv_ids: list[str] = [
+                cn.id for cn in conv_nodes
+                if self.is_node_effectively_enabled(cn.id)
+            ]
+            if not enabled_conv_ids:
+                print("[CTX ] get_enabled_history_messages: 无启用的对话（回退模式）")
+                return []
+            messages = self._repo.get_messages_by_conversation_ids(enabled_conv_ids)
+            print(f"[CTX ] get_enabled_history_messages: 回退模式，"
+                  f"{len(enabled_conv_ids)} 个启用对话 → {len(messages)} 条消息")
+            return messages
+
+        # 逐个判断 effective enabled（考虑祖先级联）
+        enabled_message_ids: set[str] = set()
+        for node in all_msg_nodes:
+            if self._is_node_enabled(node.id):
+                enabled_message_ids.add(node.message_id)
+
+        if not enabled_message_ids:
+            print("[CTX ] get_enabled_history_messages: 无有效启用的 MessageNode")
+            return []
+
+        # ── 按 DFS 前序遍历排序 ──
+        ordered_ids = self._tree.get_message_ids_in_tree_order()
+        id_order: dict[str, int] = {mid: i for i, mid in enumerate(ordered_ids)}
+
+        messages = self._repo.get_messages_by_ids(list(enabled_message_ids))
+        messages.sort(key=lambda m: id_order.get(m.id, 999999))
+        print(f"[CTX ] get_enabled_history_messages: "
+              f"{len(enabled_message_ids)} 个 MessageNode → {len(messages)} 条消息（树序遍历）")
+        return messages
 
     def _is_node_enabled(self, node_id: str) -> bool:
         """

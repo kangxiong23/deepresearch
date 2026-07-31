@@ -47,6 +47,17 @@ class SettingsController:
         """
         app_config.thinking_enabled = enabled
 
+    # ── 思考强度 ──────────────────────────────
+
+    def on_change_reasoning_effort(self, effort: str) -> None:
+        """
+        UI 切换思考强度时调用。
+
+        Args:
+            effort: 取值 "low" / "high" / "max"
+        """
+        app_config.reasoning_effort = effort
+
     # ── 搜索开关 ──────────────────────────────
 
     def on_toggle_search(self, enabled: bool) -> None:

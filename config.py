@@ -53,8 +53,16 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 # 后端读取：model = app_config.model_type
 model_type: str = os.getenv("DEFAULT_MODEL", "deepseek-v4-pro")
 
-# 思考模式开关（仅 deepseek-v4-pro 支持）
+# 思考模式开关（flash / pro 均支持）
 thinking_enabled: bool = False
+
+# 思考强度（仅 thinking_enabled=True 时生效；API 要求 thinking 未启用时不得传）
+# UI 写入：app_config.reasoning_effort = "high"
+# 后端读取：payload["reasoning_effort"] = app_config.reasoning_effort
+reasoning_effort: str = "high"
+
+# 思考强度可选值（供 UI 下拉展示 / 后端校验）
+REASONING_EFFORTS: tuple[str, ...] = ("low", "high", "max")
 
 # 联网搜索开关
 search_enabled: bool = False

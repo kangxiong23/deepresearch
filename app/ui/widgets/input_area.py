@@ -183,6 +183,87 @@ class ModelSelector(QComboBox):
             self.model_changed.emit(model_key)
 
 
+class ReasoningEffortSelector(QComboBox):
+    """
+    思考强度下拉选择（low / high / max）。
+
+    写入 app_config.reasoning_effort，通知 effort_changed 回调。
+    仅当 thinking_enabled=True 时生效（API 要求）；思考关闭时控件应被禁用。
+    """
+
+    effort_changed = Signal(str)
+
+    _EFFORT_OPTIONS = [
+        ("low", "LOW"),
+        ("high", "HIGH"),
+        ("max", "MAX"),
+    ]
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        current = getattr(app_config, "reasoning_effort", "high")
+
+        for key, label in self._EFFORT_OPTIONS:
+            self.addItem(label, key)
+
+        # 设置当前选中项
+        for i in range(self.count()):
+            if self.itemData(i) == current:
+                self.setCurrentIndex(i)
+                break
+
+        self.setFont(Fonts.mono(Fonts.SIZE_SM))
+        self.setFixedWidth(90)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("思考强度 (reasoning_effort)：low / high / max，仅思考模式开启时生效")
+        self.setStyleSheet(f"""
+            QComboBox {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.BG_ELEVATED};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 8px;
+                padding: 6px 10px;
+            }}
+            QComboBox:hover {{
+                border-color: {Colors.PRIMARY};
+            }}
+            QComboBox:focus {{
+                border-color: {Colors.PRIMARY};
+            }}
+            QComboBox:disabled {{
+                color: {Colors.TEXT_DISABLED};
+                border-color: {Colors.BORDER};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border: none;
+                padding-right: 4px;
+            }}
+            QComboBox::down-arrow {{
+                width: 8px;
+                height: 8px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {Colors.BG_ELEVATED};
+                color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {Colors.BORDER};
+                selection-background-color: {Colors.BG_OVERLAY};
+                outline: none;
+            }}
+        """)
+
+        self.currentIndexChanged.connect(self._on_change)
+
+    def _on_change(self, index: int) -> None:
+        """下拉选择变更。"""
+        effort = self.itemData(index)
+        if effort:
+            app_config.reasoning_effort = effort
+            self.effort_changed.emit(effort)
+
+
 # ──────────────────────────────────────────────
 # 附件条
 # ──────────────────────────────────────────────
@@ -327,6 +408,7 @@ class InputArea(QFrame):
     model_changed = Signal(str)
     thinking_toggled = Signal(bool)
     search_toggled = Signal(bool)
+    reasoning_effort_changed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -402,11 +484,17 @@ class InputArea(QFrame):
         self._model_selector = ModelSelector()
         self._model_selector.model_changed.connect(self.model_changed)
 
+        # 思考强度下拉（思考关闭时禁用，因为 API 要求 thinking 启用才可传 reasoning_effort）
+        self._effort_selector = ReasoningEffortSelector()
+        self._effort_selector.effort_changed.connect(self.reasoning_effort_changed)
+        self._effort_selector.setEnabled(initial_thinking)
+
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(0, Spacing.SM, 0, 0)
         toolbar.setSpacing(Spacing.SM)
         toolbar.addWidget(self._file_btn)
         toolbar.addWidget(self._thinking_chip)
+        toolbar.addWidget(self._effort_selector)
         toolbar.addWidget(self._search_chip)
         toolbar.addStretch()
         toolbar.addWidget(self._model_selector)
@@ -530,6 +618,8 @@ class InputArea(QFrame):
     def _on_thinking_toggle(self, val: bool) -> None:
         """思考模式切换。"""
         app_config.thinking_enabled = val
+        # 思考关闭时禁用思考强度控件（API 要求 thinking 启用才可传 reasoning_effort）
+        self._effort_selector.setEnabled(val)
         self.thinking_toggled.emit(val)
 
     def _on_search_toggle(self, val: bool) -> None:

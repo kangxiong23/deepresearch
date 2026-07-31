@@ -141,7 +141,8 @@ class ConversationService:
                 f"Node {session_id} is not a conversation"
             )
 
-        messages = self._msg_repo.get_messages(session_id)
+        # 以 tree.json 为准加载消息（已删除/禁用的消息不会出现）
+        messages = self.get_messages_for_node(session_id)
         return ConversationDetail(
             id=node.id,
             title=node.title,
@@ -284,53 +285,89 @@ class ConversationService:
         """
         收集树中所有有效启用的 MessageNode 对应的消息，按 DFS 前序遍历排列。
 
-        遍历所有 MessageNode，对每个节点通过 ancestors 级联规则判断
-        是否 effectively enabled，如果是则收集其 message_id。最后批量
-        从 SQLite 加载实际消息内容，按 DFS 前序遍历排序。
-
-        回退：若无任何 MessageNode（Phase 5 迁移前），则收集所有有效
-        启用的 ConversationNode，通过 conversation_id 批量查询消息。
+        与 `ContextService.get_enabled_history_messages()` 共用同一套
+        tree.json 驱动逻辑（唯一数据源），保证前端展示与 LLM 历史完全一致。
+        此处仅做委托，避免逻辑重复。
 
         Returns:
             list[Message] — 所有有效启用对话的消息，按 DFS 前序遍历排列
         """
-        all_msg_nodes = self._tree.get_all_message_nodes()
+        return self._context_svc.get_enabled_history_messages()
 
-        if not all_msg_nodes:
-            # 回退：无 MessageNode，使用 ConversationNode + conversation_id 查询
-            tree = self._tree.get_tree()
-            conv_nodes = [n for n in tree.nodes if isinstance(n, ConversationNode)]
-            enabled_conv_ids: list[str] = []
-            for cn in conv_nodes:
-                if self._context_svc.is_node_effectively_enabled(cn.id):
-                    enabled_conv_ids.append(cn.id)
-            if not enabled_conv_ids:
-                print("[CORE ] get_effective_enabled_messages: 无启用的对话")
-                return []
-            print(f"[CORE ] get_effective_enabled_messages: 回退模式，"
-                  f"{len(enabled_conv_ids)} 个启用对话")
-            messages = self._msg_repo.get_messages_by_conversation_ids(enabled_conv_ids)
-            return messages
+    def find_last_enabled_conversation_id(self) -> str | None:
+        """
+        返回树中最后一个有效启用 MessageNode 所在的 ConversationNode id。
 
-        # 逐个判断 effective enabled（考虑祖先级联）
-        enabled_message_ids: set[str] = set()
-        for node in all_msg_nodes:
-            if self._context_svc.is_node_effectively_enabled(node.id):
-                enabled_message_ids.add(node.message_id)
+        发送消息时应将新内容插入到该对话结尾，使聚合时间线在最新内容处自然延续。
+        若树中无任何有效启用的消息，返回 None。
 
-        if not enabled_message_ids:
-            print("[CORE ] get_effective_enabled_messages: 无有效启用的 MessageNode")
-            return []
+        Returns:
+            str | None — 目标对话 id；无启用消息时为 None
+        """
+        enabled = self._context_svc.get_enabled_history_messages()
+        if not enabled:
+            return None
+        last_msg = enabled[-1]  # DFS 前序的最后一个 = 树中最后一个启用消息
+        node_map = {n.message_id: n for n in self._tree.get_all_message_nodes()}
+        node = node_map.get(last_msg.id)
+        if node is None or not node.parent_id:
+            return None
+        parent = self._tree.get_node(node.parent_id)
+        if isinstance(parent, ConversationNode):
+            return parent.id
+        return None
 
-        # ── 按 DFS 前序遍历排序 ──
-        ordered_ids = self._tree.get_message_ids_in_tree_order()
-        id_order: dict[str, int] = {mid: i for i, mid in enumerate(ordered_ids)}
+    def conversation_is_after_all_enabled(self, conv_id: str) -> bool:
+        """
+        判断对话节点 conv_id 在 DFS 前序中的位置是否位于所有已启用消息之后。
 
-        messages = self._msg_repo.get_messages_by_ids(list(enabled_message_ids))
-        messages.sort(key=lambda m: id_order.get(m.id, 999999))
-        print(f"[CORE ] get_effective_enabled_messages: "
-              f"{len(enabled_message_ids)} 个 MessageNode → {len(messages)} 条消息（树序遍历）")
-        return messages
+        用于「新建对话」场景：若新建对话位于所有启用消息之后，直接在其中开始
+        不会造成后续对话历史顺序混乱。
+
+        Args:
+            conv_id: 对话节点 id
+
+        Returns:
+            bool — True 表示该对话位于所有已启用消息之后（或无任何启用消息）
+        """
+        order_ids = self._tree.get_all_node_ids_in_tree_order()
+        pos = {nid: i for i, nid in enumerate(order_ids)}
+        conv_idx = pos.get(conv_id)
+        if conv_idx is None:
+            return False
+
+        enabled = self._context_svc.get_enabled_history_messages()
+        if not enabled:
+            return True  # 无启用消息，空对话必然位于"所有启用消息之后"
+        node_map = {n.message_id: n for n in self._tree.get_all_message_nodes()}
+        last_node = node_map.get(enabled[-1].id)
+        if last_node is None:
+            return True
+        last_idx = pos.get(last_node.id, -1)
+        return conv_idx > last_idx
+
+    def should_continue_in_new_conversation(self, conv_id: str | None) -> bool:
+        """
+        判断是否应强制在新（空）对话中开始（不重定向）。
+
+        条件：conv_id 是一个没有任何消息的 ConversationNode，且其位置位于
+        所有已启用消息之后（DFS 前序）。满足则允许直接在新对话开始。
+
+        Args:
+            conv_id: 对话节点 id（可为 None）
+
+        Returns:
+            bool — True 表示应使用该新对话，不重定向
+        """
+        if not conv_id:
+            return False
+        node = self._tree.get_node(conv_id)
+        if node is None or not isinstance(node, ConversationNode):
+            return False
+        # 空对话：无任何 MessageNode 后代
+        if any(isinstance(n, MessageNode) for n in self._tree.get_descendants(conv_id)):
+            return False
+        return self.conversation_is_after_all_enabled(conv_id)
 
     def get_tree(self) -> TreeRoot:
         """
@@ -778,30 +815,8 @@ class ConversationService:
             if chunk.is_done:
                 full_content = "".join(full_content_parts)
                 if full_content or thinking_parts:
-                    assistant_msg = Message(
-                        id=assistant_msg_id,
-                        conversation_id=session_id,
-                        role=Role.ASSISTANT,
-                        content=full_content,
-                        is_thinking=bool(thinking_parts),
-                        created_at=datetime.utcnow(),
-                        token_count=len(full_content) // 4,
-                    )
-                    self._msg_repo.save_message(assistant_msg)
-
-                    # Phase 5: 创建 assistant MessageNode
-                    assistant_preview = full_content[:60] if full_content else ""
-                    asst_node = MessageNode(
-                        id=assistant_msg_id,
-                        parent_id=session_id,
-                        message_id=assistant_msg_id,
-                        role=Role.ASSISTANT.value,
-                        preview=assistant_preview,
-                        title=f"Asst: {assistant_preview[:30]}" if assistant_preview else "Assistant message",
-                        enabled=True,
-                    )
-                    self._tree.create_node(asst_node)
-
+                    # ★ 先创建 thinking 节点、后创建 assistant 节点，保证树序
+                    #   thinking 在前（sort_order 递增），聚合时间线先展示推理再展示回答。
                     if thinking_parts:
                         thinking_content = "".join(thinking_parts)
                         thinking_msg = Message(
@@ -827,6 +842,30 @@ class ConversationService:
                             enabled=True,
                         )
                         self._tree.create_node(think_node)
+
+                    assistant_msg = Message(
+                        id=assistant_msg_id,
+                        conversation_id=session_id,
+                        role=Role.ASSISTANT,
+                        content=full_content,
+                        is_thinking=bool(thinking_parts),
+                        created_at=datetime.utcnow(),
+                        token_count=len(full_content) // 4,
+                    )
+                    self._msg_repo.save_message(assistant_msg)
+
+                    # Phase 5: 创建 assistant MessageNode
+                    assistant_preview = full_content[:60] if full_content else ""
+                    asst_node = MessageNode(
+                        id=assistant_msg_id,
+                        parent_id=session_id,
+                        message_id=assistant_msg_id,
+                        role=Role.ASSISTANT.value,
+                        preview=assistant_preview,
+                        title=f"Asst: {assistant_preview[:30]}" if assistant_preview else "Assistant message",
+                        enabled=True,
+                    )
+                    self._tree.create_node(asst_node)
 
                 # Step 9: 更新对话元数据（标题 & 摘要）
                 self._update_meta_after_reply(
@@ -866,8 +905,8 @@ class ConversationService:
             except Exception:
                 pass  # 节点可能已不存在（容错）
 
-        # 取倒数第一条用户消息作为重新生成的输入
-        messages = self._msg_repo.get_messages(session_id)
+        # 取倒数第一条用户消息作为重新生成的输入（tree.json 为准）
+        messages = self.get_messages_for_node(session_id)
         last_user = next(
             (m for m in reversed(messages) if m.role == Role.USER), None
         )
@@ -934,8 +973,8 @@ class ConversationService:
     # ──────────────────────────────────────────
 
     def _find_last_assistant_message(self, session_id: str) -> str | None:
-        """返回最后一条 assistant 消息的 ID，找不到返回 None。"""
-        messages = self._msg_repo.get_messages(session_id)
+        """返回最后一条 assistant 消息的 ID，找不到返回 None。（tree.json 为准）"""
+        messages = self.get_messages_for_node(session_id)
         for msg in reversed(messages):
             if msg.role == Role.ASSISTANT:
                 return msg.id
@@ -970,9 +1009,12 @@ class ConversationService:
         preview = preview + ("..." if len(preview) == 100 else "")
         updates["summary"] = preview
 
-        # 更新消息计数
-        messages = self._msg_repo.get_messages(session_id)
-        updates["message_count"] = len(messages)
+        # 更新消息计数（以 tree.json 的 MessageNode 为准，DB 中的孤立行不计入）
+        message_nodes = [
+            n for n in self._tree.get_descendants(session_id)
+            if isinstance(n, MessageNode)
+        ]
+        updates["message_count"] = len(message_nodes)
 
         self._tree.update_node(session_id, **updates)
 

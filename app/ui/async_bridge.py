@@ -6,9 +6,73 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import AsyncGenerator, Callable, Any
 
-from PySide6.QtCore import QThread, QObject, Signal, Slot
+from PySide6.QtCore import QThread, QObject, Signal, Slot, Qt
+
+
+class StreamRelay(QObject):
+    """
+    主线程信号桥接器。
+
+    问题：AsyncStreamWorker 位于 worker 线程中，其信号连接到 lambda/函数
+    （非 QObject 方法）时，PySide6 无法通过 QObject::thread() 确定目标线程，
+    AutoConnection 回退为 DirectConnection，导致 UI 回调在 worker 线程中执行，
+    引发 "QObject::setParent: Cannot set parent, new parent is in a different thread"。
+
+    方案：StreamRelay 是一个始终留在主线程的 QObject。Worker 信号连接到
+    StreamRelay 的 @Slot 方法（跨线程 → 有 QObject receiver → AutoConnection
+    正确解析为 QueuedConnection），Slot 再转发到同名 Signal（同线程 →
+    DirectConnection 即可）。这样 UI 回调保证在主线程执行。
+
+    用法（在 _start_stream / _start_regenerate_stream 中）：
+        relay = StreamRelay()
+
+        # Worker → Relay（跨线程，自动 QueuedConnection）
+        stream_worker.chunk_ready.connect(relay._on_chunk)
+        stream_worker.stream_finished.connect(relay._on_finished)
+        stream_worker.stream_error.connect(relay._on_error)
+        stream_worker.stream_aborted.connect(relay._on_aborted)
+
+        # Relay → UI 回调（同线程，DirectConnection）
+        relay.chunk_ready.connect(on_chunk)
+        relay.stream_finished.connect(on_finished)
+        relay.stream_error.connect(on_error)
+        relay.stream_aborted.connect(on_aborted)
+    """
+
+    chunk_ready = Signal(str, bool, str, str)
+    stream_finished = Signal()
+    stream_error = Signal(str)
+    stream_aborted = Signal()
+    # 异步任务结果（用于 run_async_in_thread）
+    result_ready = Signal(object)
+    task_error = Signal(str)
+
+    @Slot(str, bool, str, str)
+    def _on_chunk(self, delta: str, is_done: bool, chunk_type: str, msg_id: str) -> None:
+        self.chunk_ready.emit(delta, is_done, chunk_type, msg_id)
+
+    @Slot()
+    def _on_finished(self) -> None:
+        self.stream_finished.emit()
+
+    @Slot(str)
+    def _on_error(self, error_msg: str) -> None:
+        self.stream_error.emit(error_msg)
+
+    @Slot()
+    def _on_aborted(self) -> None:
+        self.stream_aborted.emit()
+
+    @Slot(object)
+    def _on_result(self, result: object) -> None:
+        self.result_ready.emit(result)
+
+    @Slot(str)
+    def _on_task_error(self, error_msg: str) -> None:
+        self.task_error.emit(error_msg)
 
 
 class AsyncStreamWorker(QObject):
@@ -64,6 +128,8 @@ class AsyncStreamWorker(QObject):
             *args:       传递给 gen_factory 的位置参数
         """
         self._abort_flag = False
+        print(f"[DBG] run_stream THREAD={threading.current_thread().name} "
+              f"(主线程={threading.main_thread().name})")
         try:
             # 在新线程中创建独立的 asyncio 事件循环
             self._loop = asyncio.new_event_loop()
@@ -74,9 +140,26 @@ class AsyncStreamWorker(QObject):
         except Exception as exc:
             self.stream_error.emit(str(exc))
         finally:
+            print("[DBG] run_stream: entering finally (thread winding down)")
             if self._loop is not None:
-                self._loop.close()
-                self._loop = None
+                # ⚠️ 关键：run_until_complete 返回后可能仍有 pending 任务
+                # （例如 async generator 的 aclose() 内部创建的 async_generator_athrow 任务）。
+                # 直接 close() 会触发 "Task was destroyed but it is pending!" 错误。
+                # 正确的做法：先取消所有 pending 任务，等待它们完成（CancelledError），再关闭循环。
+                try:
+                    pending = asyncio.all_tasks(self._loop)
+                    if pending:
+                        for task in pending:
+                            task.cancel()
+                        self._loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                except Exception:
+                    pass  # 清理阶段忽略所有错误
+                finally:
+                    self._loop.close()
+                    self._loop = None
+            print("[DBG] run_stream: exiting finally, thread entering exec()")
 
     async def _iterate_stream(
         self,
@@ -177,8 +260,19 @@ class AsyncTaskRunner(QObject):
             self.task_error.emit(str(exc))
         finally:
             if self._loop is not None:
-                self._loop.close()
-                self._loop = None
+                try:
+                    pending = asyncio.all_tasks(self._loop)
+                    if pending:
+                        for task in pending:
+                            task.cancel()
+                        self._loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                except Exception:
+                    pass
+                finally:
+                    self._loop.close()
+                    self._loop = None
 
 
 def run_async_in_thread(
@@ -191,11 +285,15 @@ def run_async_in_thread(
     """
     便捷函数：在后台线程运行 async 函数。
 
+    通过 StreamRelay 桥接确保 on_result/on_error 回调在主线程执行，
+    避免 lambda 回调因缺少 QObject receiver 而在 worker 线程中
+    操作 QWidget 导致的跨线程 setParent 错误。
+
     Args:
         coro_func: 返回 awaitable 的可调用对象
         *args:     位置参数
-        on_result: 结果回调
-        on_error:  错误回调
+        on_result: 结果回调（将在主线程调用）
+        on_error:  错误回调（将在主线程调用）
         parent:    父 QObject
 
     Returns:
@@ -205,10 +303,20 @@ def run_async_in_thread(
     runner = AsyncTaskRunner(parent)
     runner.moveToThread(thread)
 
-    if on_result:
-        runner.result_ready.connect(on_result)
-    if on_error:
-        runner.task_error.connect(on_error)
+    # 使用 StreamRelay 桥接：runner 在 worker 线程发射信号，
+    # relay 是在主线程创建的 QObject，显式 QueuedConnection
+    if on_result or on_error:
+        relay = StreamRelay()
+        if on_result:
+            runner.result_ready.connect(
+                relay._on_result, Qt.ConnectionType.QueuedConnection
+            )
+            relay.result_ready.connect(on_result)
+        if on_error:
+            runner.task_error.connect(
+                relay._on_task_error, Qt.ConnectionType.QueuedConnection
+            )
+            relay.task_error.connect(on_error)
 
     thread.started.connect(lambda: runner.run(coro_func, *args))
     thread.finished.connect(runner.deleteLater)

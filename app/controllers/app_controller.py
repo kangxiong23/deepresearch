@@ -127,6 +127,32 @@ class AppController:
         print(f"[CTRL ] on_get_multi_conversation_messages: 返回 {len(result)} 个 MessageVM")
         return result
 
+    def find_last_enabled_conversation_id(self) -> str | None:
+        """
+        返回树中最后一个有效启用消息所在的对话 id。
+
+        供 UI 在发送消息前确定插入目标（新内容在聚合时间线末尾继续）。
+
+        Returns:
+            str | None — 目标对话 id；无启用消息时为 None
+        """
+        return self._conversation_svc.find_last_enabled_conversation_id()
+
+    def should_continue_in_new_conversation(self, conv_id: str | None) -> bool:
+        """
+        判断是否应强制在新（空）对话中开始（不重定向）。
+
+        条件：conv_id 是空对话，且其位置位于所有已启用消息之后（DFS 前序）。
+        供 UI 发送前决定是否重定向到最后一个启用消息所在对话。
+
+        Args:
+            conv_id: 对话节点 id（可为 None）
+
+        Returns:
+            bool — True 表示应使用该新对话，不重定向
+        """
+        return self._conversation_svc.should_continue_in_new_conversation(conv_id)
+
     def on_search(self, keywords_text: str) -> list[SearchResultVM]:
         """
         UI 调用：执行消息关键词搜索。

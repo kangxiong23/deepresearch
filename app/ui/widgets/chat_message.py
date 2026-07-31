@@ -309,6 +309,8 @@ class ThinkingBlock(QFrame):
         self._buffer += delta
         self._content_browser.setPlainText(self._buffer)
         self._update_content_height()
+        # ★ 同步重绘内容 viewport，保证 thinking 内容也逐块上屏
+        self._content_browser.viewport().repaint()
 
     def start_stream(self) -> None:
         """[兼容] 与 ChatMessage.start_stream 接口统一。"""
@@ -663,6 +665,10 @@ class ChatMessage(QFrame):
         vsb = self._content_browser.verticalScrollBar()
         if vsb.isVisible():
             vsb.setValue(vsb.maximum())
+        # ★ 同步重绘内容 viewport：setHtml 只安排异步 update，交给事件循环后
+        #   paint 事件会被合并，导致文本最后一次性出现。直接 repaint() 内容
+        #   区域可立即上屏（同步、不处理其他事件，不会重入）。
+        self._content_browser.viewport().repaint()
 
     def finalize_stream(self) -> None:
         """结束流式接收。"""

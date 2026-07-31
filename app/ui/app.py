@@ -24,6 +24,7 @@ from app.ui.widgets.search_popup import SearchPopup
 from app.ui.widgets.sidebar import Sidebar
 from app.ui.async_bridge import (
     AsyncStreamWorker,
+    StreamRelay,
     run_async_in_thread,
 )
 
@@ -57,6 +58,7 @@ class ChatApp:
         # ── 流式工作线程引用（防 GC）───────────
         self._stream_thread: QThread | None = None
         self._stream_worker: AsyncStreamWorker | None = None
+        self._stream_relay: StreamRelay | None = None  # 保持 relay 引用，防止 GC
         self._async_task_threads: list = []  # 保持引用防止 GC
 
         # ── 构建主窗口 ──────────────────────────
@@ -110,6 +112,9 @@ class ChatApp:
         )
         input_area.search_toggled.connect(
             lambda v: self._settings_ctrl.on_toggle_search(v)
+        )
+        input_area.reasoning_effort_changed.connect(
+            lambda e: self._settings_ctrl.on_change_reasoning_effort(e)
         )
 
         # ── Sidebar 顶部按钮信号 ──────────────────
@@ -370,7 +375,8 @@ class ChatApp:
         发送消息入口。
 
         1. 中止现有流（如有）
-        2. 自动创建对话（如无活跃对话）
+        2. 确定消息插入目标：树中最后一个有效启用消息所在的对话
+           （使新内容在聚合时间线末尾继续）；无启用消息且无活跃会话时新建
         3. 追加用户消息气泡
         4. 清空输入区，切换到生成状态
         5. 启动流式响应
@@ -379,8 +385,17 @@ class ChatApp:
         if self._stream_worker is not None:
             self._handle_stop()
 
-        if not self._current_session_id:
-            self._handle_new_conversation()
+        # ★ 插入目标决策：
+        #   - 若当前会话是「新建空对话」且位于所有已启用消息之后（DFS 前序），
+        #     则强制在该新对话开始，不重定向。
+        #   - 否则重定向到树中最后一个有效启用消息所在的对话（聚合时间线末尾）。
+        if not self._ctrl.should_continue_in_new_conversation(self._current_session_id):
+            target = self._ctrl.find_last_enabled_conversation_id()
+            if target:
+                self._current_session_id = target
+                self._window.sidebar.set_active(target)
+            elif not self._current_session_id:
+                self._handle_new_conversation()
 
         if not text and not files:
             return
@@ -456,6 +471,7 @@ class ChatApp:
                     thinking_ref[0] = ThinkingBlock()
                     self._insert_before_last(thinking_ref[0])
                 thinking_ref[0].append_text(delta)
+                thinking_ref[0].repaint()  # 强制立即重绘，实现流式效果
             else:
                 if self._streaming_message:
                     self._streaming_message.append_stream(delta)
@@ -464,15 +480,21 @@ class ChatApp:
                         self._window.message_list.register_message(
                             _msg_id, self._streaming_message
                         )
+                    self._streaming_message.repaint()  # 强制立即重绘
 
             # 多对话模式：仅当用户在底部附近时才自动跟随
             self._window.message_list.scroll_to_bottom()
 
         def on_finished():
             """流结束。"""
+            # 防止重入：_cleanup_stream_thread → thread.quit() → thread.finished
+            # → relay._on_finished → 再次触发本回调。此时 worker 已置 None。
+            if self._stream_worker is None:
+                return
             if self._streaming_message:
                 self._streaming_message.finalize_stream()
                 self._streaming_message = None
+            print("[DBG] on_finished: calling _cleanup_stream_thread")
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
             QTimer.singleShot(0, self._load_tree)
@@ -490,26 +512,58 @@ class ChatApp:
             if self._streaming_message:
                 self._streaming_message.finalize_stream()
                 self._streaming_message = None
+            print("[DBG] on_finished: calling _cleanup_stream_thread")
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
 
-        stream_worker.chunk_ready.connect(on_chunk)
-        stream_worker.stream_finished.connect(on_finished)
-        stream_worker.stream_error.connect(on_error)
-        stream_worker.stream_aborted.connect(on_aborted)
+        # ── 创建 StreamRelay 桥接器（主线程 QObject）────────────
+        # Worker 信号 → Relay Slot（跨线程，有 QObject receiver →
+        # AutoConnection 正确解析为 QueuedConnection）
+        # Relay Signal → UI 回调（同线程，DirectConnection）
+        relay = StreamRelay()
+        self._stream_relay = relay  # 保持引用，防止 GC 回收 relay
 
-        # 清理信号连接
+        # Worker → Relay: 显式 QueuedConnection（有 QObject receiver，安全）
+        stream_worker.chunk_ready.connect(
+            relay._on_chunk, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_finished.connect(
+            relay._on_finished, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_error.connect(
+            relay._on_error, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_aborted.connect(
+            relay._on_aborted, Qt.ConnectionType.QueuedConnection
+        )
+
+        # Relay → 回调: 同线程，DirectConnection 即可
+        relay.chunk_ready.connect(on_chunk)
+        relay.stream_finished.connect(on_finished)
+        relay.stream_error.connect(on_error)
+        relay.stream_aborted.connect(on_aborted)
+
+        # stream_thread.finished 也经 relay 桥接
         stream_thread.finished.connect(
-            lambda: self._cleanup_stream_thread()
+            relay._on_finished, Qt.ConnectionType.QueuedConnection
         )
 
         # 在线程启动后运行流 — 用局部变量捕获，防止竞态
         _ctrl = self._ctrl
+        # ★ 必须显式 DirectConnection：started 由 worker 线程发出，而 lambda
+        #   没有 QObject receiver 时，AutoConnection 会按"连接时所在线程"
+        #   （主线程）路由，导致 run_stream 阻塞主线程 → 无法流式显示。
+        #   显式 DirectConnection 强制在发出信号的 worker 线程执行。
         stream_thread.started.connect(
             lambda: stream_worker.run_stream(
                 _ctrl.on_send_message, session_id, text, files
-            )
+            ),
+            Qt.ConnectionType.DirectConnection,
         )
+
+        # [DBG] 生命周期定位：记录 thread/worker 何时被销毁
+        stream_thread.destroyed.connect(lambda: print("[DBG] QThread DESTROYED"))
+        stream_worker.destroyed.connect(lambda: print("[DBG] AsyncStreamWorker DESTROYED"))
 
         stream_thread.start()
 
@@ -538,6 +592,7 @@ class ChatApp:
                     thinking_ref[0] = ThinkingBlock()
                     self._insert_before_last(thinking_ref[0])
                 thinking_ref[0].append_text(delta)
+                thinking_ref[0].repaint()
             else:
                 if self._streaming_message:
                     self._streaming_message.append_stream(delta)
@@ -546,13 +601,18 @@ class ChatApp:
                         self._window.message_list.register_message(
                             _msg_id, self._streaming_message
                         )
+                    self._streaming_message.repaint()
             # 多对话模式：仅当用户在底部附近时才自动跟随
             self._window.message_list.scroll_to_bottom()
 
         def on_finished():
+            # 防止重入（同 _start_stream 中的 on_finished）
+            if self._stream_worker is None:
+                return
             if self._streaming_message:
                 self._streaming_message.finalize_stream()
                 self._streaming_message = None
+            print("[DBG] on_finished: calling _cleanup_stream_thread")
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
             QTimer.singleShot(0, self._load_tree)
@@ -568,24 +628,50 @@ class ChatApp:
             if self._streaming_message:
                 self._streaming_message.finalize_stream()
                 self._streaming_message = None
+            print("[DBG] on_finished: calling _cleanup_stream_thread")
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
 
-        stream_worker.chunk_ready.connect(on_chunk)
-        stream_worker.stream_finished.connect(on_finished)
-        stream_worker.stream_error.connect(on_error)
-        stream_worker.stream_aborted.connect(on_aborted)
+        # ── StreamRelay 桥接（与 _start_stream 相同模式）──
+        relay = StreamRelay()
+        self._stream_relay = relay  # 保持引用，防止 GC 回收 relay
+
+        # Worker → Relay: 显式 QueuedConnection
+        stream_worker.chunk_ready.connect(
+            relay._on_chunk, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_finished.connect(
+            relay._on_finished, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_error.connect(
+            relay._on_error, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_aborted.connect(
+            relay._on_aborted, Qt.ConnectionType.QueuedConnection
+        )
+
+        # Relay → 回调: 同线程 DirectConnection
+        relay.chunk_ready.connect(on_chunk)
+        relay.stream_finished.connect(on_finished)
+        relay.stream_error.connect(on_error)
+        relay.stream_aborted.connect(on_aborted)
 
         stream_thread.finished.connect(
-            lambda: self._cleanup_stream_thread()
+            relay._on_finished, Qt.ConnectionType.QueuedConnection
         )
 
         _ctrl = self._ctrl
+        # ★ 同 _start_stream：显式 DirectConnection 确保 run_stream 在 worker 线程执行
         stream_thread.started.connect(
             lambda: stream_worker.run_stream(
                 _ctrl.on_regenerate_message, session_id, ""
-            )
+            ),
+            Qt.ConnectionType.DirectConnection,
         )
+
+        # [DBG] 生命周期定位：记录 thread/worker 何时被销毁
+        stream_thread.destroyed.connect(lambda: print("[DBG] QThread DESTROYED"))
+        stream_worker.destroyed.connect(lambda: print("[DBG] AsyncStreamWorker DESTROYED"))
 
         stream_thread.start()
 
@@ -620,10 +706,28 @@ class ChatApp:
         """清理流式工作线程资源（幂等）。"""
         worker = self._stream_worker
         thread = self._stream_thread
+        relay = self._stream_relay
 
-        # 置空引用，防止重入
+        # [DBG] 生命周期定位：清理时线程是否仍在运行？
+        if thread is not None:
+            print(f"[DBG] cleanup: thread.isRunning()={thread.isRunning()}")
+
+        # 置空引用，防止重入。
+        # ⚠️ 注意：self._stream_thread 暂不置空 —— 必须保留引用直到线程 finished，
+        #    否则 Python GC 可能提前销毁仍在运行的 QThread / worker / relay，
+        #    触发 "QThread: Destroyed while thread is still running" 闪退。
         self._stream_worker = None
-        self._stream_thread = None
+        self._stream_relay = None
+
+        if relay is not None:
+            try:
+                relay.chunk_ready.disconnect()
+                relay.stream_finished.disconnect()
+                relay.stream_error.disconnect()
+                relay.stream_aborted.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            # 延迟到线程结束后统一 deleteLater（见下方 _finalize）
 
         if worker is not None:
             try:
@@ -633,12 +737,26 @@ class ChatApp:
                 worker.stream_aborted.disconnect()
             except (TypeError, RuntimeError):
                 pass
-            worker.deleteLater()
+            # 延迟到线程结束后统一 deleteLater
 
         if thread is not None:
+            # 不阻塞等待（wait() 在 Windows 上可能与 COM 消息泵冲突导致
+            # 0x8001010d 崩溃）。
+            # ★ 关键修复：finished 信号在 worker 线程 run() 真正退出后才发出。
+            #   用闭包同时持有 thread + worker + relay 的 Python 引用，直到
+            #   finished 再统一 deleteLater，杜绝"仍在运行却被提前销毁"。
+            def _finalize(t=thread, w=worker, r=relay):
+                if self._stream_thread is t:
+                    self._stream_thread = None
+                t.deleteLater()
+                if w is not None:
+                    w.deleteLater()
+                if r is not None:
+                    r.deleteLater()
+
+            thread.finished.connect(_finalize)
             thread.quit()
-            thread.wait(2000)
-            thread.deleteLater()
+            print(f"[DBG] cleanup: after quit(), isRunning()={thread.isRunning()}")
 
     # ── 树形结构操作 ──────────────────────────
 

@@ -315,6 +315,24 @@ class TreeStore:
 
         return result
 
+    def get_all_node_ids_in_tree_order(self) -> list[str]:
+        """
+        以 DFS 前序遍历收集所有节点 id（目录/对话/消息），按树结构排序。
+
+        Returns:
+            list[str] — 按 DFS 前序排列的所有节点 id
+        """
+        result: list[str] = []
+
+        def dfs(node_id: str) -> None:
+            result.append(node_id)
+            for child in self._find_children(node_id):
+                dfs(child.id)
+
+        for root_node in self._find_children(None):
+            dfs(root_node.id)
+        return result
+
     def get_descendants(self, node_id: str) -> list[AnyTreeNode]:
         """
         收集节点的所有后代（BFS，不包含节点自身）。
