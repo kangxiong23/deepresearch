@@ -1525,12 +1525,14 @@ class TreePanel(QWidget):
         from PySide6.QtGui import QBrush, QColor
         node_id = item.data(ROLE_NODE_ID)
         if node_id == self._edited_node_id:
-            item.setForeground(
-                QBrush(QColor(Colors.TEXT_SECONDARY + "88"))
-            )
+            # ⚠️ Qt 8 位 hex 是 #AARRGGBB（alpha 在前）——#RRGGBBAA 会被
+            # 误解析成错乱颜色。显式用 alpha 前置格式。
+            color = QColor("#88" + Colors.TEXT_SECONDARY.lstrip("#"))
+            item.setForeground(QBrush(color))
         else:
-            # 恢复默认前景色（由 item 初始创建时未设置 → 使用调色板默认色）
-            item.setForeground(QBrush())
+            # ⚠️ 不能用空 QBrush() 恢复：NoBrush + 黑色在深色背景下不可见，
+            # 会导致"文字全消失且退出不恢复"。显式恢复为树的 QSS 文字色。
+            item.setForeground(QBrush(QColor(Colors.TEXT_SECONDARY)))
         for i in range(item.rowCount()):
             child = item.child(i)
             if child is not None:
