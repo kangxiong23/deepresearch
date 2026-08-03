@@ -32,7 +32,8 @@ LOG_LEVEL=DEBUG python main.py
 One-time / maintenance utilities live in `scripts/`. They are **not** part of the app and must be run manually from the project root. Both follow a **dry-run by default, `--execute` to apply** pattern and read paths via `config.py`:
 
 ```bash
-# Prune orphan message rows from SQLite (based on tree.json / recycle_bin.json)
+# Prune orphan message rows from SQLite (based on tree.json / recycle_bin.json /
+# branch storage — rows referenced by fork_nodes/branch_nodes are kept for branch switching)
 python scripts/sync_db_with_tree.py            # dry-run: show orphan count + rows
 python scripts/sync_db_with_tree.py --execute  # actually delete orphans
 
@@ -133,6 +134,28 @@ Conversations, folders, and messages are organized in a hierarchical tree stored
 
 **Migration path.** On first launch after upgrade, `database._migrate_if_needed()` converts old `conversations` table rows to `ConversationNode` entries under the "未分类" root folder, then renames the old table to `conversations_bak`.
 
+### Fork / branch feature (分叉功能)
+
+Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict priority declared in the spec: Ch3 > Ch1 > Ch4 > Ch5 > Ch2. Implementation plan: `FORK_PLAN.md`.
+
+**Core concepts.** A *modified node* (edited-and-resent user message, or regenerated assistant) has **no marker**; it is identified as "the successor of a fork point". The *fork point* = the modified node's predecessor (or the conversation node itself when the first message is modified). Invariant: fork point and modified node are always adjacent.
+
+**Storage split.** `tree.json` holds ONLY the current chain (per conversation, the `MessageNode` children). All historical branches live in SQLite:
+- `fork_nodes` — archived node metadata (title/preview/enabled/thinking_message_id/fork fields). `role` column exists; `_ensure_column` backfills older tables.
+- `branch_nodes` — path-decomposition branch lists: rows `(conversation_id, fork_point_id, branch_index, node_id, position)`; a branch = rows with same `(fork_point_id, branch_index)` ordered by `position`, **head = the fork point itself**, list ends at the next fork point or chain end.
+
+**Fork fields on tree nodes** (MessageNode + ConversationNode): `is_fork_point`, `fork_branch_count` (n), `fork_current_index` (m, 0-based; UI shows m+1/n). Invariant: `is_fork_point == (branch_count >= 2)`; degrade (count 1→0) deletes the last branch record (ruling A) and the view shows the remaining branch's full content (ruling B).
+
+**Dirty-marking sync (spec 3.4).** `TreeStore._dirty_conversations` — every tree-mutating op marks its conversation(s) dirty. **Sync (tree.json → DB) happens ONLY at the 3 branch triggers**: branch switch, branch delete, branch create (`BranchService.sync_dirty_conversations()` first). `replace_conversation_chain()` replaces a conversation's chain without marking dirty (it IS a sync trigger).
+
+**Key operations (`BranchService`, `app/core/branch_service.py`)**: `create_branch` (first fork archives the old chain explicitly — never rely on dirty state, it isn't persisted across restarts), `extend_current_branch` (edit-resend / send / continue append into the current branch record — keeps branch records in sync with chain growth), `switch_branch` (nested forks expand via **largest index**, `touched` map updates all fork-point indexes), `delete_branch` (cascade deletes sub-branches, degrade, auto-switch to previous branch / last if first deleted, physical orphan-row cleanup incl. bound thinking rows, trash-reference kept), `delete_fork_point` (3.3.4: fork identity + data transfer to the predecessor; merge into existing fork point: indexes continue, counts add, index kept), `migrate_branch_data` / `transfer_branch_group` (drag helpers).
+
+**ConversationService integration**: `regenerate_message` = fork mode (pre-fork: **nothing persisted until natural completion** — `completed` flag; stop/error = discard & revert per ruling, no incomplete marks); `resend_edited_message` = branch created at send time (new node id, old row preserved in archived branch), extended + incomplete cleared on completion, stop = normal incomplete paused state (plus "放弃本次修改" abandon button); delete routing: modified node → **hard delete** (never recycle bin, confirm dialog), fork point → transfer + soft delete, conversation/folder → branch data cascade at soft-delete, restore clears fork markers; `cleanup_incomplete_nodes` is branch-aware (incomplete modified nodes are always chain-tail — branch deletion is effectively non-cascading). `get_fork_info_map` feeds the `<m/n>` controls.
+
+**UI (P3)**: ChatMessage edit button (✏️, complete user messages), `_ForkControl` (`‹ m/n ›` under modified bubbles), abandon button, translucency, `set_actions_locked`; InputArea edit mode (✕ button, `set_text_locked` keeps the stop button enabled); ChatApp states `_edit_node_id` / `_prefork` (regenerate pre-fork: hidden tail widgets snapshot, streaming bubble, stop = revert) and `_can_mutate_tree(allow_send)` gating on all tree-mutating handlers; TreePanel `set_ops_locked` (drag/checkbox/context-menu interception), `set_edited_node`, `fork_display` title prefix.
+
+**Drag & drop (P4, spec 3.6)**: `ConversationService.move_message_with_fork(dragged_id, parent, position, prev_id, next_id)` — modified node same-conversation → rejected; "between fork point & modified node" → inserted node becomes the new fork point (data migrates, old degrades); fork point moved away → data re-anchors to the post-fill predecessor; cross-conversation modified node → whole-group transfer (X + tail chain move, target predecessor becomes fork point, rulings); plain moves unchanged. TreePanel computes `prev_id/next_id` (recursive model lookup, `_drop_sibling_context`) and passes them via the extended `move_node` signal; cross-conversation transfer shows a confirm dialog; rejections show a QToolTip hint.
+
 ### Key files
 
 | File | Role |
@@ -143,6 +166,8 @@ Conversations, folders, and messages are organized in a hierarchical tree stored
 | `app/core/context_service.py` | Builds the LLM context (system prompt + history + tree context) |
 | `app/core/protocols.py` | Abstract interfaces (`MessageRepoProtocol`, `TreeStoreProtocol`, etc.) |
 | `app/core/knowledge_service.py` | KG extraction from conversations via LLM |
+| `app/core/branch_service.py` | 分叉编排:同步(3.4)、建/切/删分支、分叉点迁移、拖拽数据迁移 |
+| `app/storage/branch_store.py` | fork_nodes/branch_nodes 表 CRUD + 引用收集(孤儿清理用) |
 | `app/core/file_service.py` | File parsing orchestration |
 | `app/core/search_service.py` | Search adapter orchestration |
 | `app/storage/tree_store.py` | Tree JSON persistence + recycle bin (`tree.json`, `recycle_bin.json`) |

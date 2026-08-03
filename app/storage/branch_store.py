@@ -262,6 +262,31 @@ class BranchStore:
             rows = conn.execute("SELECT node_id FROM branch_nodes").fetchall()
         return {r["node_id"] for r in rows}
 
+    def get_all_archived_node_ids(self) -> set[str]:
+        """
+        返回 fork_nodes 中归档的全部节点 ID（孤儿行清理用）。
+
+        分支记录被删除（如退化，方案 A）后，归档元数据可能残留；
+        防御性保留其消息行，避免清理掉仍可被切换/重建引用的节点。
+        """
+        conn = get_connection()
+        rows = conn.execute("SELECT node_id FROM fork_nodes").fetchall()
+        return {r["node_id"] for r in rows}
+
+    def get_all_thinking_message_ids(self) -> set[str]:
+        """
+        返回 fork_nodes 归档中全部 thinking_message_id（孤儿行清理用）。
+
+        归档的 assistant 节点绑定的 thinking 行只存在于 messages 表，
+        通过归档元数据引用——不是孤儿，必须保留。
+        """
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT thinking_message_id FROM fork_nodes "
+            "WHERE thinking_message_id IS NOT NULL AND thinking_message_id != ''"
+        ).fetchall()
+        return {r["thinking_message_id"] for r in rows}
+
     def node_id_in_any_branch(self, node_id: str) -> bool:
         """节点是否出现在任一分支列表中。"""
         conn = get_connection()
