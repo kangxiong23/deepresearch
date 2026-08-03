@@ -69,6 +69,8 @@ def initialize_database() -> None:
     # 先执行当前 DDL（确保 messages 表存在）
     with conn:
         conn.executescript(_DDL)
+        # 旧版 fork_nodes（无 role 列）补列 —— SQLite 不支持 ADD COLUMN IF NOT EXISTS
+        _ensure_column(conn, "fork_nodes", "role", "TEXT NOT NULL DEFAULT ''")
 
     # 检测是否需要迁移
     _migrate_if_needed(conn)
@@ -94,7 +96,50 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation
     ON messages (conversation_id, created_at);
+
+-- 分叉功能（tree.json = 工作副本，fork_nodes/branch_nodes = 归档库）
+CREATE TABLE IF NOT EXISTS fork_nodes (
+    node_id             TEXT PRIMARY KEY,
+    conversation_id     TEXT NOT NULL,
+    role                TEXT NOT NULL DEFAULT '',
+    title               TEXT NOT NULL DEFAULT '',
+    preview             TEXT NOT NULL DEFAULT '',
+    summary             TEXT NOT NULL DEFAULT '',
+    parent_id           TEXT,
+    sort_order          INTEGER NOT NULL DEFAULT 0,
+    enabled             INTEGER NOT NULL DEFAULT 1,
+    incomplete          INTEGER NOT NULL DEFAULT 0,
+    thinking_message_id TEXT,
+    is_fork_point       INTEGER NOT NULL DEFAULT 0,
+    fork_branch_count   INTEGER NOT NULL DEFAULT 0,
+    fork_current_index  INTEGER NOT NULL DEFAULT 0,
+    updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fork_nodes_conv
+    ON fork_nodes (conversation_id);
+
+CREATE TABLE IF NOT EXISTS branch_nodes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    fork_point_id   TEXT NOT NULL,
+    branch_index    INTEGER NOT NULL,
+    node_id         TEXT NOT NULL,
+    position        INTEGER NOT NULL,
+    UNIQUE (fork_point_id, branch_index, node_id),
+    UNIQUE (fork_point_id, branch_index, position)
+);
+CREATE INDEX IF NOT EXISTS idx_branch_nodes_fp
+    ON branch_nodes (fork_point_id);
 """
+
+
+def _ensure_column(
+    conn: sqlite3.Connection, table: str, column: str, ddl: str
+) -> None:
+    """若表缺少指定列则 ALTER TABLE 补列（幂等）。"""
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 # ──────────────────────────────────────────────

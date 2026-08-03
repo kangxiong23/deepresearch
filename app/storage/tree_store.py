@@ -78,6 +78,9 @@ class TreeStore:
         # Phase 5: O(1) 节点查找缓存
         self._node_cache: dict[str, AnyTreeNode] = {}
 
+        # 分叉功能: 脏对话标记（tree.json 已改、尚未同步到分支存储的对话 ID 集合）
+        self._dirty_conversations: set[str] = set()
+
         # 加载或创建默认树
         self._root = self._load_tree()
         # __init__ 结束后重建缓存（_load_tree 内部调用 _create_default_tree
@@ -272,6 +275,49 @@ class TreeStore:
         """从 _root.nodes 重建 _node_cache 字典，实现 O(1) 节点查找。"""
         self._node_cache = {n.id: n for n in self._root.nodes}
 
+    # ──────────────────────────────────────────
+    # 分叉功能: 脏标记（spec 3.4.5）
+    # ──────────────────────────────────────────
+
+    @property
+    def dirty_conversations(self) -> set[str]:
+        """
+        返回所有已修改但尚未同步到分支存储的对话 ID 集合（副本）。
+
+        所有修改 tree.json 的操作都会标脏对应对话；分支切换/删除/新建时，
+        BranchService 会先同步脏对话到数据库再执行操作，随后清除标记。
+        """
+        return set(self._dirty_conversations)
+
+    def mark_conversation_dirty(self, conversation_id: str | None) -> None:
+        """标记对话为脏（tree.json 已修改，待同步到分支存储）。"""
+        if conversation_id:
+            self._dirty_conversations.add(conversation_id)
+
+    def clear_dirty(self, conversation_id: str | None = None) -> None:
+        """清除脏标记。conversation_id 为空时清空全部。"""
+        if conversation_id is None:
+            self._dirty_conversations.clear()
+        else:
+            self._dirty_conversations.discard(conversation_id)
+
+    @staticmethod
+    def _conv_of(node: AnyTreeNode) -> str | None:
+        """返回节点所属的对话 ID（对话节点→自身，消息节点→parent_id，目录→None）。"""
+        if isinstance(node, ConversationNode):
+            return node.id
+        if isinstance(node, MessageNode):
+            return node.parent_id
+        return None
+
+    def _mark_dirty(self, node: AnyTreeNode) -> None:
+        self.mark_conversation_dirty(self._conv_of(node))
+
+    def _mark_subtree_dirty(self, node_id: str) -> None:
+        """将节点及其子树涉及的所有对话标记为脏。"""
+        for n in self._collect_subtree(node_id):
+            self._mark_dirty(n)
+
     def _find_node(self, node_id: str) -> AnyTreeNode | None:
         """在树中按 ID 查找节点，O(1)（使用 _node_cache）。"""
         return self._node_cache.get(node_id)
@@ -399,6 +445,7 @@ class TreeStore:
             node.incomplete = value
             node.updated_at = datetime.utcnow()
             self._save_tree(self._root)
+            self._mark_dirty(node)
 
     def cleanup_incomplete_nodes(self) -> int:
         """
@@ -489,6 +536,92 @@ class TreeStore:
                 queue.append(child.id)
         return result
 
+    # ──────────────────────────────────────────
+    # 分叉功能: 对话链路辅助
+    # ──────────────────────────────────────────
+
+    def get_conversation_chain(self, conversation_id: str) -> list[MessageNode]:
+        """
+        返回对话节点下的完整消息链（MessageNode 副本，按 sort_order 正序）。
+
+        分叉功能中，tree.json 只保存当前时刻所处的一条链路——
+        切换/新建/删除分支都会整体替换这条链（replace_conversation_chain）。
+        """
+        children = self._find_children(conversation_id)
+        chain = [c for c in children if isinstance(c, MessageNode)]
+        return [_dict_to_node(_node_to_dict(c)) for c in chain]
+
+    def replace_conversation_chain(
+        self, conversation_id: str, nodes: list[MessageNode]
+    ) -> None:
+        """
+        整体替换对话节点的消息链（分叉切换/新建/删除专用）。
+
+        - 移除对话下所有现有 MessageNode 子节点
+        - 按给定顺序插入新节点并重排 sort_order
+        - 不触发脏标记（此操作本身就是分支同步时机之一）
+
+        Args:
+            conversation_id: 对话节点 ID
+            nodes:          新的消息链（MessageNode 列表，顺序即最终顺序）
+        """
+        conv = self._find_node(conversation_id)
+        if conv is None or not isinstance(conv, ConversationNode):
+            raise ValueError(f"Not a conversation: {conversation_id}")
+
+        existing = {
+            n.id for n in self._find_children(conversation_id)
+            if isinstance(n, MessageNode)
+        }
+        self._root.nodes = [n for n in self._root.nodes if n.id not in existing]
+
+        now = datetime.utcnow()
+        for i, n in enumerate(nodes):
+            n.parent_id = conversation_id
+            n.sort_order = i
+            n.updated_at = now
+        self._root.nodes.extend(nodes)
+
+        self._rebuild_cache()
+        self._save_tree(self._root)
+
+    def is_fork_point_node(self, node: AnyTreeNode | None) -> bool:
+        """节点是否为分叉点（branch_count >= 2 表示存在多个分支）。"""
+        if node is None:
+            return False
+        return bool(getattr(node, "is_fork_point", False))
+
+    def get_predecessor(
+        self, conversation_id: str, node_id: str
+    ) -> MessageNode | None:
+        """返回节点在同一对话消息链中的前一个节点（无则 None）。"""
+        chain = self.get_conversation_chain(conversation_id)
+        for i, n in enumerate(chain):
+            if n.id == node_id:
+                return chain[i - 1] if i > 0 else None
+        return None
+
+    def find_fork_point_of(self, node: AnyTreeNode) -> tuple[str, str] | None:
+        """
+        返回节点所属的分叉点 (fork_point_id, type)。
+
+        被修改节点无独立标记，通过"分叉点的后继节点"定位：
+        - 分叉点是其前驱节点 → type="message"
+        - 节点是对话中第一条消息且对话节点是分叉点 → type="conversation"
+        - 否则返回 None（该节点不是被修改节点）
+        """
+        if not isinstance(node, MessageNode):
+            return None
+        predecessor = self.get_predecessor(node.parent_id, node.id)
+        if predecessor is not None:
+            if self.is_fork_point_node(predecessor):
+                return (predecessor.id, "message")
+            return None
+        conv = self._find_node(node.parent_id)
+        if conv is not None and self.is_fork_point_node(conv):
+            return (conv.id, "conversation")
+        return None
+
     def set_node_enabled_cascade_down(
         self, node_id: str, enabled: bool
     ) -> list[str]:
@@ -522,6 +655,7 @@ class TreeStore:
                 queue.append(child.id)
 
         self._save_tree(self._root)
+        self._mark_subtree_dirty(node_id)
         return affected_ids
 
     def recompute_ancestors_enabled(self, node_id: str) -> list[str]:
@@ -574,6 +708,12 @@ class TreeStore:
 
         if changed:
             self._save_tree(self._root)
+            # 祖先 enabled 变化同样影响分支数据（enabled 会同步到 fork_nodes）
+            self._mark_dirty(node)
+            for cid in changed:
+                cnode = self._find_node(cid)
+                if cnode is not None:
+                    self._mark_dirty(cnode)
         return changed
 
     # ──────────────────────────────────────────
@@ -599,6 +739,7 @@ class TreeStore:
 
         self._root.nodes.append(node)
         self._save_tree(self._root)
+        self._mark_dirty(node)
 
     def update_node(self, node_id: str, **updates) -> None:
         """
@@ -624,6 +765,8 @@ class TreeStore:
             "title", "enabled", "summary", "message_count",
             "context_block_ids", "attachment_paths", "preview", "role",
             "incomplete", "thinking_message_id",
+            # 分叉字段（分叉点计数/当前索引，由 BranchService 维护）
+            "is_fork_point", "fork_branch_count", "fork_current_index",
         }
         for key, value in updates.items():
             if key in allowed and hasattr(node, key):
@@ -631,6 +774,7 @@ class TreeStore:
 
         node.updated_at = datetime.utcnow()
         self._save_tree(self._root)
+        self._mark_dirty(node)
 
     def move_node(
         self,
@@ -714,6 +858,12 @@ class TreeStore:
                 n.sort_order = i
 
         self._save_tree(self._root)
+        # 拖拽重排序会影响分支数据（sort_order 会同步到 fork_nodes / branch_nodes.position）。
+        # 源对话与目标对话都需标记（被移节点的子树涉及哪些对话也一并标记）。
+        self._mark_subtree_dirty(node_id)
+        self._mark_dirty(node)
+        self.mark_conversation_dirty(old_parent_id)
+        self.mark_conversation_dirty(new_parent_id)
 
     # ──────────────────────────────────────────
     # 删除与软删除
@@ -798,6 +948,9 @@ class TreeStore:
         self._renumber_children(old_parent_id)
 
         self._save_tree(self._root)
+        # 节点已从树中移除，需基于被删节点集合标记脏（_collect_subtree 已查不到）
+        for n in removed_or_promoted:
+            self._mark_dirty(n)
         return (removed_or_promoted, trash_entries)
 
     def soft_delete_node(
@@ -892,6 +1045,7 @@ class TreeStore:
         all_trash = [e for e in all_trash if e.id != entry_id]
         self._save_trash(all_trash)
         self._save_tree(self._root)
+        self._mark_dirty(node)
 
     def permanently_delete_from_trash(self, entry_id: str) -> None:
         """
@@ -948,11 +1102,17 @@ def _node_to_dict(node: AnyTreeNode) -> dict:
         d["preview"] = node.preview
         d["incomplete"] = node.incomplete
         d["thinking_message_id"] = node.thinking_message_id
+        d["is_fork_point"] = node.is_fork_point
+        d["fork_branch_count"] = node.fork_branch_count
+        d["fork_current_index"] = node.fork_current_index
     else:
         d["summary"] = node.summary
         d["message_count"] = node.message_count
         d["context_block_ids"] = node.context_block_ids
         d["attachment_paths"] = node.attachment_paths
+        d["is_fork_point"] = node.is_fork_point
+        d["fork_branch_count"] = node.fork_branch_count
+        d["fork_current_index"] = node.fork_current_index
     return d
 
 
@@ -988,6 +1148,9 @@ def _dict_to_node(d: dict) -> AnyTreeNode:
             preview=d.get("preview", ""),
             incomplete=d.get("incomplete", False),
             thinking_message_id=d.get("thinking_message_id"),
+            is_fork_point=d.get("is_fork_point", False),
+            fork_branch_count=d.get("fork_branch_count", 0),
+            fork_current_index=d.get("fork_current_index", 0),
         )
     else:
         return ConversationNode(
@@ -996,4 +1159,7 @@ def _dict_to_node(d: dict) -> AnyTreeNode:
             message_count=d.get("message_count", 0),
             context_block_ids=d.get("context_block_ids", []),
             attachment_paths=d.get("attachment_paths", []),
+            is_fork_point=d.get("is_fork_point", False),
+            fork_branch_count=d.get("fork_branch_count", 0),
+            fork_current_index=d.get("fork_current_index", 0),
         )

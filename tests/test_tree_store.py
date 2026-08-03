@@ -418,5 +418,204 @@ class TestThinkingBinding(unittest.TestCase):
         self.assertEqual(self.store.get_node("a1").thinking_message_id, "t1")
 
 
+class TestForkFieldsAndDirtyMarking(unittest.TestCase):
+    """分叉字段序列化、脏标记与链路辅助方法测试。"""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._base = Path(self._tmpdir.name)
+        self.store = TreeStore(base_path=self._base)
+        # 构造: conv 下 M1(分叉点) → M2(被修改节点)
+        self.store.create_node(ConversationNode(
+            id="conv", parent_id="root", title="对话",
+        ))
+        self.store.create_node(MessageNode(
+            id="m1", parent_id="conv", message_id="m1", role="user",
+            title="User: 问题1", preview="问题1",
+        ))
+        self.store.create_node(MessageNode(
+            id="m2", parent_id="conv", message_id="m2", role="assistant",
+            title="Asst: 回答1", preview="回答1",
+        ))
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    # ── 分叉字段序列化 ────────────────────────
+
+    def test_fork_fields_serialization_roundtrip(self) -> None:
+        """分叉字段应持久化到 tree.json 并能往返读取。"""
+        import json
+        self.store.update_node(
+            "m1", is_fork_point=True, fork_branch_count=2, fork_current_index=1,
+        )
+        self.store.update_node(
+            "conv", is_fork_point=True, fork_branch_count=2, fork_current_index=0,
+        )
+
+        data = json.loads(
+            (self._base / "tree.json").read_text(encoding="utf-8")
+        )
+        m1_dict = next(n for n in data["nodes"] if n["id"] == "m1")
+        conv_dict = next(n for n in data["nodes"] if n["id"] == "conv")
+        self.assertTrue(m1_dict["is_fork_point"])
+        self.assertEqual(m1_dict["fork_branch_count"], 2)
+        self.assertEqual(m1_dict["fork_current_index"], 1)
+        self.assertTrue(conv_dict["is_fork_point"])
+
+        got_m1 = self.store.get_node("m1")
+        self.assertTrue(got_m1.is_fork_point)
+        self.assertEqual(got_m1.fork_branch_count, 2)
+        self.assertEqual(got_m1.fork_current_index, 1)
+
+    def test_fork_fields_default_for_old_data(self) -> None:
+        """旧 tree.json（无分叉字段）应回退到默认值。"""
+        import json
+        # 手工写一个不带分叉字段的 tree.json
+        data = {
+            "version": "3.0",
+            "nodes": [
+                {"id": "root", "parent_id": None, "sort_order": 0, "enabled": True,
+                 "title": "未分类", "created_at": "2026-01-01T00:00:00",
+                 "updated_at": "2026-01-01T00:00:00", "node_type": "folder",
+                 "context_block_ids": [], "attachment_paths": []},
+                {"id": "c", "parent_id": "root", "sort_order": 0, "enabled": True,
+                 "title": "旧对话", "created_at": "2026-01-01T00:00:00",
+                 "updated_at": "2026-01-01T00:00:00", "node_type": "conversation",
+                 "summary": "", "message_count": 0, "context_block_ids": [],
+                 "attachment_paths": []},
+                {"id": "x", "parent_id": "c", "sort_order": 0, "enabled": True,
+                 "title": "User: 旧消息", "created_at": "2026-01-01T00:00:00",
+                 "updated_at": "2026-01-01T00:00:00", "node_type": "message",
+                 "message_id": "x", "role": "user", "preview": "旧消息",
+                 "incomplete": False, "thinking_message_id": None},
+            ],
+        }
+        (self._base / "tree.json").write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
+        store = TreeStore(base_path=self._base)
+        self.assertFalse(store.get_node("c").is_fork_point)
+        self.assertEqual(store.get_node("c").fork_branch_count, 0)
+        self.assertFalse(store.get_node("x").is_fork_point)
+        self.assertEqual(store.get_node("x").fork_current_index, 0)
+
+    # ── 脏标记 ────────────────────────────────
+
+    def test_dirty_marked_on_tree_ops(self) -> None:
+        """create/update/move/delete/mark_incomplete/toggle 都应标记对话为脏。"""
+        self.store.create_node(MessageNode(
+            id="m3", parent_id="conv", message_id="m3", role="user",
+            title="User: 新问题",
+        ))
+        self.assertIn("conv", self.store.dirty_conversations)
+
+        self.store.clear_dirty()
+        self.store.update_node("m3", title="User: 改名")
+        self.assertIn("conv", self.store.dirty_conversations)
+
+        self.store.clear_dirty()
+        self.store.mark_incomplete("m3")
+        self.assertIn("conv", self.store.dirty_conversations)
+
+        self.store.clear_dirty()
+        self.store.set_node_enabled_cascade_down("m3", False)
+        self.assertIn("conv", self.store.dirty_conversations)
+
+        self.store.clear_dirty()
+        self.store.soft_delete_node("m3")
+        self.assertIn("conv", self.store.dirty_conversations)
+
+    def test_dirty_marked_on_move_across_conversations(self) -> None:
+        """跨对话拖拽应同时标记两个对话为脏。"""
+        self.store.create_node(ConversationNode(
+            id="conv2", parent_id="root", title="对话2",
+        ))
+        self.store.create_node(MessageNode(
+            id="m4", parent_id="conv2", message_id="m4", role="user",
+            title="User: 对话2消息",
+        ))
+        self.store.clear_dirty()
+        self.store.move_node("m4", new_parent_id="conv", position=0)
+        self.assertIn("conv", self.store.dirty_conversations)
+        self.assertIn("conv2", self.store.dirty_conversations)
+
+    def test_dirty_marked_on_conversation_creation(self) -> None:
+        """新建对话节点应标记自身为脏。"""
+        self.store.create_node(ConversationNode(
+            id="conv3", parent_id="root", title="对话3",
+        ))
+        self.assertIn("conv3", self.store.dirty_conversations)
+
+    def test_clear_dirty(self) -> None:
+        """clear_dirty 应支持清除指定或全部对话。"""
+        self.store.update_node("m1", title="改标题")
+        self.assertIn("conv", self.store.dirty_conversations)
+        self.store.clear_dirty("conv")
+        self.assertNotIn("conv", self.store.dirty_conversations)
+        self.store.update_node("m2", title="再改")
+        self.store.clear_dirty()
+        self.assertEqual(self.store.dirty_conversations, set())
+
+    # ── 链路辅助 ──────────────────────────────
+
+    def test_get_conversation_chain(self) -> None:
+        """get_conversation_chain 应返回按 sort_order 排列的消息链副本。"""
+        chain = self.store.get_conversation_chain("conv")
+        self.assertEqual([n.id for n in chain], ["m1", "m2"])
+        # 修改返回副本不影响内部状态
+        chain[0].title = "hack"
+        self.assertEqual(self.store.get_node("m1").title, "User: 问题1")
+
+    def test_replace_conversation_chain(self) -> None:
+        """replace_conversation_chain 应整体替换对话的消息链并重排 sort_order。"""
+        new_m2 = MessageNode(
+            id="m2b", parent_id="conv", message_id="m2b", role="assistant",
+            title="Asst: 回答1改",
+        )
+        self.store.clear_dirty()  # 排除 setUp 创建节点的脏标记
+        self.store.replace_conversation_chain("conv", [
+            self.store.get_node("m1"),
+            new_m2,
+        ])
+        chain = self.store.get_conversation_chain("conv")
+        self.assertEqual([n.id for n in chain], ["m1", "m2b"])
+        self.assertEqual(chain[0].sort_order, 0)
+        self.assertEqual(chain[1].sort_order, 1)
+        # 旧链节点已从树中移除
+        self.assertIsNone(self.store.get_node("m2"))
+        # 该操作不产生脏标记（本身就是同步时机）
+        self.assertNotIn("conv", self.store.dirty_conversations)
+
+    def test_replace_conversation_chain_rejects_non_conversation(self) -> None:
+        """对非对话节点调用 replace_conversation_chain 应抛错。"""
+        with self.assertRaises(ValueError):
+            self.store.replace_conversation_chain("m1", [])
+
+    def test_get_predecessor(self) -> None:
+        """get_predecessor 应返回链中前一个节点，首节点返回 None。"""
+        self.assertEqual(self.store.get_predecessor("conv", "m2").id, "m1")
+        self.assertIsNone(self.store.get_predecessor("conv", "m1"))
+
+    def test_find_fork_point_of(self) -> None:
+        """find_fork_point_of 应识别被修改节点（分叉点后继/对话根分叉）。"""
+        # 无分叉点 → 不是被修改节点
+        self.assertIsNone(self.store.find_fork_point_of(self.store.get_node("m2")))
+
+        # m1 成为分叉点 → m2 是被修改节点
+        self.store.update_node("m1", is_fork_point=True, fork_branch_count=2)
+        fp = self.store.find_fork_point_of(self.store.get_node("m2"))
+        self.assertEqual(fp, ("m1", "message"))
+
+        # 对话节点成为分叉点 → 第一条消息是被修改节点
+        self.store.update_node("conv", is_fork_point=True, fork_branch_count=2)
+        self.store.update_node("m1", is_fork_point=False, fork_branch_count=0)
+        fp2 = self.store.find_fork_point_of(self.store.get_node("m1"))
+        self.assertEqual(fp2, ("conv", "conversation"))
+
+        # 对话节点自身不是被修改节点（仅消息节点可被修改）
+        self.assertIsNone(self.store.find_fork_point_of(self.store.get_node("conv")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

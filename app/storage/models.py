@@ -191,6 +191,13 @@ class TreeNode:
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
+    # 分叉字段（仅 MessageNode / ConversationNode 有效，FolderNode 恒为默认值）：
+    # 分叉点记录其下分支总数 n 与当前分支索引 m（0 起）。
+    # 被修改节点无任何标记，通过"分叉点后继节点"定位。
+    is_fork_point: bool = False
+    fork_branch_count: int = 0
+    fork_current_index: int = 0
+
 
 @dataclass
 class FolderNode(TreeNode):
