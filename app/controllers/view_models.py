@@ -32,6 +32,11 @@ class MessageVM:
     content: str
     is_thinking: bool = False
     created_at: str = ""  # 格式化时间字符串
+    # 分叉信息（仅被修改节点携带，其余为默认值）：
+    conversation_id: str = ""   # 所属对话 ID
+    fork_m: int = 0             # 当前分支展示编号（1 起；0 = 非被修改节点）
+    fork_n: int = 0             # 分叉点下分支总数
+    fork_point_id: str = ""     # 分叉点 ID（<m/n> 控件切换目标）
 
 
 # ──────────────────────────────────────────────
@@ -113,6 +118,7 @@ class TreeNodeVM:
     context_block_count: int = 0             # 仅目录
     attachment_count: int = 0                # 仅目录
     role: str = ""                           # 仅消息节点: "user" | "assistant" | "thinking"
+    fork_display: str = ""                   # 分叉点标题前缀 "<m/n> "（仅信息展示，3.5.2）
 
 
 @dataclass

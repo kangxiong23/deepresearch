@@ -118,14 +118,43 @@ class AppController:
         """
         获取所有有效启用对话的消息，按时间排序合并。
 
+        被修改节点附带分叉信息（fork_m/fork_n/fork_point_id），
+        供消息气泡下方的 <m/n> 切换控件使用（3.5.1）。
+
         Returns:
             list[MessageVM] — 所有启用对话的消息
         """
         print("[CTRL ] on_get_multi_conversation_messages: 查询所有启用消息")
         messages = self._conversation_svc.get_effective_enabled_messages()
-        result = [self._map_to_message_vm(m) for m in messages]
+        fork_map = self._conversation_svc.get_fork_info_map()
+        result: list[MessageVM] = []
+        for m in messages:
+            vm = self._map_to_message_vm(m)
+            info = fork_map.get(m.id)
+            if info is not None:
+                vm.conversation_id, vm.fork_m, vm.fork_n, vm.fork_point_id = info
+            result.append(vm)
         print(f"[CTRL ] on_get_multi_conversation_messages: 返回 {len(result)} 个 MessageVM")
         return result
+
+    def on_switch_branch(self, fork_point_id: str, delta: int) -> None:
+        """
+        UI 点击 <m/n> 控件的 < / > 时调用（3.5）。
+
+        Args:
+            fork_point_id: 分叉点 ID（消息节点或对话节点）
+            delta:         +1 下一个分支 / -1 上一个分支
+        """
+        node = self._conversation_svc.get_node(fork_point_id)
+        if node is None or not isinstance(node, (ConversationNode, MessageNode)):
+            return
+        if not node.is_fork_point:
+            return
+        target = node.fork_current_index + delta
+        if target < 0 or target >= node.fork_branch_count:
+            return  # 越界防御（UI 边界按钮已禁用）
+        conv_id = node.id if isinstance(node, ConversationNode) else node.parent_id
+        self._conversation_svc.switch_branch(conv_id, fork_point_id, target)
 
     def find_last_enabled_conversation_id(self) -> str | None:
         """
@@ -310,6 +339,26 @@ class AppController:
         """
         cmd = CommandBuilder.build_regenerate_command(session_id, message_id)
         async for chunk in self._conversation_svc.regenerate_message(**cmd):
+            yield self._map_to_stream_chunk_vm(chunk)
+
+    async def on_resend_edited_message(
+        self,
+        session_id: str,
+        original_user_id: str,
+        text: str,
+        files: list[str],
+    ) -> AsyncGenerator[StreamChunkVM, None]:
+        """
+        修改并重发送 user 消息（分叉功能，spec 5.3）。
+
+        发送时立即创建分支，随后流式输出 assistant 回复。
+
+        Yields:
+            StreamChunkVM — 同 on_send_message
+        """
+        async for chunk in self._conversation_svc.resend_edited_message(
+            session_id, original_user_id, text, files
+        ):
             yield self._map_to_stream_chunk_vm(chunk)
 
     async def on_continue_message(
@@ -642,6 +691,7 @@ class AppController:
                     has_children=False,  # MessageNode 永远是叶子
                     depth=depth,
                     role=node.role,
+                    fork_display=_fork_display(node),
                 )
             elif isinstance(node, FolderNode):
                 vm = TreeNodeVM(
@@ -673,6 +723,7 @@ class AppController:
                     message_count=getattr(node, "message_count", 0),
                     context_block_count=len(getattr(node, "context_block_ids", [])),
                     attachment_count=len(getattr(node, "attachment_paths", [])),
+                    fork_display=_fork_display(node),
                 )
             result.append(vm)
 
@@ -800,6 +851,13 @@ class AppController:
 # ──────────────────────────────────────────────
 # 模块级辅助（不含业务知识，仅格式化）
 # ──────────────────────────────────────────────
+
+def _fork_display(node) -> str:
+    """分叉点的标题前缀 "<m/n> "（3.5.2：树面板仅信息展示）。"""
+    if getattr(node, "is_fork_point", False) and node.fork_branch_count:
+        return f"<{node.fork_current_index + 1}/{node.fork_branch_count}> "
+    return ""
+
 
 def _format_datetime(dt) -> str:
     """将 datetime 对象格式化为展示字符串，dt 为 None 时返回空串。"""

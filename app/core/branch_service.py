@@ -446,7 +446,11 @@ class BranchService:
     def _delete_orphan_rows(
         self, conversation_id: str, removed_ids: set[str]
     ) -> None:
-        """物理删除分支节点行（未被当前链 / 其他分支 / 回收站引用者）。"""
+        """物理删除分支节点行（未被当前链 / 其他分支 / 回收站引用者）。
+
+        同时清理被删 assistant 节点绑定的 thinking 行（thinking 只存在于
+        messages 表，树与分支均不引用；assistant 删除后即为孤儿）。
+        """
         if not removed_ids:
             return
         referenced = self._branch.get_all_referenced_node_ids(conversation_id)
@@ -461,8 +465,13 @@ class BranchService:
             and nid not in trash_ids
         ]
         if doomed:
+            thinking_ids: list[str] = []
+            for nid in doomed:
+                meta = self._branch.get_node(nid)
+                if meta and meta.get("thinking_message_id"):
+                    thinking_ids.append(meta["thinking_message_id"])
             self._branch.delete_nodes(doomed)
-            self._repo.delete_messages_by_ids(doomed)
+            self._repo.delete_messages_by_ids(doomed + thinking_ids)
 
     def _trash_node_ids(self) -> set[str]:
         """回收站中全部节点 ID（孤儿行清理时保留引用）。"""

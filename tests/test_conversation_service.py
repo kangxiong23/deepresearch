@@ -585,5 +585,429 @@ class TestThinkingBindingInterleave(unittest.TestCase):
         self.assertEqual([m.id for m in history], ["u2", "a2"])
 
 
+# ──────────────────────────────────────────────
+# P2: 分叉集成测试（regenerate 分叉模式 / 修改重发送 / 分支感知删除与清理）
+# ──────────────────────────────────────────────
+
+class _FakeLLM:
+    """模拟 DeepSeek 流式：按预定块输出后结束。"""
+
+    def __init__(self, chunks: list[tuple[str, str]] | None = None) -> None:
+        self._chunks = chunks or [("回答内容", "text")]
+
+    async def stream_chat(self, context):
+        from app.storage.models import ChunkType, MessageChunk
+        for delta, ctype in self._chunks:
+            yield MessageChunk(delta=delta, chunk_type=ChunkType(ctype))
+        yield MessageChunk(delta="", is_done=True)
+
+    async def stream_prefix_continue(self, context, *args):
+        from app.storage.models import ChunkType, MessageChunk
+        yield MessageChunk(delta="", is_done=True)
+
+    def abort(self) -> None:
+        pass
+
+
+class _FakeSearch:
+    async def search_and_format(self, text: str) -> str:
+        return ""
+
+
+class _FakeFile:
+    async def extract_files(self, files: list[str]):
+        return []
+
+
+class TestForkIntegration(unittest.TestCase):
+    """ConversationService 分叉集成测试（spec 3/4/5 章）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmpdir = tempfile.TemporaryDirectory()
+        cls._base = Path(cls._tmpdir.name)
+        cls._scope = ConfigScope(
+            DB_PATH=str(cls._base / "test.db"),
+            TREE_STORE_PATH=str(cls._base / "tree"),
+            CONTEXT_STORE_PATH=str(cls._base / "context"),
+        )
+        cls._scope.__enter__()
+
+        from app.storage.database import initialize_database
+        from app.core.branch_service import BranchService
+        from app.storage.branch_store import BranchStore
+        initialize_database()
+
+        cls.tree_store = TreeStore()
+        cls.message_repo = MessageRepo()
+        cls.context_store = ContextStore()
+        cls.context_service = ContextService(
+            message_repo=cls.message_repo,
+            context_store=cls.context_store,
+            tree_store=cls.tree_store,
+        )
+        cls.branch_store = BranchStore()
+        cls.branch_service = BranchService(
+            tree_store=cls.tree_store,
+            branch_store=cls.branch_store,
+            message_repo=cls.message_repo,
+        )
+        cls.svc = ConversationService(
+            message_repo=cls.message_repo,
+            tree_store=cls.tree_store,
+            llm_client=_FakeLLM(),
+            context_service=cls.context_service,
+            search_service=_FakeSearch(),
+            file_service=_FakeFile(),
+            branch_service=cls.branch_service,
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._scope.__exit__(None, None, None)
+        cls._tmpdir.cleanup()
+
+    def setUp(self) -> None:
+        """重置树、回收站与分支数据表。"""
+        from app.storage.models import TreeRoot
+        from app.storage.database import get_connection
+        self.tree_store._root = TreeRoot(version="1.0", nodes=[])
+        self.tree_store._rebuild_cache()
+        root = FolderNode(
+            id="root", parent_id=None, sort_order=0, enabled="some",
+            title="未分类",
+            created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
+        )
+        self.tree_store._root.nodes.append(root)
+        self.tree_store._rebuild_cache()
+        self.tree_store._save_tree(self.tree_store._root)
+        self.tree_store._save_trash([])
+        conn = get_connection()
+        with conn:
+            conn.execute("DELETE FROM branch_nodes")
+            conn.execute("DELETE FROM fork_nodes")
+            conn.execute("DELETE FROM messages")
+
+        # 标准链: conv [u1, a1, u2, a2]
+        self.tree_store.create_node(ConversationNode(
+            id="conv", parent_id="root", title="对话",
+        ))
+        for node_id, role, content in [
+            ("u1", Role.USER, "问题一"), ("a1", Role.ASSISTANT, "回答一"),
+            ("u2", Role.USER, "问题二"), ("a2", Role.ASSISTANT, "回答二"),
+        ]:
+            self.tree_store.create_node(MessageNode(
+                id=node_id, parent_id="conv", message_id=node_id,
+                role=role.value, title=f"{role.value}: {content}",
+                preview=content,
+            ))
+            self.message_repo.save_message(Message(
+                id=node_id, conversation_id="conv", role=role, content=content,
+            ))
+        self.tree_store.clear_dirty()
+
+    def _chain_ids(self) -> list[str]:
+        return [n.id for n in self.tree_store.get_conversation_chain("conv")]
+
+    def _drain(self, agen) -> list:
+        """跑完一个异步生成器并收集全部块。"""
+        async def _collect():
+            out = []
+            async for c in agen:
+                out.append(c)
+            return out
+        import asyncio
+        return asyncio.run(_collect())
+
+    # ── regenerate 分叉模式 ──────────────────
+
+    def test_regenerate_creates_fork_branch(self) -> None:
+        """重新生成完整 assistant → 分叉点 = 前驱;旧回复归档,新回复进链。"""
+        self._drain(self.svc.regenerate_message("conv", "a2"))
+        # 分叉点 = u2(a2 的前驱)
+        u2 = self.tree_store.get_node("u2")
+        self.assertTrue(u2.is_fork_point)
+        self.assertEqual(u2.fork_branch_count, 2)
+        self.assertEqual(u2.fork_current_index, 1)
+        # 分支 0 = [u2, a2](旧),分支 1 = [u2, 新a](新)
+        branches = self.branch_store.get_all_branches("u2")
+        self.assertEqual(branches[0], ["u2", "a2"])
+        self.assertEqual(len(branches[1]), 2)
+        new_a_id = branches[1][1]
+        self.assertNotEqual(new_a_id, "a2")
+        # 新链 = [u1, a1, u2, 新a];旧 a2 不在链中但消息行保留
+        self.assertEqual(self._chain_ids(), ["u1", "a1", "u2", new_a_id])
+        rows = {m.id for m in self.message_repo.get_messages("conv")}
+        self.assertIn("a2", rows)  # 归档分支保留
+        self.assertIn(new_a_id, rows)
+        # 新 assistant 已入库
+        new_msg = next(m for m in self.message_repo.get_messages("conv")
+                       if m.id == new_a_id)
+        self.assertEqual(new_msg.role, Role.ASSISTANT)
+        self.assertEqual(new_msg.content, "回答内容")
+
+    def test_regenerate_middle_assistant(self) -> None:
+        """重新生成中间 assistant → 其后的消息整体替换(1.3)。"""
+        # 链加长: [u1, a1, u2, a2, u3, a3]
+        self.tree_store.create_node(MessageNode(
+            id="u3", parent_id="conv", message_id="u3", role="user",
+            title="User: 问题三", preview="问题三",
+        ))
+        self.tree_store.create_node(MessageNode(
+            id="a3", parent_id="conv", message_id="a3", role="assistant",
+            title="Asst: 回答三", preview="回答三",
+        ))
+        self.message_repo.save_message(Message(
+            id="u3", conversation_id="conv", role=Role.USER, content="问题三",
+        ))
+        self.message_repo.save_message(Message(
+            id="a3", conversation_id="conv", role=Role.ASSISTANT, content="回答三",
+        ))
+        self.tree_store.clear_dirty()
+
+        self._drain(self.svc.regenerate_message("conv", "a2"))
+        # 分叉点 = u2;新链 = [u1, a1, u2, 新a](u3/a3 被替换)
+        chain = self._chain_ids()
+        self.assertEqual(chain[:3], ["u1", "a1", "u2"])
+        self.assertNotIn("a3", chain)
+        self.assertNotIn("u3", chain)
+        # 旧分支 0 = [u2, a2, u3, a3](截取到链尾)
+        self.assertEqual(
+            self.branch_store.get_branch_list("u2", 0), ["u2", "a2", "u3", "a3"]
+        )
+
+    def test_regenerate_abort_persists_nothing(self) -> None:
+        """停止生成 → 不持久化任何内容(4.3 丢弃回退)。"""
+        self._drain(self.svc.regenerate_message("conv", "a2"))
+        # 首次正常生成后记下状态(目标变为链尾的新 assistant)
+        target = self._chain_ids()[-1]
+        chain_before = self._chain_ids()
+        rows_before = {m.id for m in self.message_repo.get_messages("conv")}
+        svc = self.svc
+
+        async def _abort_drain():
+            out = []
+            async for c in svc.regenerate_message("conv", target):
+                out.append(c)
+                if c.delta:  # 收到首个内容块后停止
+                    svc.stop_generation()
+            return out
+
+        import asyncio
+        asyncio.run(_abort_drain())
+        # 树与消息行完全不变(预分支零持久化)
+        self.assertEqual(self._chain_ids(), chain_before)
+        rows_after = {m.id for m in self.message_repo.get_messages("conv")}
+        self.assertEqual(rows_before, rows_after)
+        # 无新增分支
+        self.assertEqual(
+            self.branch_store.get_branch_indexes("u2"), [0, 1]
+        )
+
+    # ── 修改重发送 ────────────────────────────
+
+    def test_resend_edited_message_creates_branch_at_send(self) -> None:
+        """修改重发送:发送时立即建分支;完成后扩展并清除 incomplete。"""
+        self._drain(self.svc.resend_edited_message(
+            "conv", "u2", "修改后的问题二", []
+        ))
+        chain = self._chain_ids()
+        # 新链 = [u1, a1, 新u, 新a](u2 及其后整体替换)
+        self.assertEqual(chain[:2], ["u1", "a1"])
+        new_u, new_a = chain[2], chain[3]
+        self.assertNotEqual(new_u, "u2")
+        # 分叉点 = u2 的前驱 a1;分支 0 = [a1, u2, a2],分支 1 = [a1, 新u, 新a]
+        self.assertTrue(self.tree_store.get_node("a1").is_fork_point)
+        self.assertEqual(
+            self.branch_store.get_branch_list("a1", 0), ["a1", "u2", "a2"]
+        )
+        self.assertEqual(
+            self.branch_store.get_branch_list("a1", 1), ["a1", new_u, new_a]
+        )
+        # 新 user 内容 = 修改后;incomplete 已清除
+        new_user = next(m for m in self.message_repo.get_messages("conv")
+                        if m.id == new_u)
+        self.assertEqual(new_user.content, "修改后的问题二")
+        self.assertFalse(self.tree_store.get_node(new_u).incomplete)
+        # 原 u2 内容保留(归档分支)
+        old_u = next(m for m in self.message_repo.get_messages("conv")
+                     if m.id == "u2")
+        self.assertEqual(old_u.content, "问题二")
+
+    def test_resend_first_message_root_fork(self) -> None:
+        """第一条消息被修改 → 分叉点 = 对话节点。"""
+        self._drain(self.svc.resend_edited_message(
+            "conv", "u1", "修改后的问题一", []
+        ))
+        conv = self.tree_store.get_node("conv")
+        self.assertTrue(conv.is_fork_point)
+        self.assertEqual(conv.fork_branch_count, 2)
+        self.assertEqual(
+            self.branch_store.get_branch_list("conv", 0),
+            ["conv", "u1", "a1", "u2", "a2"],
+        )
+        # 新链 = [新u, 新a];分支 1 = [conv, 新u, 新a]
+        new_chain = self._chain_ids()
+        self.assertEqual(
+            self.branch_store.get_branch_list("conv", 1),
+            ["conv"] + new_chain,
+        )
+
+    def test_resend_stop_leaves_incomplete_then_cleanup_deletes_branch(self) -> None:
+        """修改重发送停止 → incomplete 暂停态;清理时分支删除回退(5.4/5.5)。"""
+        svc = self.svc
+
+        async def _stop_mid():
+            out = []
+            async for c in svc.resend_edited_message(
+                "conv", "u2", "半路停止", []
+            ):
+                out.append(c)
+                if c.delta:
+                    svc.stop_generation()
+            return out
+
+        import asyncio
+        asyncio.run(_stop_mid())
+        # 分支已建(发送时),新 user 节点 incomplete;链 = [u1, a1, 新u]
+        new_u = self._chain_ids()[2]
+        self.assertTrue(self.tree_store.get_node(new_u).incomplete)
+        self.assertEqual(
+            self.branch_store.get_branch_list("a1", 1), ["a1", new_u]
+        )
+        # 系统清理 → 分支删除,链回退到分支 0
+        self.svc.cleanup_incomplete_nodes()
+        self.assertEqual(self._chain_ids(), ["u1", "a1", "u2", "a2"])
+        self.assertEqual(self.branch_store.get_branch_indexes("a1"), [])
+        self.assertFalse(self.tree_store.get_node("a1").is_fork_point)
+        # 硬删除:新 user 不在回收站,行已物理清理
+        trash_ids = {e.node_data.get("id") for e in self.tree_store.list_trash()}
+        self.assertNotIn(new_u, trash_ids)
+        rows = {m.id for m in self.message_repo.get_messages("conv")}
+        self.assertNotIn(new_u, rows)
+
+    # ── 分支感知删除 ──────────────────────────
+
+    def test_delete_modified_node_hard_deletes_branch(self) -> None:
+        """删除被修改节点 → 硬删除(不进回收站)+ 分支删除 + 链回退。"""
+        self._drain(self.svc.resend_edited_message(
+            "conv", "u2", "修改后的问题二", []
+        ))
+        new_u = self._chain_ids()[2]
+        self.svc.delete_conversation(new_u, "recursive")
+        # 链回退到剩余分支 0
+        self.assertEqual(self._chain_ids(), ["u1", "a1", "u2", "a2"])
+        # 不在回收站(硬删除)
+        trash_ids = {e.node_data.get("id") for e in self.tree_store.list_trash()}
+        self.assertNotIn(new_u, trash_ids)
+        # 分支记录清理 + 退化(剩 1 条分支)
+        self.assertEqual(self.branch_store.get_branch_indexes("a1"), [])
+        self.assertFalse(self.tree_store.get_node("a1").is_fork_point)
+        # 消息行物理清理
+        rows = {m.id for m in self.message_repo.get_messages("conv")}
+        self.assertNotIn(new_u, rows)
+
+    def test_delete_fork_point_node_transfers_data(self) -> None:
+        """删除分叉点节点 → 分叉数据转交前驱(3.3.4)。"""
+        self._drain(self.svc.regenerate_message("conv", "a2"))
+        # 分叉点 = u2(a2 的前驱),删除它 → 数据转交 a1
+        self.svc.delete_conversation("u2", "recursive")
+        self.assertEqual(self.branch_store.get_branch_indexes("a1"), [0, 1])
+        self.assertEqual(
+            self.branch_store.get_branch_list("a1", 0), ["a1", "a2"]
+        )
+        self.assertEqual(
+            self.branch_store.get_branch_list("a1", 1), ["a1", self._chain_ids()[-1]]
+        )
+        # u2 软删除进回收站(普通节点删除流程)
+        trash_ids = {e.node_data.get("id") for e in self.tree_store.list_trash()}
+        self.assertIn("u2", trash_ids)
+        # 新分叉点 a1 承接
+        self.assertTrue(self.tree_store.get_node("a1").is_fork_point)
+
+    def test_delete_conversation_removes_branch_data(self) -> None:
+        """删除对话 → 分支数据一并删除(3.3.1 补充说明)。"""
+        self._drain(self.svc.regenerate_message("conv", "a2"))
+        self.svc.delete_conversation("conv", "recursive")
+        self.assertEqual(self.branch_store.get_branch_indexes("u2"), [])
+        self.assertIsNone(self.branch_store.get_node("a2"))
+        # 消息行保留(对话可恢复)
+        self.assertEqual(len(self.message_repo.get_messages("conv")), 5)
+
+    def test_restore_clears_fork_fields(self) -> None:
+        """恢复对话 → 分叉标记清除,成为普通对话(3.3.1 补充说明)。"""
+        self._drain(self.svc.regenerate_message("conv", "a2"))
+        self.svc.delete_conversation("conv", "recursive")
+        # 找到 conv 的回收站条目并恢复
+        entries = [e for e in self.tree_store.list_trash()
+                   if e.node_data.get("id") == "conv"]
+        self.assertEqual(len(entries), 1)
+        self.svc.restore_conversation(entries[0].id)
+        conv = self.tree_store.get_node("conv")
+        self.assertFalse(conv.is_fork_point)
+        self.assertEqual(conv.fork_branch_count, 0)
+
+    # ── 分叉信息 ──────────────────────────────
+
+    def test_get_fork_info_map(self) -> None:
+        """get_fork_info_map 应返回被修改节点的 m/n/分叉点。"""
+        self._drain(self.svc.regenerate_message("conv", "a2"))
+        info = self.svc.get_fork_info_map()
+        new_a = self._chain_ids()[-1]
+        # 被修改节点 = 分叉点 u2 的后继(新 a)
+        self.assertIn(new_a, info)
+        conv_id, m, n, fp_id = info[new_a]
+        self.assertEqual(conv_id, "conv")
+        self.assertEqual(m, 2)   # index 1 → 展示 2
+        self.assertEqual(n, 2)
+        self.assertEqual(fp_id, "u2")
+
+    def test_cleanup_plain_incomplete_soft_deletes(self) -> None:
+        """非分支的 incomplete 节点仍走软删除。"""
+        self.tree_store.mark_incomplete("a1")
+        self.svc.cleanup_incomplete_nodes()
+        self.assertIsNone(self.tree_store.get_node("a1"))
+        trash_ids = {e.node_data.get("id") for e in self.tree_store.list_trash()}
+        self.assertIn("a1", trash_ids)
+
+    def test_send_in_forked_conversation_extends_branch(self) -> None:
+        """分叉对话中发送新消息 → 当前分支记录同步扩展(重启后切分支不丢链)。"""
+        self._drain(self.svc.regenerate_message("conv", "a2"))
+        self._drain(self.svc.send_message("conv", "问题三", []))
+        chain = self._chain_ids()
+        # 链 = [u1, a1, u2, 新a, u3, a3]
+        self.assertEqual(chain[:3], ["u1", "a1", "u2"])
+        new_a, u3, a3 = chain[3], chain[4], chain[5]
+        self.assertEqual(self.branch_store.get_branch_list("u2", 0), ["u2", "a2"])
+        self.assertEqual(
+            self.branch_store.get_branch_list("u2", 1),
+            ["u2", new_a, u3, a3],
+        )
+
+    def test_continue_in_forked_conversation_extends_branch(self) -> None:
+        """分叉对话中继续生成 → 分支记录同步扩展。"""
+        self._drain(self.svc.regenerate_message("conv", "a2"))
+        # 模拟未完成轮次:发送新消息后停止(user 节点已入链)
+        import asyncio
+        svc = self.svc
+
+        async def _stop():
+            async for c in svc.send_message("conv", "问题三", []):
+                if c.delta:
+                    svc.stop_generation()
+
+        asyncio.run(_stop())
+        chain = self._chain_ids()
+        u3 = chain[4]
+        # 继续生成
+        self._drain(self.svc.continue_message("conv", "部分回答"))
+        final = self._chain_ids()
+        self.assertEqual(final[4], u3)
+        self.assertEqual(
+            self.branch_store.get_branch_list("u2", 1),
+            ["u2", chain[3], u3, final[-1]],
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

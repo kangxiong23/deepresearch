@@ -18,6 +18,7 @@ faulthandler.enable()
 from app.storage.database import initialize_database
 from app.storage.message_repo import MessageRepo
 from app.storage.tree_store import TreeStore
+from app.storage.branch_store import BranchStore
 from app.storage.context_store import ContextStore
 
 # ── 适配器 ────────────────────────────────────
@@ -31,6 +32,7 @@ from app.core.context_service import ContextService
 from app.core.search_service import SearchService
 from app.core.file_service import FileService
 from app.core.knowledge_service import KnowledgeService
+from app.core.branch_service import BranchService
 
 # ── Storage（知识图谱）────────────────────────
 from app.storage.kg_store import KGStore
@@ -68,6 +70,7 @@ def assemble_app() -> ChatApp:
     # ── 2. Storage 层 ─────────────────────────
     message_repo  = MessageRepo()
     tree_store    = TreeStore()
+    branch_store  = BranchStore()
     context_store = ContextStore()
     kg_store      = KGStore()
 
@@ -91,6 +94,11 @@ def assemble_app() -> ChatApp:
     file_service = FileService(
         parsers=file_parsers,
     )
+    branch_service = BranchService(
+        tree_store=tree_store,
+        branch_store=branch_store,
+        message_repo=message_repo,
+    )
     conversation_service = ConversationService(
         message_repo=message_repo,
         tree_store=tree_store,
@@ -98,6 +106,7 @@ def assemble_app() -> ChatApp:
         context_service=context_service,
         search_service=search_service,
         file_service=file_service,
+        branch_service=branch_service,
     )
 
     # ── 4b. 知识图谱服务 ──────────────────────

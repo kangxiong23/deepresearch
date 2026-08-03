@@ -84,6 +84,8 @@ class ContextService:
         conversation_id: str,
         new_user_message: str,
         injected_search_text: str = "",
+        *,
+        history_until: str | None = None,
     ) -> LLMContext:
         """
         为一次 LLM 调用组装完整上下文。
@@ -100,6 +102,8 @@ class ContextService:
             conversation_id:      当前对话节点 ID
             new_user_message:     用户本次输入的文本
             injected_search_text: 搜索结果文本（由 SearchService 提供，可为空）
+            history_until:        历史截断边界消息 ID（不含该消息及其之后，
+                                  供重新生成场景使用——只保留目标消息之前的上下文）
 
         Returns:
             LLMContext — 可直接传给 LLMClientProtocol.stream_chat()
@@ -134,6 +138,14 @@ class ContextService:
         #    保持上下文轻量。
         history = self.get_enabled_history_messages()
         history = [m for m in history if m.role != Role.THINKING]
+        if history_until:
+            # 重新生成场景:只保留目标消息之前的上下文(4.1)
+            cut: list[Message] = []
+            for m in history:
+                if m.id == history_until:
+                    break
+                cut.append(m)
+            history = cut
         truncated = self._truncate_history(
             history,
             budget_tokens=app_config.max_history_tokens,

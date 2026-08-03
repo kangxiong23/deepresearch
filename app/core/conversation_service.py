@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import AsyncGenerator
 
 import config as app_config
+from app.core.branch_service import BranchService
 from app.core.context_service import ContextService
 from app.core.file_service import FileService
 from app.core.protocols import (
@@ -25,6 +26,7 @@ from app.core.protocols import (
     TreeStoreProtocol,
 )
 from app.core.search_service import SearchService
+from app.storage.branch_store import BranchStore
 from app.storage.models import (
     ChunkType,
     ConversationDetail,
@@ -71,6 +73,7 @@ class ConversationService:
         context_service: ContextService,
         search_service: SearchService,
         file_service: FileService,
+        branch_service: BranchService | None = None,
     ) -> None:
         self._msg_repo = message_repo
         self._tree = tree_store
@@ -79,6 +82,12 @@ class ConversationService:
         self._search_svc = search_service
         self._file_svc = file_service
         self._stop_event = asyncio.Event()
+        # 分叉服务（未显式注入时按依赖自动构造，兼容既有测试）
+        self._branch_svc = branch_service or BranchService(
+            tree_store=tree_store,
+            branch_store=BranchStore(),
+            message_repo=message_repo,
+        )
 
     # ──────────────────────────────────────────
     # 对话生命周期（基于 TreeStore）
@@ -258,21 +267,60 @@ class ConversationService:
         mode: str = "recursive",
     ) -> None:
         """
-        软删除对话节点，移入回收站。消息数据保留不删（便于恢复）。
+        软删除节点（移入回收站）。分支感知（spec 3.3）：
+
+        - 消息节点是被修改节点 → 硬删除 + 分支删除级联（不进回收站，拍板 3）
+        - 消息节点是分叉点 → 分叉数据转交前驱后按普通节点软删除（3.3.4）
+        - 对话/文件夹 → 子树内所有对话的分支数据一并删除（3.3.1 补充说明），
+          恢复后成为普通对话
 
         Args:
-            conversation_id: 对话节点 ID
+            conversation_id: 节点 ID（对话 / 文件夹 / 消息）
             mode:            "recursive" | "raise"（同 TreeStore.delete_node）
         """
-        # 记录父节点 ID 以便删除后重新计算
         node = self._tree.get_node(conversation_id)
         parent_id = node.parent_id if node else None
 
-        self._tree.soft_delete_node(conversation_id, mode)
+        if isinstance(node, MessageNode):
+            self._delete_message_node(node)
+        elif isinstance(node, (ConversationNode, FolderNode)):
+            # 子树中的对话：分支数据一并删除（3.3.1 补充说明）
+            subtree = [node] + self._tree.get_descendants(conversation_id)
+            for n in subtree:
+                if isinstance(n, ConversationNode):
+                    self._branch_svc.delete_conversation_branches(n.id)
+            self._tree.soft_delete_node(conversation_id, mode)
 
         # 删除后重新计算祖先的 enabled 状态
         if parent_id:
             self._tree.recompute_ancestors_enabled(parent_id)
+
+    def _delete_message_node(self, node: MessageNode) -> None:
+        """
+        分支感知的消息节点删除（spec 3.3）。
+
+        - 被修改节点（分叉点后继）：硬删除——分支记录删除 + 链自动切换 +
+          消息行物理清理，不进入回收站（3.3.1 删除方式，用户拍板 3）
+        - 分叉点：分叉数据整体转交前驱（3.3.4），自身按普通节点软删除
+        - 普通节点：走现有软删除流程
+        """
+        fp = self._tree.find_fork_point_of(node)
+        if fp is not None:
+            fork_id, kind = fp
+            conv_id = node.parent_id
+            if kind == "conversation":
+                fork_id = conv_id
+            fp_node = self._tree.get_node(fork_id)
+            branch_index = fp_node.fork_current_index if fp_node else 0
+            # 硬删除：分支记录删除 + 链重建（节点随链重建移除）+ 孤儿行物理清理
+            self._branch_svc.delete_branch(conv_id, fork_id, branch_index)
+            return
+        if self._tree.is_fork_point_node(node):
+            # 分叉点：分叉身份与数据转交前驱，自身按普通节点删除
+            self._branch_svc.delete_fork_point(node.parent_id, node.id)
+            self._tree.soft_delete_node(node.id, mode="recursive")
+            return
+        self._tree.soft_delete_node(node.id, mode="recursive")
 
     def permanently_delete_conversation(self, conversation_id: str) -> None:
         """
@@ -299,11 +347,31 @@ class ConversationService:
         """
         从回收站恢复对话节点。
 
+        恢复的节点清除分叉标记（3.3.1 补充说明：分支数据已在删除时清除，
+        恢复后为普通节点/普通对话）。
+
         Args:
             trash_entry_id: 回收站条目 ID
             new_parent_id:  恢复到的父节点 ID，None 则使用原父级
         """
+        # 先查条目，确定恢复节点的 ID（恢复后节点已进树）
+        restored_id: str | None = None
+        for entry in self._tree.list_trash():
+            if entry.id == trash_entry_id:
+                restored_id = entry.node_data.get("id")
+                break
+
         self._tree.restore_from_trash(trash_entry_id, new_parent_id)
+
+        if restored_id is not None:
+            restored = self._tree.get_node(restored_id)
+            if isinstance(restored, (ConversationNode, MessageNode)):
+                self._tree.update_node(
+                    restored_id,
+                    is_fork_point=False,
+                    fork_branch_count=0,
+                    fork_current_index=0,
+                )
 
     def list_conversations(self) -> list[ConversationNode]:
         """
@@ -378,9 +446,78 @@ class ConversationService:
                 return msg.id
         return None
 
+    # ──────────────────────────────────────────
+    # 分叉操作（spec 3.5 等）
+    # ──────────────────────────────────────────
+
+    def switch_branch(
+        self, conversation_id: str, fork_point_id: str, target_index: int
+    ) -> list[MessageNode]:
+        """
+        切换分支（3.5）：同步当前状态 → 读取目标分支 → 嵌套展开 → 重建链。
+
+        Args:
+            conversation_id:  对话节点 ID
+            fork_point_id:    分叉点 ID（消息节点或对话节点）
+            target_index:     目标分支编号（0 起）
+
+        Returns:
+            重建后的完整链路（MessageNode 列表）
+        """
+        return self._branch_svc.switch_branch(
+            conversation_id, fork_point_id, target_index
+        )
+
+    def get_fork_info_map(self) -> dict[str, tuple[str, int, int, str]]:
+        """
+        返回全部"被修改节点"的分叉展示信息。
+
+        Returns:
+            {message_id: (conversation_id, m, n, fork_point_id)}
+            - m 为 1 起的展示编号（存储 0 起 + 1）
+            - 仅包含被修改节点（其前驱是分叉点；对话第一条消息时前驱为对话节点）
+        """
+        result: dict[str, tuple[str, int, int, str]] = {}
+        tree = self._tree.get_tree()
+        for conv in tree.nodes:
+            if not isinstance(conv, ConversationNode):
+                continue
+            chain = self._tree.get_conversation_chain(conv.id)
+            for i, node in enumerate(chain):
+                if i == 0:
+                    fp = conv if conv.is_fork_point else None
+                else:
+                    prev = chain[i - 1]
+                    fp = prev if prev.is_fork_point else None
+                if fp is not None:
+                    result[node.id] = (
+                        conv.id,
+                        fp.fork_current_index + 1,
+                        fp.fork_branch_count,
+                        fp.id,
+                    )
+        return result
+
     def cleanup_incomplete_nodes(self) -> int:
-        """软删除所有标记为未完成的 MessageNode（移至回收站）。"""
-        return self._tree.cleanup_incomplete_nodes()
+        """
+        清理所有标记为未完成的 MessageNode（分支感知，spec 5.5）。
+
+        - incomplete 且为被修改节点（新创建分支的节点）→ 触发分支删除，
+          硬删除节点 + 分支记录 + 消息行，链自动切换（3.3）
+        - 其余 incomplete 节点 → 现有软删除流程（移至回收站）
+        """
+        incomplete = [
+            n for n in self._tree.get_all_message_nodes() if n.incomplete
+        ]
+        count = len(incomplete)
+        for node in incomplete:
+            if self._tree.find_fork_point_of(node) is not None:
+                self._delete_message_node(node)
+            else:
+                self._tree.soft_delete_node(node.id, mode="recursive")
+        if count:
+            print(f"[CORE ] 清理 {count} 个未完成消息节点（分支感知）")
+        return count
 
     def mark_incomplete(self, node_id: str) -> None:
         """标记消息节点为未完成（用户停止生成）。"""
@@ -878,7 +1015,9 @@ class ConversationService:
         )
         self._msg_repo.save_message(user_msg)
 
-        # Phase 5: 创建对应的 MessageNode 到树中
+        # Phase 5: 创建对应的 MessageNode 到树中。
+        # 分叉感知：若对话已有分叉点，新节点须同步扩展当前分支记录
+        # （否则重启后切换分支会丢失这部分链）。
         user_msg_node = MessageNode(
             id=user_msg.id,
             parent_id=session_id,
@@ -888,7 +1027,7 @@ class ConversationService:
             title=f"User: {text[:30]}" if text else "User message",
             enabled=True,
         )
-        self._tree.create_node(user_msg_node)
+        self._branch_svc.extend_current_branch(session_id, [user_msg_node])
 
         # ── Step 6 & 7: 调用 LLM，流式转发 ──────
         assistant_msg_id = str(uuid.uuid4())
@@ -912,48 +1051,14 @@ class ConversationService:
             if chunk.is_done:
                 full_content = "".join(full_content_parts)
                 if full_content or thinking_parts:
-                    # Phase 6: thinking 内容仍存 messages 行（is_thinking=True），
-                    #   tree 里只建 assistant 节点，通过 thinking_message_id 绑定。
-                    #   （thinking 不再是树节点，仅作为 assistant 的思维链展示。）
-                    thinking_msg_id: str | None = None
-                    if thinking_parts:
-                        thinking_content = "".join(thinking_parts)
-                        thinking_msg = Message(
-                            id=str(uuid.uuid4()),
-                            conversation_id=session_id,
-                            role=Role.THINKING,
-                            content=thinking_content,
-                            is_thinking=True,
-                            created_at=datetime.utcnow(),
-                            token_count=len(thinking_content) // 4,
-                        )
-                        self._msg_repo.save_message(thinking_msg)
-                        thinking_msg_id = thinking_msg.id
-
-                    assistant_msg = Message(
-                        id=assistant_msg_id,
-                        conversation_id=session_id,
-                        role=Role.ASSISTANT,
-                        content=full_content,
-                        is_thinking=bool(thinking_parts),
-                        created_at=datetime.utcnow(),
-                        token_count=len(full_content) // 4,
+                    # Phase 6: 持久化 assistant + 绑定 thinking（thinking 行存
+                    #   messages 表，树中只建 assistant 节点，通过绑定关联）
+                    asst_node = self._save_assistant_with_thinking(
+                        session_id, assistant_msg_id,
+                        full_content, "".join(thinking_parts),
                     )
-                    self._msg_repo.save_message(assistant_msg)
-
-                    # Phase 6: 只创建 assistant MessageNode（thinking 通过绑定关联）
-                    assistant_preview = full_content[:60] if full_content else ""
-                    asst_node = MessageNode(
-                        id=assistant_msg_id,
-                        parent_id=session_id,
-                        message_id=assistant_msg_id,
-                        role=Role.ASSISTANT.value,
-                        preview=assistant_preview,
-                        title=f"Asst: {assistant_preview[:30]}" if assistant_preview else "Assistant message",
-                        enabled=True,
-                        thinking_message_id=thinking_msg_id,
-                    )
-                    self._tree.create_node(asst_node)
+                    # 分叉感知：同步扩展当前分支记录（同 user 节点创建）
+                    self._branch_svc.extend_current_branch(session_id, [asst_node])
 
                 # Step 9: 更新对话元数据（标题 & 摘要）
                 self._update_meta_after_reply(
@@ -970,54 +1075,54 @@ class ConversationService:
         message_id: str,
     ) -> AsyncGenerator[MessageChunk, None]:
         """
-        重新生成指定消息之后的最后一条助手回复。
+        重新生成完整的 assistant 消息（分叉模式，spec 第四章）。
+
+        预分支语义（3.1）：流式完成前**不持久化任何内容**；完成后创建新分支
+        （分叉点 = 目标 assistant 的前驱，4.2）。停止生成/出错 → 不持久化，
+        由 UI 丢弃回退（4.3，停止生成 = 丢弃回退，不产生 incomplete 标记）。
+
+        注意：仅适用于完整 assistant 节点。未完成轮次的"继续/重新生成"由
+        另一条路径（send_message 流程）处理，不受本方法影响。
 
         Args:
             session_id: 当前对话节点 ID
-            message_id: 要替换的消息 ID（可为空，自动取最后一条 assistant 消息）
+            message_id: 目标 assistant 消息 ID（可为空，自动取最后一条）
 
         Yields:
             MessageChunk — 同 send_message
         """
         self._stop_event.clear()
 
-        # 被"重新生成"抢救：清除当前轮次用户消息的未完成标记（防止被自动清理）
-        _uid = self.find_latest_user_message_id(session_id)
-        if _uid:
-            self._tree.mark_incomplete(_uid, False)
+        node = self._tree.get_node(session_id)
+        if node is None or not isinstance(node, ConversationNode):
+            raise ConversationNotFoundError(session_id)
 
-        # 定位并删除最后一条 assistant 消息（含 MessageNode + 绑定 thinking 行）
+        # 定位目标 assistant
         target_id = message_id or self._find_last_assistant_message(session_id)
-        if target_id:
-            target_node = self._tree.get_node(target_id)
-            bound_thinking_id = None
-            if target_node is not None:
-                bound_thinking_id = getattr(target_node, "thinking_message_id", None)
-                try:
-                    self._tree.soft_delete_node(target_id, mode="recursive")
-                except Exception:
-                    pass  # 节点可能已不存在（容错）
-            self._msg_repo.delete_message(target_id)
-            if bound_thinking_id:
-                self._msg_repo.delete_message(bound_thinking_id)
+        target = self._tree.get_node(target_id) if target_id else None
+        if target is None or not isinstance(target, MessageNode):
+            raise ValueError(f"重新生成目标不存在: {target_id}")
 
-        # 取倒数第一条用户消息作为重新生成的输入（tree.json 为准）
-        messages = self.get_messages_for_node(session_id)
-        last_user = next(
-            (m for m in reversed(messages) if m.role == Role.USER), None
-        )
-        user_text = last_user.content if last_user else ""
+        # 分叉点 = 目标的前驱；目标为第一条消息 → 对话节点（4.2）
+        predecessor = self._tree.get_predecessor(session_id, target_id)
+        fork_point_id = predecessor.id if predecessor else session_id
 
-        # 复用 send_message 的编排流程
+        # 上下文：目标之前的全部历史 + 目标之前最后一条 user 消息文本
+        # （4.1"保留该 assistant 消息之前的所有上下文"）
+        user_text = self._user_text_before(session_id, target_id)
         llm_context = self._context_svc.build_llm_context(
             conversation_id=session_id,
             new_user_message=user_text,
             injected_search_text="",
+            history_until=target_id,
         )
 
+        # 预分支流式：不持久化，完成时才创建分支。
+        # 停止/出错（4.3）：零持久化，UI 丢弃回退——必须自然完成才落地。
         new_msg_id = str(uuid.uuid4())
         full_parts: list[str] = []
         thinking_parts: list[str] = []
+        completed = False
 
         async for chunk in self._llm.stream_chat(llm_context):
             if self._stop_event.is_set():
@@ -1026,58 +1131,168 @@ class ConversationService:
                 )
                 break
             chunk.message_id = new_msg_id
-            # 分离 thinking 块与正文块（避免思维链混入正文）
             if chunk.chunk_type == ChunkType.THINKING:
                 thinking_parts.append(chunk.delta)
             else:
                 full_parts.append(chunk.delta)
             yield chunk
             if chunk.is_done:
+                completed = True
                 break
 
         full_content = "".join(full_parts)
         thinking_content = "".join(thinking_parts)
-        if full_content:
-            # Phase 6: thinking 内容仍存 messages 行，树里只建 assistant 节点
-            thinking_msg_id: str | None = None
-            if thinking_content:
-                thinking_msg = Message(
-                    id=str(uuid.uuid4()),
-                    conversation_id=session_id,
-                    role=Role.THINKING,
-                    content=thinking_content,
-                    is_thinking=True,
-                    created_at=datetime.utcnow(),
-                    token_count=len(thinking_content) // 4,
-                )
-                self._msg_repo.save_message(thinking_msg)
-                thinking_msg_id = thinking_msg.id
-
-            self._msg_repo.save_message(Message(
-                id=new_msg_id,
-                conversation_id=session_id,
-                role=Role.ASSISTANT,
-                content=full_content,
-                is_thinking=bool(thinking_content),
-                created_at=datetime.utcnow(),
-                token_count=len(full_content) // 4,
-            ))
-
-            # Phase 6: 为新生成的回复创建 assistant MessageNode（带 thinking 绑定）
-            preview = full_content[:60]
-            regen_node = MessageNode(
-                id=new_msg_id,
-                parent_id=session_id,
-                message_id=new_msg_id,
-                role=Role.ASSISTANT.value,
-                preview=preview,
-                title=f"Asst: {preview[:30]}" if preview else "Assistant message",
-                enabled=True,
-                thinking_message_id=thinking_msg_id,
+        if completed and (full_content or thinking_content):
+            # 持久化 assistant + 绑定 thinking
+            asst_node = self._save_assistant_with_thinking(
+                session_id, new_msg_id, full_content, thinking_content
             )
-            self._tree.create_node(regen_node)
+            # 新链 = 目标之前的部分 + 新 assistant（目标及其后整体替换，1.3）
+            old_chain = self._tree.get_conversation_chain(session_id)
+            idx = next(
+                (i for i, n in enumerate(old_chain) if n.id == target_id),
+                len(old_chain),
+            )
+            new_chain = old_chain[:idx] + [asst_node]
+            self._branch_svc.create_branch(session_id, fork_point_id, new_chain)
+            self._update_meta_after_reply(session_id, user_text, full_content)
 
-        self._update_meta_after_reply(session_id, user_text, full_content)
+    async def resend_edited_message(
+        self,
+        session_id: str,
+        original_user_id: str,
+        text: str,
+        files: list[str],
+    ) -> AsyncGenerator[MessageChunk, None]:
+        """
+        修改并重发送 user 消息（spec 第五章）。
+
+        分支在**发送时立即落地**（5.3.1，无预分支状态）：
+        1. 新 user 节点（新 id —— 旧行必须保留在归档分支）标记 incomplete
+        2. create_branch（分叉点 = 原节点前驱；第一条消息 → 对话节点）
+        3. 流式输出 assistant
+        4. 完成后 extend_current_branch + 清除 incomplete（5.5）
+
+        停止生成 → 正常 incomplete 暂停态（5.4）：user 节点保持 incomplete，
+        由"继续生成/重新生成/放弃本次修改"接管（UI 层）。
+
+        Args:
+            session_id:        对话节点 ID
+            original_user_id:  被修改的原 user 消息 ID
+            text:              修改后的文本
+            files:             附件路径列表（可为空）
+
+        Yields:
+            MessageChunk — 同 send_message
+        """
+        self._stop_event.clear()
+
+        node = self._tree.get_node(session_id)
+        if node is None or not isinstance(node, ConversationNode):
+            raise ConversationNotFoundError(session_id)
+
+        # 校验：原节点必须是完整的 user 消息（3.2.1 前提条件）
+        original = self._tree.get_node(original_user_id)
+        if original is None or not isinstance(original, MessageNode):
+            raise ValueError(f"被修改消息不存在: {original_user_id}")
+        if original.role != Role.USER.value:
+            raise ValueError("只有 user 消息支持修改并重发送")
+        if original.incomplete:
+            raise ValueError("incomplete 节点不可作为分叉来源（3.2.1）")
+
+        # 文件提取 + 拼合（与 send_message 一致）
+        file_text = ""
+        if files:
+            extracted = await self._file_svc.extract_files(files)
+            parts = []
+            for filename, content in extracted:
+                if content.strip():
+                    parts.append(f"[文件：{filename}]\n{content.strip()}")
+            if parts:
+                file_text = "\n\n".join(parts)
+        full_user_text = text
+        if file_text:
+            full_user_text = (
+                f"{file_text}\n\n[用户问题]\n{text}" if text else file_text
+            )
+
+        search_text = await self._search_svc.search_and_format(text)
+
+        # 分叉点 = 原节点前驱；第一条消息 → 对话节点（5.3.2）
+        predecessor = self._tree.get_predecessor(session_id, original_user_id)
+        fork_point_id = predecessor.id if predecessor else session_id
+
+        # 新 user 消息（新 id：旧内容必须保留在归档分支中）
+        new_user_id = str(uuid.uuid4())
+        user_msg = Message(
+            id=new_user_id,
+            conversation_id=session_id,
+            role=Role.USER,
+            content=text,
+            created_at=datetime.utcnow(),
+            token_count=len(text) // 4,
+        )
+        self._msg_repo.save_message(user_msg)
+        user_node = MessageNode(
+            id=new_user_id,
+            parent_id=session_id,
+            message_id=new_user_id,
+            role=Role.USER.value,
+            preview=text[:60] if text else "",
+            title=f"User: {text[:30]}" if text else "User message",
+            enabled=True,
+            incomplete=True,  # 5.4：流式期间保持 incomplete
+        )
+
+        # 建分支（发送时立即落地）：新链 = 原节点之前 + 新 user 节点
+        old_chain = self._tree.get_conversation_chain(session_id)
+        idx = next(
+            (i for i, n in enumerate(old_chain) if n.id == original_user_id),
+            len(old_chain),
+        )
+        new_chain = old_chain[:idx] + [user_node]
+        self._branch_svc.create_branch(session_id, fork_point_id, new_chain)
+
+        # 上下文基于新链构建（incomplete 的新 user 节点由 new_user_message 传入）
+        llm_context = self._context_svc.build_llm_context(
+            conversation_id=session_id,
+            new_user_message=full_user_text,
+            injected_search_text=search_text,
+        )
+
+        new_msg_id = str(uuid.uuid4())
+        full_parts: list[str] = []
+        thinking_parts: list[str] = []
+        completed = False
+
+        async for chunk in self._llm.stream_chat(llm_context):
+            if self._stop_event.is_set():
+                yield MessageChunk(
+                    delta="", is_done=True, message_id=new_msg_id
+                )
+                break
+            chunk.message_id = new_msg_id
+            if chunk.chunk_type == ChunkType.THINKING:
+                thinking_parts.append(chunk.delta)
+            else:
+                full_parts.append(chunk.delta)
+            yield chunk
+            if chunk.is_done:
+                completed = True
+                break
+
+        full_content = "".join(full_parts)
+        thinking_content = "".join(thinking_parts)
+        # 仅自然完成才持久化与扩展分支（5.4：停止 → 保持 incomplete 暂停态，
+        # 部分内容只存在于内存，由继续生成/重新生成/放弃接管）
+        if completed and (full_content or thinking_content):
+            asst_node = self._save_assistant_with_thinking(
+                session_id, new_msg_id, full_content, thinking_content
+            )
+            # 扩展当前分支 + 清除 incomplete（5.5：分支成为完整分支）
+            self._branch_svc.extend_current_branch(session_id, [asst_node])
+            self._tree.mark_incomplete(new_user_id, False)
+            self._update_meta_after_reply(session_id, text, full_content)
 
     async def continue_message(
         self,
@@ -1187,7 +1402,8 @@ class ConversationService:
                 enabled=True,
                 thinking_message_id=thinking_msg_id,
             )
-            self._tree.create_node(asst_node)
+            # 分叉感知：同步扩展当前分支记录
+            self._branch_svc.extend_current_branch(session_id, [asst_node])
 
             self._update_meta_after_reply(session_id, "", complete_content)
 
@@ -1210,6 +1426,63 @@ class ConversationService:
             if msg.role == Role.ASSISTANT:
                 return msg.id
         return None
+
+    def _user_text_before(self, session_id: str, target_id: str) -> str:
+        """返回目标消息之前最后一条 user 消息的完整文本（重新生成输入）。"""
+        text = ""
+        for msg in self.get_messages_for_node(session_id):
+            if msg.id == target_id:
+                break
+            if msg.role == Role.USER:
+                text = msg.content
+        return text
+
+    def _save_assistant_with_thinking(
+        self,
+        session_id: str,
+        assistant_msg_id: str,
+        full_content: str,
+        thinking_content: str,
+    ) -> MessageNode:
+        """
+        持久化 assistant 消息行 + 绑定 thinking 行（Phase 6），
+        返回 assistant MessageNode（thinking 不再作为树节点）。
+        """
+        thinking_msg_id: str | None = None
+        if thinking_content:
+            thinking_msg = Message(
+                id=str(uuid.uuid4()),
+                conversation_id=session_id,
+                role=Role.THINKING,
+                content=thinking_content,
+                is_thinking=True,
+                created_at=datetime.utcnow(),
+                token_count=len(thinking_content) // 4,
+            )
+            self._msg_repo.save_message(thinking_msg)
+            thinking_msg_id = thinking_msg.id
+
+        self._msg_repo.save_message(Message(
+            id=assistant_msg_id,
+            conversation_id=session_id,
+            role=Role.ASSISTANT,
+            content=full_content,
+            is_thinking=bool(thinking_content),
+            created_at=datetime.utcnow(),
+            token_count=len(full_content) // 4,
+        ))
+
+        preview = full_content[:60]
+        return MessageNode(
+            id=assistant_msg_id,
+            parent_id=session_id,
+            message_id=assistant_msg_id,
+            role=Role.ASSISTANT.value,
+            preview=preview,
+            title=f"Asst: {preview[:30]}" if preview else "Assistant message",
+            enabled=True,
+            thinking_message_id=thinking_msg_id,
+        )
 
     def _update_meta_after_reply(
         self,
