@@ -963,12 +963,22 @@ class ChatApp:
         self._window.input_area.exit_edit_mode(keep_text=False)
         self._window.sidebar.tree_panel.clear_edited_node()
         layout = self._window.message_list.message_layout()
+        target_idx = -1
         for i in range(layout.count()):
             w = layout.itemAt(i).widget()
             if isinstance(w, ChatMessage) and w.message_id == original_user_id:
                 w.set_content(text)
                 w.set_translucent(False)
+                target_idx = i
                 break
+        # 隐藏被修改节点之后的所有旧消息（5.3/1.3 级联替换的 UI 先行：
+        # 它们属于旧分支，发送时分支已创建、链已替换；完成/放弃/切分支时
+        # 全量刷新接管显示）
+        if target_idx >= 0:
+            for i in range(target_idx + 1, layout.count()):
+                w = layout.itemAt(i).widget()
+                if w is not None:
+                    w.setVisible(False)
         self._set_ui_locked(False)
         self._last_turn_was_edit_resend = True
         self._window.input_area.set_generating(True)

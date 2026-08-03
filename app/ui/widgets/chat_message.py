@@ -466,6 +466,7 @@ class ChatMessage(QFrame):
         self._show_resend: bool = False    # 用户消息：是否显示"重新发送"
         self._locked: bool = False         # 预分支/修改状态下操作按钮锁定（3.1.3/5.2）
         self._translucent: bool = False    # 修改状态半透明（5.1.3/5.1.4）
+        self._opacity_effect = None        # 半透明效果对象（QGraphicsOpacityEffect）
         self._show_abandon: bool = False   # 修改重发送暂停态："放弃本次修改"按钮
         self._stream_buffer: str = content
         self._updating_height: bool = False  # 防重入
@@ -903,19 +904,21 @@ class ChatMessage(QFrame):
         self._update_content_height()
 
     def set_translucent(self, translucent: bool) -> None:
-        """半透明状态（修改状态下的气泡与文字，5.1.3/5.1.4）。"""
+        """半透明状态（修改状态下的气泡与文字，5.1.3/5.1.4）。
+
+        用 QGraphicsOpacityEffect 实现——气泡背景与气泡内文字（含
+        Markdown 渲染的 HTML 内容）整体半透明；stylesheet 的 color 规则
+        无法覆盖 HTML 内联样式，仅靠 QSS 会导致文字不透明。
+        """
         self._translucent = translucent
-        alpha = int(255 * (0.45 if translucent else 1.0))
-        self.setStyleSheet(f"""
-            ChatMessage {{
-                background-color: {self._bg_color};
-                {self._normal_border}
-                margin: {Spacing.XS}px 0px;
-            }}
-            QTextBrowser, QLabel, QPushButton {{
-                color: rgba(232, 234, 240, {alpha});
-            }}
-        """)
+        if translucent:
+            if self._opacity_effect is None:
+                from PySide6.QtWidgets import QGraphicsOpacityEffect
+                self._opacity_effect = QGraphicsOpacityEffect(self)
+                self._opacity_effect.setOpacity(0.45)
+            self.setGraphicsEffect(self._opacity_effect)
+        else:
+            self.setGraphicsEffect(None)
 
     def set_actions_locked(self, locked: bool) -> None:
         """锁定/解锁操作按钮（预分支与修改状态下，3.1.3/5.2）。"""

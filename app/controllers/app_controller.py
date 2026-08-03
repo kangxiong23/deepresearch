@@ -648,9 +648,10 @@ class AppController:
     # 树形结构管理（Phase 4）
     # ──────────────────────────────────────────
 
-    def get_tree(self) -> list[TreeNodeVM]:
+    def _build_tree_vms_plain(self) -> list[TreeNodeVM]:
         """
-        返回完整树结构的 DFS 排序平面列表，depth 和 has_children 预计算。
+        返回完整树结构的 DFS 排序平面列表，depth 和 has_children 预计算
+        （不含分叉展示前缀，由 get_tree 统一附加）。
 
         Returns:
             list[TreeNodeVM] — 按 DFS 遍历顺序排列的节点视图模型
@@ -691,7 +692,6 @@ class AppController:
                     has_children=False,  # MessageNode 永远是叶子
                     depth=depth,
                     role=node.role,
-                    fork_display=_fork_display(node),
                     is_modified=(
                         self._conversation_svc.is_modified_node(node.id)
                     ),
@@ -726,7 +726,6 @@ class AppController:
                     message_count=getattr(node, "message_count", 0),
                     context_block_count=len(getattr(node, "context_block_ids", [])),
                     attachment_count=len(getattr(node, "attachment_paths", [])),
-                    fork_display=_fork_display(node),
                 )
             result.append(vm)
 
@@ -739,6 +738,25 @@ class AppController:
             dfs(root_node, 0)
 
         return result
+
+    def get_tree(self) -> list[TreeNodeVM]:
+        """
+        返回完整树结构的 DFS 排序平面列表，depth 和 has_children 预计算。
+
+        分叉标记（<m/n>）显示在被修改节点上（用户拍板）：标记存储于
+        分叉点，但展示时位于分叉点的后继（被修改节点），与聊天区控件一致。
+
+        Returns:
+            list[TreeNodeVM] — 按 DFS 遍历顺序排列的节点视图模型
+        """
+        vms = self._build_tree_vms_plain()
+        # 分叉展示信息：{message_id: (conv, m, n, fork_point_id)}
+        fork_map = self._conversation_svc.get_fork_info_map()
+        for vm in vms:
+            info = fork_map.get(vm.id)
+            if info is not None:
+                vm.fork_display = f"<{info[1]}/{info[2]}> "
+        return vms
 
     def on_create_folder(
         self,
@@ -884,13 +902,6 @@ class AppController:
 # ──────────────────────────────────────────────
 # 模块级辅助（不含业务知识，仅格式化）
 # ──────────────────────────────────────────────
-
-def _fork_display(node) -> str:
-    """分叉点的标题前缀 "<m/n> "（3.5.2：树面板仅信息展示）。"""
-    if getattr(node, "is_fork_point", False) and node.fork_branch_count:
-        return f"<{node.fork_current_index + 1}/{node.fork_branch_count}> "
-    return ""
-
 
 def _format_datetime(dt) -> str:
     """将 datetime 对象格式化为展示字符串，dt 为 None 时返回空串。"""
