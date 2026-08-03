@@ -92,6 +92,62 @@ class DeepSeekClient:
         except httpx.RequestError as e:
             raise LLMAPIError(f"DeepSeek request failed: {e}") from e
 
+    async def stream_prefix_continue(
+        self,
+        context,
+        partial_content: str,
+        partial_thinking: str = "",
+    ) -> AsyncGenerator[MessageChunk, None]:
+        """
+        前缀续写（Beta）：从已有的部分 assistant 内容继续补全。
+
+        使用 Beta base_url（https://api.deepseek.com/beta）。
+        context.messages 末尾应为 prefix=True 的 assistant 消息
+        （由 ContextService.build_continue_context 构建）。
+
+        Args:
+            context:          LLMContext（含 system + 历史 + prefix assistant 消息）
+            partial_content:  未完成消息已有的部分文本（信息性；已含于 context）
+            partial_thinking: 未完成消息已有的部分思考内容（信息性；已含于 context）
+
+        Yields:
+            MessageChunk — 与 stream_chat 相同；最后一块 is_done=True
+        """
+        self._abort_flag = False
+        url = "https://api.deepseek.com/beta" + self._API_PATH
+        headers = {
+            "Authorization": f"Bearer {app_config.DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        payload = self._build_payload(context)
+
+        client = await self._get_client()
+
+        try:
+            async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if self._abort_flag:
+                        yield MessageChunk(delta="", is_done=True,
+                                           chunk_type=ChunkType.TEXT)
+                        return
+
+                    chunk = _parse_sse_line(line)
+                    if chunk is None:
+                        continue
+                    yield chunk
+                    if chunk.is_done:
+                        return
+
+        except httpx.HTTPStatusError as e:
+            raise LLMAPIError(
+                f"DeepSeek API error {e.response.status_code}: "
+                f"{e.response.text[:200]}"
+            ) from e
+        except httpx.RequestError as e:
+            raise LLMAPIError(f"DeepSeek request failed: {e}") from e
+
     def abort(self) -> None:
         """设置中止标志，stream_chat 在下次读取前检测并退出。"""
         self._abort_flag = True

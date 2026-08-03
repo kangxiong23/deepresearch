@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import uuid
 from copy import deepcopy
 from datetime import datetime
@@ -26,10 +27,28 @@ from app.storage.models import (
     FolderNode,
     MessageNode,
     NodeType,
+    Role,
     TrashEntry,
     TreeNode,
     TreeRoot,
 )
+
+
+def _atomic_replace(src: Path, dst: Path, retries: int = 5, delay: float = 0.05) -> None:
+    """
+    原子替换文件（os.replace），Windows 上带重试。
+
+    Windows 上 os.replace 可能因杀毒/索引器对源或目标文件的瞬时锁定而报
+    PermissionError（WinError 5）。重试几次通常即可通过（瞬态锁自动释放）。
+    """
+    for attempt in range(retries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay)
 
 
 class TreeStore:
@@ -64,6 +83,8 @@ class TreeStore:
         # __init__ 结束后重建缓存（_load_tree 内部调用 _create_default_tree
         # 时会触发 _save_tree，此时 _root 尚未赋值，缓存由此处统一重建）
         self._rebuild_cache()
+        # Phase 6: 旧版 thinking 节点 → assistant.thinking_message_id 绑定迁移
+        self._migrate_thinking_binding()
 
     # ──────────────────────────────────────────
     # 内部 I/O
@@ -93,7 +114,7 @@ class TreeStore:
             tmp_path = self._tree_path.with_suffix(".tmp")
             with tmp_path.open("w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self._tree_path)
+            _atomic_replace(tmp_path, self._tree_path)
         # 写入后重建缓存（仅在 _root 已初始化后；__init__ 期间暂不重建）
         if hasattr(self, "_root") and self._root is not None:
             self._rebuild_cache()
@@ -135,7 +156,7 @@ class TreeStore:
             tmp_path = self._trash_path.with_suffix(".tmp")
             with tmp_path.open("w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self._trash_path)
+            _atomic_replace(tmp_path, self._trash_path)
 
     def _create_default_tree(self) -> TreeRoot:
         """创建默认树结构：仅包含一个"未分类"根目录。"""
@@ -149,11 +170,99 @@ class TreeStore:
             created_at=now,
             updated_at=now,
         )
-        tree = TreeRoot(version="1.0", nodes=[root_folder])
+        tree = TreeRoot(version="3.0", nodes=[root_folder])
         self._save_tree(tree)
         # 初始化空回收站
         self._save_trash([])
         return tree
+
+    # ──────────────────────────────────────────
+    # 内部迁移（Phase 6 — thinking 绑定）
+    # ──────────────────────────────────────────
+
+    def _migrate_thinking_binding(self) -> None:
+        """
+        [Phase 6] 旧版 thinking MessageNode → assistant.thinking_message_id 绑定迁移。
+
+        旧格式: user → thinking → assistant（三个并列 MessageNode，v2.0 及以下）
+        新格式: user → assistant(thinking_message_id=<thinking 行 id>)（v3.0）
+
+        规则：
+        - 对每个 thinking 节点，绑定到紧随其后的 assistant 兄弟节点
+        - 孤儿 thinking（同父下无后随 assistant）→ 移入回收站（可恢复）
+        - 所有 thinking 节点从树中移除（其内容行仍保留在 messages 表）
+
+        幂等：tree.json 版本号 >= 3.0 直接跳过。
+        """
+        try:
+            cur_version = float(self._root.version)
+        except (TypeError, ValueError):
+            cur_version = 1.0
+        if cur_version >= 3.0:
+            return
+
+        thinking_nodes = [
+            n for n in self._root.nodes
+            if isinstance(n, MessageNode) and n.role == Role.THINKING.value
+        ]
+        if not thinking_nodes:
+            # 无 thinking 节点也升级版本，避免每次启动重复扫描
+            self._root.version = "3.0"
+            self._save_tree(self._root)
+            return
+
+        # 按父节点分组，子节点按 sort_order 排序（保持原始树序）
+        from collections import defaultdict
+        children_by_parent: dict[str | None, list[AnyTreeNode]] = defaultdict(list)
+        for n in self._root.nodes:
+            children_by_parent[n.parent_id].append(n)
+        for group in children_by_parent.values():
+            group.sort(key=lambda n: n.sort_order)
+
+        orphan_nodes: list[MessageNode] = []
+        remove_ids: set[str] = set()
+
+        for tn in thinking_nodes:
+            siblings = children_by_parent.get(tn.parent_id, [])
+            target: AnyTreeNode | None = None
+            seen_tn = False
+            for s in siblings:
+                if s.id == tn.id:
+                    seen_tn = True
+                    continue
+                if seen_tn and isinstance(s, MessageNode) and s.role == Role.ASSISTANT.value:
+                    target = s
+                    break
+            if target is not None:
+                target.thinking_message_id = tn.message_id
+                target.updated_at = datetime.utcnow()
+            else:
+                orphan_nodes.append(tn)
+            remove_ids.add(tn.id)
+
+        # 孤儿 thinking 节点 → 回收站（保持可恢复）
+        trash_entries: list[TrashEntry] = []
+        now = datetime.utcnow()
+        for tn in orphan_nodes:
+            trash_entries.append(TrashEntry(
+                id=str(uuid.uuid4()),
+                json_path=self._build_path_for_node(tn),
+                node_data=_node_to_dict(tn),
+                deleted_at=now,
+            ))
+        if trash_entries:
+            all_trash = self._load_trash()
+            all_trash.extend(trash_entries)
+            self._save_trash(all_trash)
+
+        # 移除 thinking 节点并重新编号受影响父级的子节点顺序
+        self._root.nodes = [n for n in self._root.nodes if n.id not in remove_ids]
+        self._rebuild_cache()
+        for pid in {tn.parent_id for tn in thinking_nodes}:
+            self._renumber_children(pid)
+
+        self._root.version = "3.0"
+        self._save_tree(self._root)
 
     # ──────────────────────────────────────────
     # 内部查找辅助
@@ -280,6 +389,34 @@ class TreeStore:
     def get_all_message_nodes(self) -> list[MessageNode]:
         """返回树中所有 MessageNode 实例。"""
         return [n for n in self._root.nodes if isinstance(n, MessageNode)]
+
+    def mark_incomplete(self, node_id: str, value: bool = True) -> None:
+        """标记/清除消息节点的未完成状态。"""
+        node = self._find_node(node_id)
+        if node is None or not isinstance(node, MessageNode):
+            return
+        if node.incomplete != value:
+            node.incomplete = value
+            node.updated_at = datetime.utcnow()
+            self._save_tree(self._root)
+
+    def cleanup_incomplete_nodes(self) -> int:
+        """
+        软删除所有标记为未完成的 MessageNode（移至回收站，可恢复）。
+
+        Returns:
+            被软删除的节点数量
+        """
+        incomplete = [
+            n for n in self._root.nodes
+            if isinstance(n, MessageNode) and n.incomplete
+        ]
+        count = len(incomplete)
+        for n in incomplete:
+            self.soft_delete_node(n.id, mode="recursive")
+        if count:
+            print(f"[STORAGE] 清理 {count} 个未完成消息节点（软删除至回收站）")
+        return count
 
     def get_message_ids_in_tree_order(self, root_id: str | None = None) -> list[str]:
         """
@@ -486,6 +623,7 @@ class TreeStore:
         allowed = {
             "title", "enabled", "summary", "message_count",
             "context_block_ids", "attachment_paths", "preview", "role",
+            "incomplete", "thinking_message_id",
         }
         for key, value in updates.items():
             if key in allowed and hasattr(node, key):
@@ -808,6 +946,8 @@ def _node_to_dict(node: AnyTreeNode) -> dict:
         d["message_id"] = node.message_id
         d["role"] = node.role
         d["preview"] = node.preview
+        d["incomplete"] = node.incomplete
+        d["thinking_message_id"] = node.thinking_message_id
     else:
         d["summary"] = node.summary
         d["message_count"] = node.message_count
@@ -846,6 +986,8 @@ def _dict_to_node(d: dict) -> AnyTreeNode:
             message_id=d.get("message_id", d["id"]),
             role=d.get("role", ""),
             preview=d.get("preview", ""),
+            incomplete=d.get("incomplete", False),
+            thinking_message_id=d.get("thinking_message_id"),
         )
     else:
         return ConversationNode(

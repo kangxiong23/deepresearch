@@ -39,6 +39,21 @@ def get_connection() -> sqlite3.Connection:
     return _local.conn
 
 
+def reset_connection() -> None:
+    """
+    关闭并丢弃当前线程的 SQLite 连接（下次 get_connection() 重建）。
+
+    由 ConfigScope 在 DB_PATH 变化时调用，确保新连接指向新的数据库文件，
+    并释放旧文件句柄（避免 Windows 上删除临时 DB 时被占用）。
+    """
+    if hasattr(_local, "conn") and _local.conn is not None:
+        try:
+            _local.conn.close()
+        except Exception:
+            pass
+        _local.conn = None
+
+
 def initialize_database() -> None:
     """
     执行建表 DDL 与数据迁移。幂等：表已存在时不报错。

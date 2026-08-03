@@ -28,6 +28,7 @@ from app.storage.models import (
     FolderNode,
     LLMContext,
     Message,
+    MessageNode,
     Role,
 )
 
@@ -322,15 +323,31 @@ class ContextService:
         """
         return self._is_node_enabled(node_id)
 
-    def get_enabled_history_messages(self) -> list[Message]:
+    def get_enabled_history_messages(
+        self,
+        include_incomplete: bool = False,
+        include_thinking: bool = False,
+    ) -> list[Message]:
         """
-        收集 LLM 历史消息，以 tree.json 为唯一数据源。
+        收集历史消息，以 tree.json 为唯一数据源。
 
-        规则（与前端 `get_effective_enabled_messages` 完全一致）：
+        规则（与前端 `get_effective_enabled_messages` 一致）：
         - 遍历树中所有 MessageNode，逐个通过祖先级联规则判断是否 effectively enabled
         - 仅收集 enabled 的 message_id，批量从 messages 表加载实际内容
         - 按 DFS 前序遍历（树结构顺序）排列
-        - 包含 THINKING 消息（由调用方在组装 messages 时过滤，保证前端展示一致）
+        - 默认排除 THINKING（Phase 6 起 thinking 绑定在 assistant 上，
+          通过 include_thinking=True 仅在前端展示时穿插，LLM 上下文永不含 thinking）
+
+        include_incomplete:
+            False（默认）— 跳过标记为未完成（incomplete）的节点，
+                           用于 LLM 上下文（不污染、不占 token）。
+            True — 包含 incomplete 节点，用于前端展示（与侧边栏一致，
+                   暂停轮次的 user 消息仍显示）。
+
+        include_thinking:
+            False（默认）— 用于 LLM 上下文（thinking 是草稿，不进上下文）。
+            True — 将 assistant 节点绑定的 thinking 行穿插到对应 assistant 之前，
+                   用于前端聚合时间线展示。
 
         回退：若树中无任何 MessageNode（Phase 5 迁移前创建的旧对话），
         则收集所有有效启用的 ConversationNode，通过 conversation_id 批量查询。
@@ -355,13 +372,18 @@ class ContextService:
                 print("[CTX ] get_enabled_history_messages: 无启用的对话（回退模式）")
                 return []
             messages = self._repo.get_messages_by_conversation_ids(enabled_conv_ids)
+            if include_thinking:
+                messages = self._interleave_bound_thinking(messages)
             print(f"[CTX ] get_enabled_history_messages: 回退模式，"
                   f"{len(enabled_conv_ids)} 个启用对话 → {len(messages)} 条消息")
             return messages
 
         # 逐个判断 effective enabled（考虑祖先级联）
+        # 默认跳过 incomplete 节点（不进 LLM 上下文）；前端展示时传入 True 包含
         enabled_message_ids: set[str] = set()
         for node in all_msg_nodes:
+            if node.incomplete and not include_incomplete:
+                continue
             if self._is_node_enabled(node.id):
                 enabled_message_ids.add(node.message_id)
 
@@ -375,9 +397,95 @@ class ContextService:
 
         messages = self._repo.get_messages_by_ids(list(enabled_message_ids))
         messages.sort(key=lambda m: id_order.get(m.id, 999999))
+
+        if include_thinking:
+            # Phase 6: 展示模式附带绑定 thinking（LLM 上下文保持排除）
+            messages = self._interleave_bound_thinking(messages)
+
         print(f"[CTX ] get_enabled_history_messages: "
               f"{len(enabled_message_ids)} 个 MessageNode → {len(messages)} 条消息（树序遍历）")
         return messages
+
+    def _interleave_bound_thinking(self, messages: list[Message]) -> list[Message]:
+        """
+        Phase 6: 将 assistant 节点绑定的 thinking 行穿插到对应 assistant 之前。
+
+        仅用于前端展示；LLM 上下文调用方不传 include_thinking。
+        """
+        if not messages:
+            return messages
+        all_msg_nodes = self._tree.get_all_message_nodes()
+        bound = {
+            n.message_id: n.thinking_message_id
+            for n in all_msg_nodes
+            if isinstance(n, MessageNode) and n.thinking_message_id
+        }
+        if not bound:
+            return messages
+        thinking_ids = [tid for tid in bound.values() if tid]
+        thinking_msgs = self._repo.get_messages_by_ids(thinking_ids)
+        by_id = {t.id: t for t in thinking_msgs}
+        result: list[Message] = []
+        for m in messages:
+            if m.role == Role.ASSISTANT and m.id in bound:
+                t = by_id.get(bound[m.id])
+                if t is not None:
+                    result.append(t)
+            result.append(m)
+        return result
+
+    def build_continue_context(
+        self,
+        partial_content: str,
+        partial_thinking: str = "",
+    ) -> LLMContext:
+        """
+        构建"继续生成"的 LLM 上下文（DeepSeek Beta 前缀续写）。
+
+        历史来自 tree.json（与正常发送一致，剔除 THINKING），
+        末尾追加部分 assistant 内容作为 prefix（prefix=True），让模型补全其余内容。
+
+        Args:
+            partial_content:  未完成消息已有的部分文本（续写起点）
+            partial_thinking: 未完成消息已有的部分思考内容（若有，作为 reasoning_content）
+
+        Returns:
+            LLMContext — 传给 LLMClient.stream_prefix_continue
+        """
+        system_prompt = self._build_system_prompt()
+
+        # 历史与正常发送一致：tree.json 唯一数据源，剔除 thinking
+        history = self.get_enabled_history_messages()
+        history = [m for m in history if m.role != Role.THINKING]
+        truncated = self._truncate_history(
+            history, budget_tokens=app_config.max_history_tokens
+        )
+
+        messages: list[dict] = []
+        for msg in truncated:
+            messages.append({
+                "role": msg.role.value if hasattr(msg.role, "value") else msg.role,
+                "content": msg.content,
+            })
+
+        # 末尾追加部分 assistant 作为 prefix（续写起点）
+        prefix_msg: dict = {
+            "role": "assistant",
+            "content": partial_content or "",
+            "prefix": True,
+        }
+        if partial_thinking:
+            prefix_msg["reasoning_content"] = partial_thinking
+        messages.append(prefix_msg)
+
+        return LLMContext(
+            messages=messages,
+            system_prompt=system_prompt,
+            model_type=app_config.model_type,
+            thinking_enabled=app_config.thinking_enabled,
+            max_tokens=app_config.max_tokens,
+            temperature=app_config.temperature,
+        )
 
     def _is_node_enabled(self, node_id: str) -> bool:
         """

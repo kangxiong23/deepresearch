@@ -50,6 +50,25 @@ class LLMClientProtocol(Protocol):
         """
         ...
 
+    async def stream_prefix_continue(
+        self,
+        context: LLMContext,
+        partial_content: str,
+        partial_thinking: str = "",
+    ) -> AsyncGenerator[MessageChunk, None]:
+        """
+        前缀续写（Beta）：从已有的部分 assistant 内容继续补全。
+
+        Args:
+            context:          LLMContext（含 system + 历史 + prefix assistant 消息）
+            partial_content:  未完成消息已有的部分文本
+            partial_thinking: 未完成消息已有的部分思考内容（若有）
+
+        Yields:
+            MessageChunk — 与 stream_chat 相同；最后一块 is_done=True
+        """
+        ...
+
     def abort(self) -> None:
         """中止当前正在进行的流式请求。"""
         ...
@@ -291,6 +310,14 @@ class TreeStoreProtocol(Protocol):
 
     def get_all_message_nodes(self) -> list[MessageNode]:
         """返回树中所有 MessageNode 实例。"""
+        ...
+
+    def mark_incomplete(self, node_id: str, value: bool = True) -> None:
+        """标记/清除消息节点的未完成状态。"""
+        ...
+
+    def cleanup_incomplete_nodes(self) -> int:
+        """软删除所有标记为未完成的 MessageNode，返回删除数量。"""
         ...
 
     def get_message_ids_in_tree_order(self, root_id: str | None = None) -> list[str]:

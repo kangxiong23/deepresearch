@@ -24,7 +24,9 @@ from app.storage.models import (
 from app.storage.tree_store import TreeStore
 from app.storage.context_store import ContextStore
 from app.storage.message_repo import MessageRepo
+from config import ConfigScope
 from app.core.context_service import ContextService
+from app.core.conversation_service import ConversationService
 
 
 class TestConversationServiceTreeOps(unittest.TestCase):
@@ -36,11 +38,13 @@ class TestConversationServiceTreeOps(unittest.TestCase):
         cls._tmpdir = tempfile.TemporaryDirectory()
         cls._base = Path(cls._tmpdir.name)
 
-        # 用临时路径覆盖 config
-        import config as app_config
-        app_config.DB_PATH = str(cls._base / "test.db")
-        app_config.TREE_STORE_PATH = str(cls._base / "tree")
-        app_config.CONTEXT_STORE_PATH = str(cls._base / "context")
+        # 用 ConfigScope 隔离临时路径（退出自动恢复 config + 关闭 DB 连接）
+        cls._scope = ConfigScope(
+            DB_PATH=str(cls._base / "test.db"),
+            TREE_STORE_PATH=str(cls._base / "tree"),
+            CONTEXT_STORE_PATH=str(cls._base / "context"),
+        )
+        cls._scope.__enter__()
 
         from app.storage.database import initialize_database
         initialize_database()
@@ -54,6 +58,7 @@ class TestConversationServiceTreeOps(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        cls._scope.__exit__(None, None, None)  # 关闭连接 + 恢复 config
         cls._tmpdir.cleanup()
 
     def setUp(self) -> None:
@@ -173,6 +178,32 @@ class TestConversationServiceTreeOps(unittest.TestCase):
         trash = self.tree_store.list_trash()
         self.assertEqual(len(trash), 2)
 
+    def test_incomplete_mark_and_cleanup(self) -> None:
+        """标记未完成 → 软删除到回收站（只删标记节点，其余保留）。"""
+        conv = ConversationNode(id="conv-clean", parent_id="root", title="清理测试")
+        self.tree_store.create_node(conv)
+        n1 = MessageNode(
+            id="clean-m1", parent_id="conv-clean", message_id="clean-m1",
+            role="user", preview="问题", title="User: 问题",
+        )
+        n2 = MessageNode(
+            id="clean-m2", parent_id="conv-clean", message_id="clean-m2",
+            role="assistant", preview="回答", title="Asst: 回答",
+        )
+        self.tree_store.create_node(n1)
+        self.tree_store.create_node(n2)
+
+        # 标记 m1 未完成
+        self.tree_store.mark_incomplete("clean-m1", True)
+        self.assertTrue(self.tree_store.get_node("clean-m1").incomplete)
+
+        # 清理 → 只删 m1，m2 保留，回收站 +1
+        count = self.tree_store.cleanup_incomplete_nodes()
+        self.assertEqual(count, 1)
+        self.assertIsNone(self.tree_store.get_node("clean-m1"))
+        self.assertIsNotNone(self.tree_store.get_node("clean-m2"))
+        self.assertEqual(len(self.tree_store.list_trash()), 1)
+
 
 class TestContextServiceTreeIntegration(unittest.TestCase):
     """测试 ContextService 的树形上下文收集（Phase 3 功能）。"""
@@ -182,10 +213,13 @@ class TestContextServiceTreeIntegration(unittest.TestCase):
         cls._tmpdir = tempfile.TemporaryDirectory()
         cls._base = Path(cls._tmpdir.name)
 
-        import config as app_config
-        app_config.TREE_STORE_PATH = str(cls._base / "tree")
-        app_config.CONTEXT_STORE_PATH = str(cls._base / "context")
-        app_config.DB_PATH = str(cls._base / "test.db")
+        # 用 ConfigScope 隔离临时路径（退出自动恢复 config + 关闭 DB 连接）
+        cls._scope = ConfigScope(
+            DB_PATH=str(cls._base / "test.db"),
+            TREE_STORE_PATH=str(cls._base / "tree"),
+            CONTEXT_STORE_PATH=str(cls._base / "context"),
+        )
+        cls._scope.__enter__()
 
         from app.storage.database import initialize_database
         initialize_database()
@@ -201,6 +235,7 @@ class TestContextServiceTreeIntegration(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        cls._scope.__exit__(None, None, None)  # 关闭连接 + 恢复 config
         cls._tmpdir.cleanup()
 
     def setUp(self) -> None:
@@ -396,6 +431,158 @@ class TestContextServiceTreeIntegration(unittest.TestCase):
 
         history = self.context_service.get_enabled_history_messages()
         self.assertNotIn("m-dis", [mm.id for mm in history])
+
+    def test_history_skips_incomplete(self) -> None:
+        """标记为未完成的 MessageNode 不应进入 LLM 历史上下文。"""
+        conv = ConversationNode(
+            id="conv-inc", parent_id="root", title="未完成测试",
+        )
+        self.tree_store.create_node(conv)
+
+        m1 = Message(
+            id="inc-m1", conversation_id="conv-inc", role=Role.USER,
+            content="问题1", created_at=datetime.utcnow(), token_count=2,
+        )
+        self.message_repo.save_message(m1)
+        n1 = MessageNode(
+            id="inc-m1", parent_id="conv-inc", message_id="inc-m1",
+            role=Role.USER.value, preview="问题1", title="User: 问题1",
+        )
+        self.tree_store.create_node(n1)
+
+        # 初始：在历史中
+        self.assertEqual(len(self.context_service.get_enabled_history_messages()), 1)
+
+        # 标记未完成 → 历史中应消失
+        self.tree_store.mark_incomplete("inc-m1", True)
+        self.assertEqual(self.context_service.get_enabled_history_messages(), [])
+
+    def test_display_includes_incomplete_but_context_skips(self) -> None:
+        """前端展示(include_incomplete=True)包含 incomplete 节点，LLM 上下文排除。"""
+        conv = ConversationNode(
+            id="conv-ii", parent_id="root", title="问题2测试",
+        )
+        self.tree_store.create_node(conv)
+
+        m = Message(
+            id="ii-m1", conversation_id="conv-ii", role=Role.USER,
+            content="问题", created_at=datetime.utcnow(), token_count=2,
+        )
+        self.message_repo.save_message(m)
+        n = MessageNode(
+            id="ii-m1", parent_id="conv-ii", message_id="ii-m1",
+            role=Role.USER.value, preview="问题", title="User: 问题",
+        )
+        self.tree_store.create_node(n)
+        self.tree_store.mark_incomplete("ii-m1", True)
+
+        # LLM 上下文（默认 include_incomplete=False）：排除
+        self.assertEqual(self.context_service.get_enabled_history_messages(), [])
+        # 前端展示（include_incomplete=True）：包含
+        display = self.context_service.get_enabled_history_messages(
+            include_incomplete=True
+        )
+        self.assertEqual([mm.id for mm in display], ["ii-m1"])
+
+
+class TestThinkingBindingInterleave(unittest.TestCase):
+    """Phase 6: get_messages_for_node / 展示路径 的绑定 thinking 穿插。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmpdir = tempfile.TemporaryDirectory()
+        cls._base = Path(cls._tmpdir.name)
+
+        # 用 ConfigScope 隔离临时路径（退出自动恢复 config + 关闭 DB 连接）
+        cls._scope = ConfigScope(
+            DB_PATH=str(cls._base / "test.db"),
+            TREE_STORE_PATH=str(cls._base / "tree"),
+            CONTEXT_STORE_PATH=str(cls._base / "context"),
+        )
+        cls._scope.__enter__()
+
+        from app.storage.database import initialize_database
+        initialize_database()
+
+        cls.tree_store = TreeStore()
+        cls.message_repo = MessageRepo()
+        cls.context_store = ContextStore()
+        cls.context_service = ContextService(
+            message_repo=cls.message_repo,
+            context_store=cls.context_store,
+            tree_store=cls.tree_store,
+        )
+        # llm/search/file 用 stub —— 本组测试只调用 get_messages_for_node
+        # 与 get_effective_enabled_messages，不触发 LLM/搜索/文件。
+        cls.conversation_service = ConversationService(
+            message_repo=cls.message_repo,
+            tree_store=cls.tree_store,
+            llm_client=object(),
+            context_service=cls.context_service,
+            search_service=object(),
+            file_service=object(),
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._scope.__exit__(None, None, None)  # 关闭连接 + 恢复 config
+        cls._tmpdir.cleanup()
+
+    def setUp(self) -> None:
+        from app.storage.models import TreeRoot
+        self.tree_store._root = TreeRoot(version="3.0", nodes=[])
+        self.tree_store._rebuild_cache()
+        root = FolderNode(
+            id="root", parent_id=None, sort_order=0, enabled="some",
+            title="未分类",
+            created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
+        )
+        self.tree_store._root.nodes.append(root)
+        self.tree_store._rebuild_cache()
+        self.tree_store._save_tree(self.tree_store._root)
+        self.tree_store._save_trash([])
+
+    def _build_conv_with_thinking(self, conv_id: str, u_id: str, a_id: str, t_id: str) -> None:
+        """建一个对话: user → assistant(thinking_message_id=t_id)。"""
+        conv = ConversationNode(id=conv_id, parent_id="root", title="穿插")
+        self.tree_store.create_node(conv)
+        u = MessageNode(
+            id=u_id, parent_id=conv_id, message_id=u_id,
+            role="user", preview="问", title="User: 问",
+        )
+        a = MessageNode(
+            id=a_id, parent_id=conv_id, message_id=a_id,
+            role="assistant", preview="答", title="Asst: 答",
+            thinking_message_id=t_id,
+        )
+        self.tree_store.create_node(u)
+        self.tree_store.create_node(a)
+        self.message_repo.save_message(Message(
+            id=u_id, conversation_id=conv_id, role=Role.USER, content="问题",
+        ))
+        self.message_repo.save_message(Message(
+            id=t_id, conversation_id=conv_id, role=Role.THINKING,
+            content="思考", is_thinking=True,
+        ))
+        self.message_repo.save_message(Message(
+            id=a_id, conversation_id=conv_id, role=Role.ASSISTANT, content="回答",
+        ))
+
+    def test_get_messages_for_node_interleaves_thinking(self) -> None:
+        """get_messages_for_node 应将绑定 thinking 行插到 assistant 之前。"""
+        self._build_conv_with_thinking("conv-i", "u1", "a1", "t1")
+        msgs = self.conversation_service.get_messages_for_node("conv-i")
+        self.assertEqual([m.id for m in msgs], ["u1", "t1", "a1"])
+
+    def test_get_effective_enabled_messages_includes_thinking(self) -> None:
+        """前端展示路径应包含绑定 thinking；LLM 上下文路径应排除。"""
+        self._build_conv_with_thinking("conv-e", "u2", "a2", "t2")
+
+        display = self.conversation_service.get_effective_enabled_messages()
+        self.assertEqual([m.id for m in display], ["u2", "t2", "a2"])
+
+        history = self.context_service.get_enabled_history_messages()
+        self.assertEqual([m.id for m in history], ["u2", "a2"])
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime
 
 import config as app_config
+from config import ConfigScope
 from app.storage.kg_store import KGStore, KGEntity, KGRelation, KGQueryResult
 
 
@@ -249,18 +250,13 @@ class KnowledgeService:
         )
 
         full_text = ""
-        try:
-            # 强制使用 chat 模型提取，不受当前 model_type 影响
-            original_model = app_config.model_type
-            app_config.model_type = "deepseek-v4-flash"
-
+        # 强制使用 chat 模型提取，不受当前 model_type 影响（ConfigScope 自动恢复）
+        with ConfigScope(model_type="deepseek-v4-flash"):
             async for chunk in self._llm.stream_chat(context):
                 if chunk.chunk_type.value == "text" if hasattr(chunk.chunk_type, 'value') else chunk.chunk_type == "text":
                     full_text += chunk.delta
                 if chunk.is_done:
                     break
-        finally:
-            app_config.model_type = original_model
 
         return full_text.strip()
 

@@ -232,6 +232,8 @@ class MessageNode(TreeNode):
     message_id: str = ""          # FK to messages.id
     role: str = ""                # "user" | "assistant" | "thinking" | "system"
     preview: str = ""             # 前 60 字预览，供树节点展示
+    incomplete: bool = False      # 未完成（用户停止生成）：构建上下文时跳过，后续可软删除
+    thinking_message_id: str | None = None  # assistant 节点: 绑定其思维链 thinking 行 id (thinking 不再是树节点)
     node_type: NodeType = field(default=NodeType.MESSAGE, init=False)
 
 

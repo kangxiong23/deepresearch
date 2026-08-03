@@ -168,6 +168,30 @@ class AppController:
         """
         return self._conversation_svc.is_conversation_usable(conv_id)
 
+    def find_latest_user_message_id(self, session_id: str) -> str | None:
+        """
+        返回指定对话下最近一条 user MessageNode 的 id（未完成轮次的标记目标）。
+
+        Args:
+            session_id: 对话节点 ID
+
+        Returns:
+            str | None — 最近一条 user 消息的 id
+        """
+        return self._conversation_svc.find_latest_user_message_id(session_id)
+
+    def cleanup_incomplete_nodes(self) -> int:
+        """软删除所有标记为未完成的 MessageNode（移至回收站）。"""
+        return self._conversation_svc.cleanup_incomplete_nodes()
+
+    def mark_incomplete(self, node_id: str) -> None:
+        """标记消息节点为未完成（用户停止生成）。"""
+        self._conversation_svc.mark_incomplete(node_id)
+
+    def clear_incomplete_mark(self, node_id: str) -> None:
+        """清除消息节点的未完成标记（被"重新生成"/"继续生成"抢救）。"""
+        self._conversation_svc.clear_incomplete_mark(node_id)
+
     def on_search(self, keywords_text: str) -> list[SearchResultVM]:
         """
         UI 调用：执行消息关键词搜索。
@@ -286,6 +310,28 @@ class AppController:
         """
         cmd = CommandBuilder.build_regenerate_command(session_id, message_id)
         async for chunk in self._conversation_svc.regenerate_message(**cmd):
+            yield self._map_to_stream_chunk_vm(chunk)
+
+    async def on_continue_message(
+        self,
+        session_id: str,
+        partial_content: str,
+        partial_thinking: str = "",
+    ) -> AsyncGenerator[StreamChunkVM, None]:
+        """
+        继续生成未完成的助手消息（DeepSeek Beta 前缀续写）。
+
+        Args:
+            session_id:       当前对话节点 ID
+            partial_content:  未完成消息已有的部分文本
+            partial_thinking: 未完成消息已有的部分思考内容（若有）
+
+        Yields:
+            StreamChunkVM — 流式续写块，同 on_send_message
+        """
+        async for chunk in self._conversation_svc.continue_message(
+            session_id, partial_content, partial_thinking
+        ):
             yield self._map_to_stream_chunk_vm(chunk)
 
     def on_stop_generation(self) -> None:

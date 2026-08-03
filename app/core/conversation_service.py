@@ -30,6 +30,7 @@ from app.storage.models import (
     ConversationDetail,
     ConversationNode,
     FolderNode,
+    LLMContext,
     MessageNode,
     Message,
     MessageChunk,
@@ -178,42 +179,78 @@ class ConversationService:
             return []
 
         # ── 收集该节点覆盖的 message_id 集合 ──
+        message_nodes: list[MessageNode] = []
         if isinstance(node, MessageNode):
-            message_ids = [node.message_id]
-        elif isinstance(node, ConversationNode):
-            message_ids = [
-                n.message_id
-                for n in self._tree.get_descendants(node_id)
+            message_nodes = [node]
+        elif isinstance(node, (ConversationNode, FolderNode)):
+            message_nodes = [
+                n for n in self._tree.get_descendants(node_id)
                 if isinstance(n, MessageNode)
             ]
-            # 回退：若无 MessageNode 子节点（Phase 5 迁移前的旧数据），
+            # 回退：ConversationNode 无 MessageNode 子节点（Phase 5 迁移前的旧数据），
             # 使用 conversation_id 查询
-            if not message_ids:
+            if isinstance(node, ConversationNode) and not message_nodes:
                 print(f"[CORE ] get_messages_for_node: 对话 {node_id} 无 MessageNode，"
                       f"回退到 conversation_id 查询")
                 messages = self._msg_repo.get_messages(node_id)
                 return messages  # 旧数据保持原顺序
-        elif isinstance(node, FolderNode):
-            message_ids = [
-                n.message_id
-                for n in self._tree.get_descendants(node_id)
-                if isinstance(n, MessageNode)
-            ]
         else:
             return []
 
-        if not message_ids:
+        if not message_nodes:
             print(f"[CORE ] get_messages_for_node: 节点 {node_id} 无 message_id 可查")
             return []
+
+        message_ids = [n.message_id for n in message_nodes]
+        # Phase 6: 收集 assistant 节点绑定的 thinking 行 id（其内容仍存 messages 表）
+        thinking_ids = [
+            n.thinking_message_id for n in message_nodes if n.thinking_message_id
+        ]
 
         # ── 按 DFS 前序遍历排序 ──
         ordered_ids = self._tree.get_message_ids_in_tree_order(node_id)
         id_order: dict[str, int] = {mid: i for i, mid in enumerate(ordered_ids)}
 
-        messages = self._msg_repo.get_messages_by_ids(message_ids)
-        messages.sort(key=lambda m: id_order.get(m.id, 999999))
-        print(f"[CORE ] get_messages_for_node: 节点 {node_id} → {len(messages)} 条消息（树序遍历）")
-        return messages
+        all_ids = message_ids + thinking_ids
+        messages = self._msg_repo.get_messages_by_ids(all_ids)
+        by_id = {m.id: m for m in messages}
+        # 主消息（user/assistant/遗留 thinking 节点）按树序排列
+        main_msgs = [
+            by_id[mid]
+            for mid in sorted(message_ids, key=lambda i: id_order.get(i, 999999))
+            if mid in by_id
+        ]
+        result = self._interleave_bound_thinking(message_nodes, main_msgs, by_id)
+        print(f"[CORE ] get_messages_for_node: 节点 {node_id} → "
+              f"{len(main_msgs)} 条消息 + {len(result) - len(main_msgs)} 条绑定 thinking（树序遍历）")
+        return result
+
+    @staticmethod
+    def _interleave_bound_thinking(
+        message_nodes: list[MessageNode],
+        ordered_msgs: list[Message],
+        by_id: dict[str, Message],
+    ) -> list[Message]:
+        """
+        Phase 6: 将 assistant 节点绑定的 thinking 行穿插到对应 assistant 之前。
+
+        仅调整主消息顺序；无绑定则原样返回。
+        """
+        bound = {
+            n.message_id: n.thinking_message_id
+            for n in message_nodes
+            if n.thinking_message_id
+        }
+        if not bound:
+            return ordered_msgs
+        result: list[Message] = []
+        for m in ordered_msgs:
+            if m.role == Role.ASSISTANT and m.id in bound:
+                t = by_id.get(bound[m.id])
+                if t is not None:
+                    result.append(t)
+            result.append(m)
+        return result
 
     def delete_conversation(
         self,
@@ -286,13 +323,18 @@ class ConversationService:
         收集树中所有有效启用的 MessageNode 对应的消息，按 DFS 前序遍历排列。
 
         与 `ContextService.get_enabled_history_messages()` 共用同一套
-        tree.json 驱动逻辑（唯一数据源），保证前端展示与 LLM 历史完全一致。
-        此处仅做委托，避免逻辑重复。
+        tree.json 驱动逻辑（唯一数据源），保证前端展示与侧边栏一致。
+        此处包含 incomplete 节点：暂停轮次的 user 消息在重绘后仍显示
+        （LLM 上下文则通过默认 include_incomplete=False 排除）。
+        Phase 6 起同时附带绑定 thinking（include_thinking=True），
+        使聚合时间线仍能展示每条 assistant 的思维链。
 
         Returns:
             list[Message] — 所有有效启用对话的消息，按 DFS 前序遍历排列
         """
-        return self._context_svc.get_enabled_history_messages()
+        return self._context_svc.get_enabled_history_messages(
+            include_incomplete=True, include_thinking=True
+        )
 
     def find_last_enabled_conversation_id(self) -> str | None:
         """
@@ -316,6 +358,37 @@ class ConversationService:
         if isinstance(parent, ConversationNode):
             return parent.id
         return None
+
+    def find_latest_user_message_id(self, session_id: str) -> str | None:
+        """
+        返回指定对话下最近一条 user MessageNode 的 id。
+
+        用于标记未完成轮次：停止生成时，树中只有用户消息节点存在，
+        该节点即未完成轮次的标记目标。
+
+        Args:
+            session_id: 对话节点 ID
+
+        Returns:
+            str | None — 最近一条 user 消息的 id
+        """
+        messages = self.get_messages_for_node(session_id)
+        for msg in reversed(messages):
+            if msg.role == Role.USER:
+                return msg.id
+        return None
+
+    def cleanup_incomplete_nodes(self) -> int:
+        """软删除所有标记为未完成的 MessageNode（移至回收站）。"""
+        return self._tree.cleanup_incomplete_nodes()
+
+    def mark_incomplete(self, node_id: str) -> None:
+        """标记消息节点为未完成（用户停止生成）。"""
+        self._tree.mark_incomplete(node_id, True)
+
+    def clear_incomplete_mark(self, node_id: str) -> None:
+        """清除消息节点的未完成标记（被"重新生成"/"继续生成"抢救）。"""
+        self._tree.mark_incomplete(node_id, False)
 
     def conversation_is_after_all_enabled(self, conv_id: str) -> bool:
         """
@@ -839,8 +912,10 @@ class ConversationService:
             if chunk.is_done:
                 full_content = "".join(full_content_parts)
                 if full_content or thinking_parts:
-                    # ★ 先创建 thinking 节点、后创建 assistant 节点，保证树序
-                    #   thinking 在前（sort_order 递增），聚合时间线先展示推理再展示回答。
+                    # Phase 6: thinking 内容仍存 messages 行（is_thinking=True），
+                    #   tree 里只建 assistant 节点，通过 thinking_message_id 绑定。
+                    #   （thinking 不再是树节点，仅作为 assistant 的思维链展示。）
+                    thinking_msg_id: str | None = None
                     if thinking_parts:
                         thinking_content = "".join(thinking_parts)
                         thinking_msg = Message(
@@ -853,19 +928,7 @@ class ConversationService:
                             token_count=len(thinking_content) // 4,
                         )
                         self._msg_repo.save_message(thinking_msg)
-
-                        # Phase 5: 创建 thinking MessageNode
-                        thinking_preview = thinking_content[:60]
-                        think_node = MessageNode(
-                            id=thinking_msg.id,
-                            parent_id=session_id,
-                            message_id=thinking_msg.id,
-                            role=Role.THINKING.value,
-                            preview=thinking_preview,
-                            title=f"Think: {thinking_preview[:30]}" if thinking_preview else "Thinking",
-                            enabled=True,
-                        )
-                        self._tree.create_node(think_node)
+                        thinking_msg_id = thinking_msg.id
 
                     assistant_msg = Message(
                         id=assistant_msg_id,
@@ -878,7 +941,7 @@ class ConversationService:
                     )
                     self._msg_repo.save_message(assistant_msg)
 
-                    # Phase 5: 创建 assistant MessageNode
+                    # Phase 6: 只创建 assistant MessageNode（thinking 通过绑定关联）
                     assistant_preview = full_content[:60] if full_content else ""
                     asst_node = MessageNode(
                         id=assistant_msg_id,
@@ -888,6 +951,7 @@ class ConversationService:
                         preview=assistant_preview,
                         title=f"Asst: {assistant_preview[:30]}" if assistant_preview else "Assistant message",
                         enabled=True,
+                        thinking_message_id=thinking_msg_id,
                     )
                     self._tree.create_node(asst_node)
 
@@ -917,17 +981,25 @@ class ConversationService:
         """
         self._stop_event.clear()
 
-        # 定位并删除最后一条 assistant 消息（含 MessageNode）
+        # 被"重新生成"抢救：清除当前轮次用户消息的未完成标记（防止被自动清理）
+        _uid = self.find_latest_user_message_id(session_id)
+        if _uid:
+            self._tree.mark_incomplete(_uid, False)
+
+        # 定位并删除最后一条 assistant 消息（含 MessageNode + 绑定 thinking 行）
         target_id = message_id or self._find_last_assistant_message(session_id)
         if target_id:
-            self._msg_repo.delete_message(target_id)
-            # Phase 5: 也从树中删除对应的 MessageNode
-            try:
-                target_node = self._tree.get_node(target_id)
-                if target_node is not None:
+            target_node = self._tree.get_node(target_id)
+            bound_thinking_id = None
+            if target_node is not None:
+                bound_thinking_id = getattr(target_node, "thinking_message_id", None)
+                try:
                     self._tree.soft_delete_node(target_id, mode="recursive")
-            except Exception:
-                pass  # 节点可能已不存在（容错）
+                except Exception:
+                    pass  # 节点可能已不存在（容错）
+            self._msg_repo.delete_message(target_id)
+            if bound_thinking_id:
+                self._msg_repo.delete_message(bound_thinking_id)
 
         # 取倒数第一条用户消息作为重新生成的输入（tree.json 为准）
         messages = self.get_messages_for_node(session_id)
@@ -945,6 +1017,7 @@ class ConversationService:
 
         new_msg_id = str(uuid.uuid4())
         full_parts: list[str] = []
+        thinking_parts: list[str] = []
 
         async for chunk in self._llm.stream_chat(llm_context):
             if self._stop_event.is_set():
@@ -953,23 +1026,44 @@ class ConversationService:
                 )
                 break
             chunk.message_id = new_msg_id
-            full_parts.append(chunk.delta)
+            # 分离 thinking 块与正文块（避免思维链混入正文）
+            if chunk.chunk_type == ChunkType.THINKING:
+                thinking_parts.append(chunk.delta)
+            else:
+                full_parts.append(chunk.delta)
             yield chunk
             if chunk.is_done:
                 break
 
         full_content = "".join(full_parts)
+        thinking_content = "".join(thinking_parts)
         if full_content:
+            # Phase 6: thinking 内容仍存 messages 行，树里只建 assistant 节点
+            thinking_msg_id: str | None = None
+            if thinking_content:
+                thinking_msg = Message(
+                    id=str(uuid.uuid4()),
+                    conversation_id=session_id,
+                    role=Role.THINKING,
+                    content=thinking_content,
+                    is_thinking=True,
+                    created_at=datetime.utcnow(),
+                    token_count=len(thinking_content) // 4,
+                )
+                self._msg_repo.save_message(thinking_msg)
+                thinking_msg_id = thinking_msg.id
+
             self._msg_repo.save_message(Message(
                 id=new_msg_id,
                 conversation_id=session_id,
                 role=Role.ASSISTANT,
                 content=full_content,
+                is_thinking=bool(thinking_content),
                 created_at=datetime.utcnow(),
                 token_count=len(full_content) // 4,
             ))
 
-            # Phase 5: 为新生成的回复创建 MessageNode
+            # Phase 6: 为新生成的回复创建 assistant MessageNode（带 thinking 绑定）
             preview = full_content[:60]
             regen_node = MessageNode(
                 id=new_msg_id,
@@ -979,10 +1073,123 @@ class ConversationService:
                 preview=preview,
                 title=f"Asst: {preview[:30]}" if preview else "Assistant message",
                 enabled=True,
+                thinking_message_id=thinking_msg_id,
             )
             self._tree.create_node(regen_node)
 
         self._update_meta_after_reply(session_id, user_text, full_content)
+
+    async def continue_message(
+        self,
+        session_id: str,
+        partial_content: str,
+        partial_thinking: str = "",
+    ) -> AsyncGenerator[MessageChunk, None]:
+        """
+        继续生成未完成的助手消息（DeepSeek Beta 前缀续写）。
+
+        从 tree.json 获取历史消息（与正常发送一致），将已有的部分助手内容作为
+        prefix，请求模型补全其余内容。流式返回续写块；完成后持久化完整助手
+        消息到 DB + 树。
+
+        Args:
+            session_id:       当前对话节点 ID
+            partial_content:  未完成消息已有的部分文本（续写起点）
+            partial_thinking: 未完成消息已有的部分思考内容（若有）
+
+        Yields:
+            MessageChunk — 与 send_message 相同；最后一块 is_done=True
+        """
+        self._stop_event.clear()
+
+        # 被"继续生成"抢救：清除当前轮次用户消息的未完成标记（防止被自动清理）
+        _uid = self.find_latest_user_message_id(session_id)
+        if _uid:
+            self._tree.mark_incomplete(_uid, False)
+
+        # 验证会话
+        node = self._tree.get_node(session_id)
+        if node is None:
+            raise ConversationNotFoundError(session_id)
+        if not isinstance(node, ConversationNode):
+            raise ConversationNotFoundError(
+                f"Node {session_id} is not a conversation"
+            )
+
+        # 构建续写上下文（历史来自 tree.json，末尾 prefix assistant）
+        context = self._context_svc.build_continue_context(
+            partial_content=partial_content,
+            partial_thinking=partial_thinking,
+        )
+
+        new_msg_id = str(uuid.uuid4())
+        full_parts: list[str] = []
+        thinking_parts: list[str] = []
+
+        async for chunk in self._llm.stream_prefix_continue(
+            context, partial_content, partial_thinking
+        ):
+            if self._stop_event.is_set():
+                yield MessageChunk(
+                    delta="", is_done=True, message_id=new_msg_id
+                )
+                break
+
+            chunk.message_id = new_msg_id
+            # 分离 thinking 块与正文块（避免思维链混入正文）
+            if chunk.chunk_type == ChunkType.THINKING:
+                thinking_parts.append(chunk.delta)
+            else:
+                full_parts.append(chunk.delta)
+            yield chunk
+            if chunk.is_done:
+                break
+
+        # 完整内容 = 已有部分 + 续写部分（API 只返回新增 token）
+        continuation = "".join(full_parts)
+        complete_content = (partial_content or "") + continuation
+        complete_thinking = (partial_thinking or "") + "".join(thinking_parts)
+        if complete_content.strip():
+            # Phase 6: thinking 内容仍存 messages 行，树里只建 assistant 节点
+            thinking_msg_id: str | None = None
+            if complete_thinking.strip():
+                thinking_msg = Message(
+                    id=str(uuid.uuid4()),
+                    conversation_id=session_id,
+                    role=Role.THINKING,
+                    content=complete_thinking,
+                    is_thinking=True,
+                    created_at=datetime.utcnow(),
+                    token_count=len(complete_thinking) // 4,
+                )
+                self._msg_repo.save_message(thinking_msg)
+                thinking_msg_id = thinking_msg.id
+
+            assistant_msg = Message(
+                id=new_msg_id,
+                conversation_id=session_id,
+                role=Role.ASSISTANT,
+                content=complete_content,
+                is_thinking=bool(complete_thinking.strip()),
+                created_at=datetime.utcnow(),
+                token_count=len(complete_content) // 4,
+            )
+            self._msg_repo.save_message(assistant_msg)
+
+            preview = complete_content[:60]
+            asst_node = MessageNode(
+                id=new_msg_id,
+                parent_id=session_id,
+                message_id=new_msg_id,
+                role=Role.ASSISTANT.value,
+                preview=preview,
+                title=f"Asst: {preview[:30]}" if preview else "Assistant message",
+                enabled=True,
+                thinking_message_id=thinking_msg_id,
+            )
+            self._tree.create_node(asst_node)
+
+            self._update_meta_after_reply(session_id, "", complete_content)
 
     def stop_generation(self) -> None:
         """

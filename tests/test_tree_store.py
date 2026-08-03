@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.storage.models import (
     ConversationNode,
     FolderNode,
+    MessageNode,
     TreeNode,
     TreeRoot,
 )
@@ -326,6 +327,95 @@ class TestTreeStoreCRUD(unittest.TestCase):
         self.store.create_node(conv)
         self.store.move_node("c1", new_parent_id="root")
         self.assertEqual(self.store.get_node("c1").parent_id, "root")
+
+
+class TestThinkingBinding(unittest.TestCase):
+    """Phase 6: thinking 绑定迁移与 thinking_message_id 序列化。"""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._base = Path(self._tmpdir.name)
+        self.store = TreeStore(base_path=self._base)
+        # 构造旧树（v2.0）：root → conv → user / thinking / assistant
+        conv = ConversationNode(id="conv", parent_id="root", title="对话")
+        self.store.create_node(conv)
+        u = MessageNode(
+            id="u1", parent_id="conv", message_id="u1", role="user",
+            preview="问", title="User: 问",
+        )
+        t = MessageNode(
+            id="t1", parent_id="conv", message_id="t1", role="thinking",
+            preview="想", title="Think: 想",
+        )
+        a = MessageNode(
+            id="a1", parent_id="conv", message_id="a1", role="assistant",
+            preview="答", title="Asst: 答",
+        )
+        self.store.create_node(u)
+        self.store.create_node(t)
+        self.store.create_node(a)
+        self.store._root.version = "2.0"
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def test_migrate_binds_thinking_to_next_assistant(self) -> None:
+        """thinking 节点应绑定到后随 assistant 并从树中移除，版本升 3.0。"""
+        self.store._migrate_thinking_binding()
+        asst = self.store.get_node("a1")
+        self.assertIsNotNone(asst)
+        self.assertEqual(asst.thinking_message_id, "t1")
+        # thinking 节点不再存在于树中
+        self.assertIsNone(self.store.get_node("t1"))
+        self.assertEqual(self.store._root.version, "3.0")
+
+    def test_migrate_keeps_user_and_assistant_order(self) -> None:
+        """迁移后 user 与 assistant 顺序不变，且 sort_order 重编号。"""
+        self.store._migrate_thinking_binding()
+        children = self.store.get_children("conv")
+        ids = [n.id for n in children]
+        self.assertEqual(ids, ["u1", "a1"])
+        self.assertEqual(children[0].sort_order, 0)
+        self.assertEqual(children[1].sort_order, 1)
+
+    def test_migrate_orphan_thinking_goes_to_trash(self) -> None:
+        """后无 assistant 的孤儿 thinking 节点应软删到回收站。"""
+        t2 = MessageNode(
+            id="t2", parent_id="conv", message_id="t2", role="thinking",
+            preview="孤儿", title="Think: 孤儿",
+        )
+        self.store.create_node(t2)
+        self.store._root.version = "2.0"
+        self.store._migrate_thinking_binding()
+        # t1 绑定 a1；t2 是孤儿 → 回收站
+        self.assertIsNone(self.store.get_node("t2"))
+        trash = self.store.list_trash()
+        self.assertEqual(len(trash), 1)
+        self.assertEqual(trash[0].node_data.get("id"), "t2")
+
+    def test_thinking_message_id_serialization_roundtrip(self) -> None:
+        """thinking_message_id 应持久化到 tree.json 并能往返读取。"""
+        import json
+        a9 = MessageNode(
+            id="a9", parent_id="conv", message_id="a9", role="assistant",
+            preview="答", title="Asst: 答", thinking_message_id="t9",
+        )
+        self.store.create_node(a9)
+        self.store._save_tree(self.store._root)
+
+        data = json.loads(
+            (self._base / "tree.json").read_text(encoding="utf-8")
+        )
+        node_dict = next(n for n in data["nodes"] if n["id"] == "a9")
+        self.assertEqual(node_dict.get("thinking_message_id"), "t9")
+
+        got = self.store.get_node("a9")
+        self.assertEqual(got.thinking_message_id, "t9")
+
+    def test_update_node_thinking_message_id(self) -> None:
+        """update_node 应支持更新 thinking_message_id。"""
+        self.store.update_node("a1", thinking_message_id="t1")
+        self.assertEqual(self.store.get_node("a1").thinking_message_id, "t1")
 
 
 if __name__ == "__main__":

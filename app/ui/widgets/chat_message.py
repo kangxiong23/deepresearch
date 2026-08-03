@@ -382,6 +382,8 @@ class ChatMessage(QFrame):
     copy_requested = Signal(str)        # content text
     regenerate_requested = Signal()     # no args needed
     remember_requested = Signal()       # no args needed
+    continue_requested = Signal()       # 继续生成（未完成消息）
+    resend_requested = Signal(str)      # 重新发送（用户消息）
 
     def __init__(
         self,
@@ -397,6 +399,8 @@ class ChatMessage(QFrame):
         self.role = role
         self.message_id = message_id
         self._is_streaming: bool = False
+        self._is_incomplete: bool = False  # 未完成（用户停止生成）
+        self._show_resend: bool = False    # 用户消息：是否显示"重新发送"
         self._stream_buffer: str = content
         self._updating_height: bool = False  # 防重入
 
@@ -444,6 +448,12 @@ class ChatMessage(QFrame):
         action_layout.setContentsMargins(0, 0, 0, 0)
         action_layout.setSpacing(Spacing.XS)
 
+        # "重新发送"按钮（仅首字延迟停止的用户消息场景显示）
+        self._resend_btn = self._make_icon_button("↻", "重新发送", Colors.TEXT_SECONDARY)
+        self._resend_btn.clicked.connect(self._on_resend)
+        self._resend_btn.setVisible(False)
+        action_layout.addWidget(self._resend_btn)
+
         if not is_user:
             self._copy_btn = self._make_icon_button("📋", "复制", Colors.TEXT_SECONDARY)
             self._copy_btn.clicked.connect(self._on_copy)
@@ -456,9 +466,13 @@ class ChatMessage(QFrame):
             self._remember_btn._default_icon = "🔖"
             self._remember_btn._default_color = Colors.TEXT_SECONDARY
 
+            self._continue_btn = self._make_icon_button("▶", "继续生成", Colors.TEXT_SECONDARY)
+            self._continue_btn.clicked.connect(self._on_continue)
+
             action_layout.addWidget(self._copy_btn)
             action_layout.addWidget(self._regen_btn)
             action_layout.addWidget(self._remember_btn)
+            action_layout.addWidget(self._continue_btn)
             action_layout.addStretch()
 
         self._action_widget.setVisible(not is_user)
@@ -508,6 +522,9 @@ class ChatMessage(QFrame):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Minimum,
         )
+
+        # 初始状态（完成态）：复制/重新生成/记住显示，继续隐藏
+        self._update_action_visibility()
 
     # ── 操作按钮工厂 ──────────────────────────
 
@@ -632,6 +649,24 @@ class ChatMessage(QFrame):
         """请求提取知识图谱。"""
         self.remember_requested.emit()
 
+    def _on_continue(self) -> None:
+        """请求继续生成（未完成消息）。"""
+        self.continue_requested.emit()
+
+    def _on_resend(self) -> None:
+        """请求重新发送（用户消息）。"""
+        self.resend_requested.emit(self.current_content)
+
+    def show_resend_button(self) -> None:
+        """在用户消息上显示'重新发送'按钮（首字延迟停止场景）。"""
+        self._show_resend = True
+        self._update_action_visibility()
+
+    def hide_resend_button(self) -> None:
+        """隐藏'重新发送'按钮。"""
+        self._show_resend = False
+        self._update_action_visibility()
+
     # ── 记住按钮状态 ──────────────────────────
 
     def set_remember_loading(self) -> None:
@@ -672,7 +707,9 @@ class ChatMessage(QFrame):
     def start_stream(self) -> None:
         """开始流式接收。清空缓冲并重置内容。"""
         self._is_streaming = True
+        self._is_incomplete = False
         self._stream_buffer = ""
+        self._update_action_visibility()
 
     def append_stream(self, delta: str) -> None:
         """追加流式文本块，自动渲染 Markdown 并更新高度。"""
@@ -689,8 +726,53 @@ class ChatMessage(QFrame):
         self._content_browser.viewport().repaint()
 
     def finalize_stream(self) -> None:
-        """结束流式接收。"""
+        """结束流式接收（正常完成）。"""
         self._is_streaming = False
+        self._is_incomplete = False
+        self._update_action_visibility()
+
+    def mark_incomplete(self) -> None:
+        """标记消息为未完成状态（用户停止生成），显示重新生成 + 继续按钮。"""
+        self._is_streaming = False
+        self._is_incomplete = True
+        self._update_action_visibility()
+
+    def restart_stream_from(self, content: str) -> None:
+        """从已有部分内容恢复流式追加状态（继续生成用）。"""
+        self._is_streaming = True
+        self._is_incomplete = False
+        self._stream_buffer = content or ""
+        self._content_browser.setHtml(_render_markdown(self._stream_buffer))
+        self._update_content_height()
+        self._update_action_visibility()
+
+    def _update_action_visibility(self) -> None:
+        """根据当前状态更新操作按钮可见性。"""
+        if self._is_streaming:
+            # 流式中：整栏操作按钮隐藏
+            self._action_widget.setVisible(False)
+            return
+        if self._is_user:
+            # 用户消息：默认无操作按钮；仅"重新发送"场景显示
+            self._action_widget.setVisible(self._show_resend)
+            self._resend_btn.setVisible(self._show_resend)
+            return
+        if self._is_incomplete:
+            # 未完成：仅重新生成 + 继续
+            self._action_widget.setVisible(True)
+            self._copy_btn.setVisible(False)
+            self._remember_btn.setVisible(False)
+            self._regen_btn.setVisible(True)
+            self._continue_btn.setVisible(True)
+            self._resend_btn.setVisible(False)
+            return
+        # 正常完成：复制/重新生成/记住显示，继续隐藏
+        self._action_widget.setVisible(True)
+        self._copy_btn.setVisible(True)
+        self._remember_btn.setVisible(True)
+        self._regen_btn.setVisible(True)
+        self._continue_btn.setVisible(False)
+        self._resend_btn.setVisible(False)
 
     # ── 属性 ──────────────────────────────────
 

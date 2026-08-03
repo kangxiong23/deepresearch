@@ -46,6 +46,9 @@ class ChatApp:
         # ── 状态（与 Flet 版本 ChatApp 字段一一对应）──
         self._current_session_id: str = ""
         self._streaming_message: ChatMessage | None = None
+        # 流式期间收到消息列表重建请求（删除/启用切换等）时置 True，
+        # 流结束后统一重建，避免流式控件被销毁导致输出效果丢失
+        self._pending_rebuild_after_stream: bool = False
         self._tree_nodes: list = []
 
         # ── Phase 5: 精确滚动定位 ─────────────
@@ -60,6 +63,12 @@ class ChatApp:
         self._stream_worker: AsyncStreamWorker | None = None
         self._stream_relay: StreamRelay | None = None  # 保持 relay 引用，防止 GC
         self._async_task_threads: list = []  # 保持引用防止 GC
+        # 未完成的助手消息（用户停止生成后保留引用，供"继续生成"）
+        self._incomplete_message: ChatMessage | None = None
+        # 未完成轮次的用户消息节点 id（重绘后 user widget 有真实 ID，靠它定位）
+        self._incomplete_user_id: str | None = None
+        # 最近一次发送的文本（供未完成轮次"重新发送"用）
+        self._last_sent_text: str = ""
 
         # ── 构建主窗口 ──────────────────────────
         self._window = MainWindow()
@@ -171,6 +180,10 @@ class ChatApp:
         再加载消息和滚动。否则所有 widget 几何无效，
         scrollbar.maximum() 返回 0，scroll_to_bottom 无效。
         """
+        # 启动时先同步清理上次运行遗留的未完成消息节点（软删除至回收站）。
+        # 必须在 _load_tree / _load_all_messages 之前执行——否则渲染先于清理，
+        # 前端会短暂显示即将被删除的 incomplete 节点。
+        self._ctrl.cleanup_incomplete_nodes()
         self._load_tree()
         self._window.show()
         # 窗口显示后加载消息 — 此时布局有效，scrollbar 能返回正确的 maximum
@@ -232,7 +245,16 @@ class ChatApp:
         scroll_to_bottom=False 使用滚动锚点机制：
             刷新前记录视口中点最近的消息 ID 和偏移；
             刷新后定位到该消息，若已消失则向上查找最近幸存消息。
+
+        流式期间不重建：重建会销毁流式控件（_streaming_message / thinking block），
+        后续 chunk 会追加到脱离布局的控件上，导致输出效果与最终回复丢失。
+        此时将请求延后到流结束/中止后统一执行。
         """
+        if self._streaming_message is not None:
+            self._pending_rebuild_after_stream = True
+            print("[UI] 流式期间跳过消息列表重建，延后到流结束后执行")
+            return
+
         msg_list = self._window.message_list
 
         if not scroll_to_bottom:
@@ -281,6 +303,28 @@ class ChatApp:
                 ids.append(w.message_id)
         return ids
 
+    def _post_stream_refresh(self, aborted: bool = False) -> None:
+        """
+        流结束/中止后的消息列表刷新。
+
+        - 正常结束（aborted=False）：刷新侧边栏 + 轻量同步消息 ID
+          （流式结果已显示，避免整页重建闪烁）。
+        - 流式期间若有延后的重建请求（删除/启用切换等），统一执行整页重建：
+          结束 → 滚动到底部；中止 → 保持当前位置（未完成轮次由
+          _restore_incomplete_after_rebuild 恢复）。
+        """
+        QTimer.singleShot(0, self._load_tree)
+        if self._pending_rebuild_after_stream:
+            self._pending_rebuild_after_stream = False
+            QTimer.singleShot(
+                0,
+                lambda: self._load_all_messages(
+                    scroll_to_bottom=not aborted
+                ),
+            )
+        elif not aborted:
+            QTimer.singleShot(0, self._sync_message_widget_ids)
+
     def _handle_new_conversation(self) -> None:
         """
         新建对话（多对话模式）。
@@ -301,11 +345,24 @@ class ChatApp:
 
     # ── 消息列表操作 ──────────────────────────
 
+    @staticmethod
+    def _find_stretch_index(layout) -> int:
+        """返回布局中最后一个 stretch（弹簧）项的索引；无 stretch 则返回 count。"""
+        for i in range(layout.count() - 1, -1, -1):
+            item = layout.itemAt(i)
+            if item is not None and item.spacerItem() is not None:
+                return i
+        return layout.count()
+
     def _append_message(self, msg: ChatMessage) -> None:
-        """追加一条消息到列表底部并隐藏空状态。"""
+        """追加一条消息到列表底部并隐藏空状态。
+
+        始终在末尾 stretch 之前插入（若无 stretch 则在最末尾追加），
+        保证新消息永远位于对话区底部，与 tree.json 顺序一致。
+        """
         layout = self._window.message_list.message_layout()
-        # 在 stretch 之前插入
-        layout.insertWidget(layout.count() - 1, msg)
+        stretch_idx = self._find_stretch_index(layout)
+        layout.insertWidget(stretch_idx, msg)
         self._window.message_list.show_empty_hint(False)
         # Phase 5: 注册消息以便精确滚动定位
         if msg.message_id:
@@ -314,12 +371,10 @@ class ChatApp:
     def _insert_before_last(self, widget) -> None:
         """在最后一条消息之前插入控件（用于 ThinkingBlock）。"""
         layout = self._window.message_list.message_layout()
-        count = layout.count()
-        # stretch 在末尾，倒数第二个是最后一条消息
-        if count >= 2:
-            layout.insertWidget(count - 2, widget)
-        else:
-            layout.insertWidget(0, widget)
+        stretch_idx = self._find_stretch_index(layout)
+        # stretch 前一个位置即最后一条消息；若无 stretch，取末尾
+        insert_idx = max(0, stretch_idx - 1)
+        layout.insertWidget(insert_idx, widget)
         self._window.message_list.show_empty_hint(False)
 
     def _rebuild_message_list(self, message_vms: list) -> None:
@@ -327,10 +382,15 @@ class ChatApp:
         # 记录现有 thinking 块的展开状态（按 message_id），重建后恢复；
         # 新增的 thinking 一律默认折叠（折叠状态不持久化）。
         expanded_map = self._capture_thinking_states()
+        # 捕获未完成轮次的 partial 内容（内存方案），重建后恢复
+        incomplete_state = self._capture_incomplete_state()
         self._window.message_list.clear_messages()
 
         if not message_vms:
             self._window.message_list.show_empty_hint(True)
+            # 即使无消息也要恢复未完成轮次（如删除触发重绘的边界情况）
+            if incomplete_state:
+                self._restore_incomplete_after_rebuild(incomplete_state)
             return
 
         layout = self._window.message_list.message_layout()
@@ -343,7 +403,7 @@ class ChatApp:
                 # 已显示的 thinking 保持原展开状态；新增的默认折叠
                 if vm.id in expanded_map:
                     block.set_expanded(expanded_map[vm.id])
-                layout.insertWidget(layout.count() - 1, block)
+                layout.insertWidget(self._find_stretch_index(layout), block)
                 if vm.id:
                     self._window.message_list.register_message(vm.id, block)
                 continue
@@ -354,8 +414,8 @@ class ChatApp:
                 is_thinking=getattr(vm, "is_thinking", False),
             )
             self._connect_message_signals(msg)
-            # 在 stretch 之前插入
-            layout.insertWidget(layout.count() - 1, msg)
+            # 在 stretch 之前插入（鲁棒：无 stretch 则在末尾）
+            layout.insertWidget(self._find_stretch_index(layout), msg)
             # Phase 5: 注册消息以便精确滚动定位
             if vm.id:
                 self._window.message_list.register_message(vm.id, msg)
@@ -366,6 +426,64 @@ class ChatApp:
         container.adjustSize()
 
         self._window.message_list.show_empty_hint(False)
+
+        # 重建后恢复未完成轮次的 partial 内容（若有）
+        if incomplete_state:
+            self._restore_incomplete_after_rebuild(incomplete_state)
+
+    def _capture_incomplete_state(self) -> dict | None:
+        """重绘前捕获未完成轮次的内容（内存方案，供重建后恢复）。
+
+        partial thinking/assistant 内容只存在于内存 widget，不持久化；
+        重启时 incomplete 会被软删除，无需恢复。
+        """
+        incomplete = self._incomplete_message
+        if incomplete is None:
+            return None
+        thinking = self._extract_thinking_content(incomplete)
+        return {
+            "thinking": thinking,
+            "assistant_content": incomplete.current_content,
+            "assistant_id": incomplete.message_id,
+        }
+
+    def _restore_incomplete_after_rebuild(self, state: dict) -> None:
+        """重建后恢复未完成轮次的 partial 内容（内存方案）。"""
+        layout = self._window.message_list.message_layout()
+        thinking = state.get("thinking") or ""
+        assistant_content = state.get("assistant_content") or ""
+
+        if thinking:
+            block = ThinkingBlock()
+            block.append_text(thinking)
+            layout.insertWidget(self._find_stretch_index(layout), block)
+
+        if assistant_content.strip():
+            # 场景2/3：有 partial 内容 → assistant 显示"重新生成"+"继续"
+            assistant = ChatMessage(role="assistant", content=assistant_content)
+            assistant.message_id = state.get("assistant_id", "") or ""
+            if assistant.message_id:
+                self._window.message_list.register_message(
+                    assistant.message_id, assistant
+                )
+            assistant.mark_incomplete()
+            self._connect_message_signals(assistant)
+            layout.insertWidget(self._find_stretch_index(layout), assistant)
+            self._incomplete_message = assistant
+        else:
+            # 场景1：无内容 → 在最后一条 user 消息上显示"重新发送"
+            self._incomplete_message = None
+            last_user = None
+            for i in range(layout.count()):
+                w = layout.itemAt(i).widget()
+                if isinstance(w, ChatMessage) and w.role == "user":
+                    last_user = w
+            if last_user is not None:
+                last_user.show_resend_button()
+
+        container = self._window.message_list.message_container()
+        container.updateGeometry()
+        container.adjustSize()
 
     def _capture_thinking_states(self) -> dict[str, bool]:
         """收集当前消息列表中 ThinkingBlock 的展开状态（message_id → is_expanded）。"""
@@ -418,6 +536,10 @@ class ChatApp:
         msg.remember_requested.connect(
             lambda: self._handle_remember(msg)
         )
+        msg.continue_requested.connect(
+            lambda: self._handle_continue(self._current_session_id)
+        )
+        msg.resend_requested.connect(self._handle_resend)
 
     def _on_copy_content(self, text: str) -> None:
         """复制文本到系统剪贴板。"""
@@ -438,9 +560,15 @@ class ChatApp:
         4. 清空输入区，切换到生成状态
         5. 启动流式响应
         """
-        # 中止现有流
+        # 中止现有流（会标记旧轮次为未完成）
         if self._stream_worker is not None:
             self._handle_stop()
+
+        # 清理所有标记为未完成的节点（用户已开新轮次，旧未完成是垃圾 → 软删至回收站）
+        self._ctrl.cleanup_incomplete_nodes()
+
+        # 记录本次发送文本（供未完成轮次"重新发送"用）
+        self._last_sent_text = text
 
         # ★ 插入目标决策：
         #   - 若当前会话是「新建空对话」且位于所有已启用消息之后（DFS 前序），
@@ -458,6 +586,11 @@ class ChatApp:
 
         if not text and not files:
             return
+
+        # 移除旧未完成轮次的控件（被标记的 user + 其下所有消息），
+        # 保持 UI 与 tree.json 的一致性（tree.json 已在上面 cleanup 时软删）
+        self._remove_incomplete_widgets()
+        self._incomplete_message = None
 
         # 追加用户消息
         user_msg = ChatMessage(role="user", content=text)
@@ -478,23 +611,171 @@ class ChatApp:
         self._window.input_area.set_generating(False)
         if self._streaming_message:
             self._streaming_message.finalize_stream()
+            self._streaming_message.mark_incomplete()
+            # 保留引用供"继续生成"
+            self._incomplete_message = self._streaming_message
             self._streaming_message = None
         if self._stream_worker:
             self._stream_worker.request_abort()
+        # 标记未完成轮次 + 处理三种停止场景的 UI
+        self._mark_current_turn_incomplete()
+
+    def _mark_current_turn_incomplete(self) -> None:
+        """停止生成后：标记用户消息节点未完成，并按三种场景调整 UI。
+
+        场景1（首字延迟停止）：无输出内容 → 用户消息显示"重新发送"，隐藏空 assistant。
+        场景2/3（thinking / assistant 中断）：有部分内容 → assistant 已由
+        mark_incomplete() 显示"重新生成"+"继续"。
+        """
+        session_id = self._current_session_id
+        # 1. 标记用户消息节点为未完成（后续自动软删除）
+        user_id = self._ctrl.find_latest_user_message_id(session_id) if session_id else None
+        if user_id:
+            self._ctrl.mark_incomplete(user_id)
+            self._incomplete_user_id = user_id
+            # 刷新侧边栏：tree.json 已更新 user 节点，侧边栏需同步显示
+            QTimer.singleShot(0, self._load_tree)
+
+        # 2. 场景1：首字延迟停止（无内容）
+        incomplete = self._incomplete_message
+        if incomplete is None or not incomplete.current_content:
+            self._handle_first_byte_stop_scenario(incomplete)
+
+    def _handle_first_byte_stop_scenario(self, incomplete: ChatMessage | None) -> None:
+        """首字延迟停止：隐藏空 assistant widget，在用户消息上显示"重新发送"。"""
+        if incomplete is not None:
+            incomplete.setVisible(False)
+        self._show_resend_on_user_message()
+
+    def _show_resend_on_user_message(self) -> None:
+        """在当前轮次（未同步 ID）的用户消息控件上显示"重新发送"按钮。"""
+        layout = self._window.message_list.message_layout()
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if isinstance(w, ChatMessage) and w.role == "user" and not w.message_id:
+                w.show_resend_button()
+                break
 
     def _handle_regenerate(self, session_id: str) -> None:
         """
         重新生成助手回复。
 
-        创建新的 assistant 消息气泡，
-        启动流式 regenerate。
+        若当前是未完成轮次：丢弃部分内容，重新回答该用户消息；
+        否则走正常 regenerate。
         """
         if not session_id:
+            return
+        # 未完成轮次：重新回答该用户消息（清除标记 + 移除部分内容 + 重发）
+        if self._incomplete_message is not None:
+            self._resend_current_turn()
             return
 
         self._window.input_area.set_generating(True)
 
         self._start_regenerate_stream(session_id)
+
+    def _handle_continue(self, session_id: str) -> None:
+        """继续生成未完成的助手消息（DeepSeek Beta 前缀续写）。"""
+        if not session_id:
+            return
+        incomplete = self._incomplete_message
+        if incomplete is None:
+            return
+        partial_content = incomplete.current_content
+        partial_thinking = self._extract_thinking_content(incomplete)
+        self._incomplete_message = None
+        self._incomplete_user_id = None
+        # 被"继续"抢救：清除用户消息的未完成标记（防止被自动清理）
+        user_id = self._ctrl.find_latest_user_message_id(session_id)
+        if user_id:
+            self._ctrl.clear_incomplete_mark(user_id)
+        self._window.input_area.set_generating(True)
+        self._start_continue_stream(
+            session_id, partial_content, partial_thinking, incomplete
+        )
+
+    def _handle_resend(self, text: str) -> None:
+        """重新发送（首字延迟停止后）：丢弃未完成轮次，重新发送该用户消息。"""
+        if text:
+            self._last_sent_text = text
+        self._resend_current_turn()
+
+    def _resend_current_turn(self) -> None:
+        """丢弃未完成轮次（软删 user 节点 + 移除 widget），重新发送该用户消息。"""
+        session_id = self._current_session_id
+        user_text = self._last_sent_text or ""
+        # 软删旧 user 节点（未完成标记的）→ 进回收站
+        user_id = self._ctrl.find_latest_user_message_id(session_id) if session_id else None
+        if user_id:
+            self._ctrl.on_soft_delete_node(user_id)
+        # 移除未完成轮次的 widget（user + thinking + 部分 assistant）
+        self._remove_incomplete_widgets()
+        self._incomplete_message = None
+        if user_text:
+            self._handle_send(user_text, [])
+
+    def _remove_incomplete_widgets(self) -> None:
+        """移除当前未完成轮次的控件（user + thinking + 部分 assistant），保持 UI 与 tree.json 一致。
+
+        删除区间：从"未同步 ID 的 user 消息"到"_incomplete_message"（闭区间）。
+        只影响当前未完成轮次，不动之前轮的控件。
+        """
+        layout = self._window.message_list.message_layout()
+        incomplete = self._incomplete_message
+
+        assistant_idx = -1
+        for i in range(layout.count()):
+            if layout.itemAt(i).widget() is incomplete:
+                assistant_idx = i
+                break
+        user_idx = -1
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if isinstance(w, ChatMessage) and w.role == "user":
+                # 匹配：未同步 ID（首次停止）或重绘后带真实 ID（_incomplete_user_id）
+                if not w.message_id or (
+                    self._incomplete_user_id
+                    and w.message_id == self._incomplete_user_id
+                ):
+                    user_idx = i
+
+        # 都找不到 → 无未完成轮次可移除
+        if assistant_idx < 0 and user_idx < 0:
+            return
+        if user_idx < 0:
+            user_idx = assistant_idx
+        if assistant_idx < 0:
+            assistant_idx = user_idx
+
+        start = min(user_idx, assistant_idx)
+        end = max(user_idx, assistant_idx)
+        to_remove: list = []
+        # 从后往前 takeAt 移出布局（避免索引漂移），再隐藏+删除
+        for i in range(end, start - 1, -1):
+            item = layout.takeAt(i)
+            if item is not None and item.widget() is not None:
+                to_remove.append(item.widget())
+        for w in to_remove:
+            w.setVisible(False)
+            w.deleteLater()
+        self._incomplete_user_id = None
+        self._window.message_list.message_container().updateGeometry()
+
+    def _extract_thinking_content(self, target_msg: ChatMessage) -> str:
+        """从消息列表中提取紧邻 target_msg 之前最近一个 ThinkingBlock 的内容。"""
+        layout = self._window.message_list.message_layout()
+        target_index = -1
+        for i in range(layout.count()):
+            if layout.itemAt(i).widget() is target_msg:
+                target_index = i
+                break
+        if target_index < 0:
+            return ""
+        for i in range(target_index - 1, -1, -1):
+            w = layout.itemAt(i).widget()
+            if isinstance(w, ThinkingBlock):
+                return w.current_content
+        return ""
 
     # ── 流式引擎 ──────────────────────────────
 
@@ -509,6 +790,8 @@ class ChatApp:
         # 创建 assistant 消息气泡
         # ★ 本轮对话首次输出时强制滚动到底部一次（标志位，见 on_chunk）
         self._first_chunk_scrolled = False
+        # 重置流式期间的延迟重建标志（防上一轮残留导致重复重建）
+        self._pending_rebuild_after_stream = False
         assistant_msg = ChatMessage(role="assistant", content="")
         assistant_msg.start_stream()
         self._streaming_message = assistant_msg
@@ -561,12 +844,9 @@ class ChatApp:
             if self._streaming_message:
                 self._streaming_message.finalize_stream()
                 self._streaming_message = None
-            print("[DBG] on_finished: calling _cleanup_stream_thread")
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
-            QTimer.singleShot(0, self._load_tree)
-            # 流结束后仅轻量同步消息 ID，不整页重建（流式结果已显示，避免页面重绘闪烁）
-            QTimer.singleShot(0, self._sync_message_widget_ids)
+            self._post_stream_refresh(aborted=False)
 
         def on_error(error_msg: str):
             """流出错。"""
@@ -577,10 +857,13 @@ class ChatApp:
             """流被用户中止。"""
             if self._streaming_message:
                 self._streaming_message.finalize_stream()
+                self._streaming_message.mark_incomplete()
+                # 保留引用供"继续生成"
+                self._incomplete_message = self._streaming_message
                 self._streaming_message = None
-            print("[DBG] on_finished: calling _cleanup_stream_thread")
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
+            self._post_stream_refresh(aborted=True)
 
         # ── 创建 StreamRelay 桥接器（主线程 QObject）────────────
         # Worker 信号 → Relay Slot（跨线程，有 QObject receiver →
@@ -627,10 +910,6 @@ class ChatApp:
             Qt.ConnectionType.DirectConnection,
         )
 
-        # [DBG] 生命周期定位：记录 thread/worker 何时被销毁
-        stream_thread.destroyed.connect(lambda: print("[DBG] QThread DESTROYED"))
-        stream_worker.destroyed.connect(lambda: print("[DBG] AsyncStreamWorker DESTROYED"))
-
         stream_thread.start()
 
     def _start_regenerate_stream(self, session_id: str) -> None:
@@ -640,6 +919,8 @@ class ChatApp:
         """
         # ★ 本轮对话首次输出时强制滚动到底部一次（标志位，见 on_chunk）
         self._first_chunk_scrolled = False
+        # 重置流式期间的延迟重建标志（防上一轮残留导致重复重建）
+        self._pending_rebuild_after_stream = False
         assistant_msg = ChatMessage(role="assistant", content="")
         assistant_msg.start_stream()
         self._streaming_message = assistant_msg
@@ -686,12 +967,9 @@ class ChatApp:
             if self._streaming_message:
                 self._streaming_message.finalize_stream()
                 self._streaming_message = None
-            print("[DBG] on_finished: calling _cleanup_stream_thread")
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
-            QTimer.singleShot(0, self._load_tree)
-            # 流结束后仅轻量同步消息 ID，不整页重建（流式结果已显示，避免页面重绘闪烁）
-            QTimer.singleShot(0, self._sync_message_widget_ids)
+            self._post_stream_refresh(aborted=False)
 
         def on_error(error_msg: str):
             print(f"[UI] Regenerate error: {error_msg}")
@@ -700,10 +978,13 @@ class ChatApp:
         def on_aborted():
             if self._streaming_message:
                 self._streaming_message.finalize_stream()
+                self._streaming_message.mark_incomplete()
+                # 保留引用供"继续生成"
+                self._incomplete_message = self._streaming_message
                 self._streaming_message = None
-            print("[DBG] on_finished: calling _cleanup_stream_thread")
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
+            self._post_stream_refresh(aborted=True)
 
         # ── StreamRelay 桥接（与 _start_stream 相同模式）──
         relay = StreamRelay()
@@ -742,9 +1023,116 @@ class ChatApp:
             Qt.ConnectionType.DirectConnection,
         )
 
-        # [DBG] 生命周期定位：记录 thread/worker 何时被销毁
-        stream_thread.destroyed.connect(lambda: print("[DBG] QThread DESTROYED"))
-        stream_worker.destroyed.connect(lambda: print("[DBG] AsyncStreamWorker DESTROYED"))
+        stream_thread.start()
+
+    def _start_continue_stream(
+        self,
+        session_id: str,
+        partial_content: str,
+        partial_thinking: str,
+        target_msg: ChatMessage,
+    ) -> None:
+        """
+        启动继续生成流（追加到已有消息控件，不新建气泡）。
+
+        复用 AsyncStreamWorker 在后台线程迭代
+        controller.on_continue_message() 的 async generator。
+        """
+        target_msg.restart_stream_from(partial_content)
+        self._streaming_message = target_msg
+        # 本轮对话首次输出时强制滚动到底部一次（标志位）
+        self._first_chunk_scrolled = False
+        # 重置流式期间的延迟重建标志（防上一轮残留导致重复重建）
+        self._pending_rebuild_after_stream = False
+
+        # thinking block 引用（续写通常不再出 thinking，但兼容）
+        thinking_ref: list = [None]
+
+        stream_thread = QThread()
+        stream_worker = AsyncStreamWorker()
+        stream_worker.moveToThread(stream_thread)
+        self._stream_thread = stream_thread
+        self._stream_worker = stream_worker
+
+        def on_chunk(delta: str, is_done: bool, chunk_type: str, _msg_id: str):
+            if not self._first_chunk_scrolled:
+                self._first_chunk_scrolled = True
+                self._window.message_list.force_scroll_to_bottom()
+
+            if chunk_type == "thinking":
+                if thinking_ref[0] is None:
+                    thinking_ref[0] = ThinkingBlock()
+                    self._insert_before_last(thinking_ref[0])
+                thinking_ref[0].append_text(delta)
+                thinking_ref[0].repaint()
+            else:
+                if self._streaming_message:
+                    self._streaming_message.append_stream(delta)
+                    if _msg_id:
+                        self._streaming_message.message_id = _msg_id
+                        self._window.message_list.register_message(
+                            _msg_id, self._streaming_message
+                        )
+                    self._streaming_message.repaint()
+            self._window.message_list.scroll_to_bottom()
+
+        def on_finished():
+            if self._stream_worker is None:
+                return
+            if self._streaming_message:
+                self._streaming_message.finalize_stream()
+                self._streaming_message = None
+            self._window.input_area.set_generating(False)
+            self._cleanup_stream_thread()
+            self._post_stream_refresh(aborted=False)
+
+        def on_error(error_msg: str):
+            print(f"[UI] Continue error: {error_msg}")
+            on_finished()
+
+        def on_aborted():
+            if self._streaming_message:
+                self._streaming_message.finalize_stream()
+                self._streaming_message.mark_incomplete()
+                self._incomplete_message = self._streaming_message
+                self._streaming_message = None
+            self._window.input_area.set_generating(False)
+            self._cleanup_stream_thread()
+            self._post_stream_refresh(aborted=True)
+
+        relay = StreamRelay()
+        self._stream_relay = relay
+        stream_worker.chunk_ready.connect(
+            relay._on_chunk, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_finished.connect(
+            relay._on_finished, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_error.connect(
+            relay._on_error, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_aborted.connect(
+            relay._on_aborted, Qt.ConnectionType.QueuedConnection
+        )
+        relay.chunk_ready.connect(on_chunk)
+        relay.stream_finished.connect(on_finished)
+        relay.stream_error.connect(on_error)
+        relay.stream_aborted.connect(on_aborted)
+        stream_thread.finished.connect(
+            relay._on_finished, Qt.ConnectionType.QueuedConnection
+        )
+
+        _ctrl = self._ctrl
+        # ★ 必须 DirectConnection：确保 run_stream 在 worker 线程执行
+        stream_thread.started.connect(
+            lambda: stream_worker.run_stream(
+                _ctrl.on_continue_message,
+                session_id,
+                partial_content,
+                partial_thinking,
+            ),
+            Qt.ConnectionType.DirectConnection,
+        )
 
         stream_thread.start()
 
@@ -780,10 +1168,6 @@ class ChatApp:
         worker = self._stream_worker
         thread = self._stream_thread
         relay = self._stream_relay
-
-        # [DBG] 生命周期定位：清理时线程是否仍在运行？
-        if thread is not None:
-            print(f"[DBG] cleanup: thread.isRunning()={thread.isRunning()}")
 
         # 置空引用，防止重入。
         # ⚠️ 注意：self._stream_thread 暂不置空 —— 必须保留引用直到线程 finished，
@@ -829,7 +1213,6 @@ class ChatApp:
 
             thread.finished.connect(_finalize)
             thread.quit()
-            print(f"[DBG] cleanup: after quit(), isRunning()={thread.isRunning()}")
 
     # ── 树形结构操作 ──────────────────────────
 
