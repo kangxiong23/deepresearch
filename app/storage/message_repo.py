@@ -98,6 +98,19 @@ class MessageRepo:
                 "DELETE FROM messages WHERE id = ?", (message_id,)
             )
 
+    def delete_messages_by_ids(self, message_ids: list[str]) -> int:
+        """按 ID 批量删除消息（分支删除时物理清理孤儿行）。"""
+        if not message_ids:
+            return 0
+        conn = get_connection()
+        with conn:
+            placeholders = ",".join("?" for _ in message_ids)
+            cur = conn.execute(
+                f"DELETE FROM messages WHERE id IN ({placeholders})",
+                message_ids,
+            )
+            return cur.rowcount
+
     def delete_messages_by_conversation(self, conversation_id: str) -> int:
         """
         删除指定对话 ID 下的所有消息（彻底删除时使用）。
