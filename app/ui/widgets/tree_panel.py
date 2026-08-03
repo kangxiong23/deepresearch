@@ -64,6 +64,7 @@ ROLE_TIMESTAMP = Qt.ItemDataRole.UserRole + 7  # str — formatted time
 ROLE_ROLE = Qt.ItemDataRole.UserRole + 8  # str — message role
 ROLE_PREVIEW = Qt.ItemDataRole.UserRole + 9  # str — message preview
 ROLE_IS_SELECTED = Qt.ItemDataRole.UserRole + 10  # bool — 多选模式选中
+ROLE_IS_MODIFIED = Qt.ItemDataRole.UserRole + 11  # bool — 被修改节点（分叉点后继，3.6 拖拽）
 
 # ──────────────────────────────────────────────
 # 节点类型图标映射
@@ -784,9 +785,59 @@ class _TreeView(QTreeView):
                     ",".join(all_dragged_ids), parent_id, position
                 )
             else:
-                self.drop_occurred.emit(dragged_id, parent_id, position)
+                prev_id, next_id = self._drop_sibling_context(
+                    parent_id, position
+                )
+                self.drop_occurred.emit(
+                    dragged_id, parent_id, position, prev_id, next_id
+                )
         else:
             event.ignore()
+
+    def _drop_sibling_context(
+        self, parent_id: str, position: object
+    ) -> tuple[str, str]:
+        """
+        计算目标插入点前后的消息节点 ID（分支感知拖拽判定用，3.6）。
+
+        parent_id 为对话时，从模型取该对话下消息兄弟列表；
+        position 为插入索引（None = 末尾）。返回 (prev_id, next_id)，
+        不存在时为空串。
+        """
+        if not parent_id or self.model() is None:
+            return ("", "")
+        parent_item: QStandardItem | None = None
+
+        def find_item(item: QStandardItem) -> bool:
+            """递归查找目标节点（对话可能嵌套在文件夹下）。"""
+            nonlocal parent_item
+            if item.data(ROLE_NODE_ID) == parent_id:
+                parent_item = item
+                return True
+            for i in range(item.rowCount()):
+                if find_item(item.child(i)):
+                    return True
+            return False
+
+        for row in range(self.model().rowCount()):
+            top = self.model().item(row)
+            if top is not None and find_item(top):
+                break
+        if parent_item is None:
+            return ("", "")
+        count = parent_item.rowCount()
+        pos = count if position is None else min(max(int(position), 0), count)
+        prev_id = ""
+        next_id = ""
+        if pos > 0:
+            p_item = parent_item.child(pos - 1)
+            if p_item is not None:
+                prev_id = p_item.data(ROLE_NODE_ID) or ""
+        if pos < count:
+            n_item = parent_item.child(pos)
+            if n_item is not None:
+                next_id = n_item.data(ROLE_NODE_ID) or ""
+        return (prev_id, next_id)
 
     # ──────────────────────────────────────────
     # 放置验证逻辑
@@ -1209,7 +1260,9 @@ class TreePanel(QWidget):
     rename_node = Signal(str)
     delete_node = Signal(str)
     toggle_enabled = Signal(str)
-    move_node = Signal(str, str, object)  # node_id, target_parent_id, position
+    move_node = Signal(str, str, object, str, str)  # node_id, target_parent_id, position, prev_id, next_id
+    # 说明: prev_id / next_id 为目标插入点前后的消息节点 ID（仅消息链内插入有效,
+    #       空串表示无;供分支感知拖拽判定"分叉点与被修改节点之间"等场景,3.6）
     manage_context = Signal(str)
     attach_file = Signal(str)
 
@@ -1434,6 +1487,14 @@ class TreePanel(QWidget):
     @property
     def ops_locked(self) -> bool:
         return self._ops_locked
+
+    def show_rejected_hint(self, message: str) -> None:
+        """拖拽被拒绝时的轻量提示（QToolTip 显示在树视图中心）。"""
+        from PySide6.QtWidgets import QToolTip
+        pos = self._tree_view.viewport().rect().center()
+        QToolTip.showText(
+            self._tree_view.viewport().mapToGlobal(pos), message, self._tree_view
+        )
 
     def set_edited_node(self, node_id: str) -> None:
         """修改状态下将被修改节点标题置为半透明（5.1.4）。"""
@@ -1675,6 +1736,7 @@ class TreePanel(QWidget):
         item.setData(node.updated_at, ROLE_TIMESTAMP)
         item.setData(node.role, ROLE_ROLE)
         item.setData(node.preview, ROLE_PREVIEW)
+        item.setData(getattr(node, "is_modified", False), ROLE_IS_MODIFIED)
 
         # ── 文本颜色 ──────────────────────────────
         item.setForeground(QBrush(QColor(Colors.TEXT_SECONDARY)))
@@ -1894,14 +1956,22 @@ class TreePanel(QWidget):
         else:
             self.toggle_enabled.emit(node_id)
 
-    def _on_drop(self, dragged_id: str, target_parent_id: str, position: object) -> None:
+    def _on_drop(
+        self,
+        dragged_id: str,
+        target_parent_id: str,
+        position: object,
+        prev_id: str = "",
+        next_id: str = "",
+    ) -> None:
         """
         拖拽放置完成。
         发射 move_node 信号让上层处理业务逻辑。
         target_parent_id 为空串时表示根级。
         position 为 None 时表示追加到末尾。
+        prev_id/next_id 为目标插入点前后节点（分支感知拖拽，3.6）。
         """
-        self.move_node.emit(dragged_id, target_parent_id, position)
+        self.move_node.emit(dragged_id, target_parent_id, position, prev_id, next_id)
 
     def _on_batch_drop(self, dragged_ids_str: str, target_parent_id: str, position: object) -> None:
         """

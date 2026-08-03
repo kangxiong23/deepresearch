@@ -475,6 +475,179 @@ class ConversationService:
             return False
         return self._tree.find_fork_point_of(node) is not None
 
+    # ──────────────────────────────────────────
+    # 分支感知拖拽（spec 3.6）
+    # ──────────────────────────────────────────
+
+    def move_message_with_fork(
+        self,
+        dragged_id: str,
+        new_parent_id: str | None,
+        position: int | None,
+        prev_id: str | None = None,
+        next_id: str | None = None,
+    ) -> bool:
+        """
+        分支感知的消息拖拽移动（3.6 组合表）。
+
+        prev_id/next_id：目标插入点前后的消息节点 ID（TreePanel 计算；
+        仅在目标位于消息链中时有效，否则为 None）。
+
+        处理矩阵：
+        - 被修改节点（同对话）→ ❌ 拒绝（返回 False，拍板 3）
+        - 拖到"分叉点与被修改节点之间" → 🔀 插入节点成为新分叉点，
+          原分叉点退化，分支数据迁移（3.6.1 原则 3）
+        - 分叉点移走 → ✅ 数据原地保留，re-anchor 到补位后的新前驱（3.6.2）
+        - 跨对话被修改节点 → 🔄 整体迁移（X 及尾链，拍板 2；
+          目标分叉点 = 目标位置前驱，拍板 1）
+        - 普通节点 → ✅ 纯移动（同步时分支记录自动更新）
+        - 对话/文件夹 → ✅ 纯移动（分支数据按对话 ID 保留）
+        """
+        node = self._tree.get_node(dragged_id)
+        if node is None:
+            return False
+        # 对话 / 文件夹：纯移动（分支数据按对话 ID 保留，不随节点移动）
+        if not isinstance(node, MessageNode):
+            self._tree.move_node(dragged_id, new_parent_id, position)
+            return True
+
+        dragged_conv = node.parent_id
+        is_modified = self._tree.find_fork_point_of(node) is not None
+        target_conv = new_parent_id
+
+        # 被修改节点（同对话）→ 全拒绝（3.6.1，拍板 3）
+        if is_modified and target_conv == dragged_conv:
+            return False
+
+        # 目标位置上下文："之间" = 前驱是分叉点且后继是它的被修改节点
+        between_fork_id = self._between_fork_id(prev_id, next_id)
+
+        if between_fork_id is not None:
+            # 🔀 "之间"插入：插入节点成为新分叉点，原分叉点退化（3.6.1 原则 3）
+            if is_modified:
+                # 跨对话被修改节点 → 🔄 整体迁移到当前分叉
+                return self._transfer_modified_group(
+                    node, between_fork_id, target_conv, position
+                )
+            if node.is_fork_point:
+                # 分叉点（其他分叉）移入"之间"：原数据 re-anchor 后继承目标分叉数据
+                self._reanchor_fork_point_after_move(node, dragged_conv)
+            self._move_message_node(dragged_id, target_conv, position)
+            self._branch_svc.migrate_branch_data(
+                target_conv, between_fork_id, dragged_id
+            )
+            return True
+
+        # 非"之间"位置
+        if is_modified:
+            # 跨对话被修改节点 → 🔄 整体迁移（拍板 1：前驱成为新分叉点；
+            # 无前驱 → 对话节点承接）
+            target_fork = prev_id if prev_id else target_conv
+            return self._transfer_modified_group(
+                node, target_fork, target_conv, position
+            )
+
+        if node.is_fork_point:
+            # 分叉点移走：数据原地保留，re-anchor 到补位后的新前驱（3.6.2）
+            self._reanchor_fork_point_after_move(node, dragged_conv)
+            self._move_message_node(dragged_id, target_conv, position)
+            return True
+
+        # 普通消息节点：纯移动
+        self._move_message_node(dragged_id, target_conv, position)
+        return True
+
+    def _between_fork_id(self, prev_id: str | None, next_id: str | None) -> str | None:
+        """
+        判定插入点是否位于"分叉点与被修改节点之间"（3.6.1 目的地）。
+
+        条件：插入点前驱是分叉点 F，且后继是 F 的被修改节点。
+        """
+        if not prev_id or not next_id:
+            return None
+        prev = self._tree.get_node(prev_id)
+        if prev is None or not prev.is_fork_point:
+            return None
+        next_node = self._tree.get_node(next_id)
+        if next_node is None:
+            return None
+        next_fp = self._tree.find_fork_point_of(next_node)
+        if next_fp is not None and next_fp[0] == prev_id:
+            return prev_id
+        return None
+
+    def _move_message_node(
+        self, node_id: str, target_conv: str | None, position: int | None
+    ) -> None:
+        """移动消息节点并同步分支数据（脏标记由 move_node 自动完成）。"""
+        self._tree.move_node(node_id, target_conv, position)
+        # 移动改变了链结构：刷新当前分支记录（对涉及对话统一同步）
+        self._branch_svc.sync_dirty_conversations()
+
+    def _reanchor_fork_point_after_move(
+        self, fork_node: MessageNode, source_conv: str
+    ) -> None:
+        """分叉点被移走：分支数据原地保留，re-anchor 到补位后的新前驱（3.6.2）。
+
+        新分叉点 = 被修改节点的前驱（补位后紧挨着被修改节点的节点）；
+        分叉点是第一条消息时 → 对话节点。
+        """
+        chain = self._tree.get_conversation_chain(source_conv)
+        pos = next(
+            (i for i, n in enumerate(chain) if n.id == fork_node.id), None
+        )
+        if pos is None:
+            return
+        new_fork_id = chain[pos - 1].id if pos > 0 else source_conv
+        self._branch_svc.migrate_branch_data(source_conv, fork_node.id, new_fork_id)
+
+    def _transfer_modified_group(
+        self,
+        node: MessageNode,
+        target_fork_id: str,
+        target_conv: str,
+        position: int | None,
+    ) -> bool:
+        """
+        跨对话被修改节点整体迁移（3.6.1 🔄，拍板 1/2）。
+
+        - X 及其后同分支尾链一起移入目标对话（拍板 2）
+        - 目标分叉点 = 目标位置前驱（普通位置时前驱成为新分叉点，
+          拍板 1；"之间"时为该分叉点）
+        - 源对话链回退到 X 之前；分支数据整体迁移到目标分叉点名下
+        """
+        source_conv = node.parent_id
+        fp = self._tree.find_fork_point_of(node)
+        if fp is None:
+            return False
+        fork_id, _kind = fp
+
+        src_chain = self._tree.get_conversation_chain(source_conv)
+        x_pos = next(
+            (i for i, n in enumerate(src_chain) if n.id == node.id), None
+        )
+        if x_pos is None:
+            return False
+        tail = src_chain[x_pos:]  # X 及尾链（树副本，携带分叉字段）
+
+        # 1. 源对话链回退到 X 之前
+        self._tree.replace_conversation_chain(source_conv, src_chain[:x_pos])
+        # 2. 分支数据整体迁移（源 F → 目标分叉点，源侧记录删除）
+        self._branch_svc.transfer_branch_group(
+            source_conv, fork_id, target_conv, target_fork_id
+        )
+        # 3. 目标对话链：X + 尾链插入目标位置
+        tgt_chain = self._tree.get_conversation_chain(target_conv)
+        insert_pos = position if position is not None else len(tgt_chain)
+        insert_pos = min(max(insert_pos, 0), len(tgt_chain))
+        new_tgt_chain = (
+            tgt_chain[:insert_pos] + tail + tgt_chain[insert_pos:]
+        )
+        self._tree.replace_conversation_chain(target_conv, new_tgt_chain)
+        # 4. 统一同步（刷新目标对话所有分叉点的当前分支记录）+ 清脏
+        self._branch_svc.sync_dirty_conversations()
+        return True
+
     def get_fork_info_map(self) -> dict[str, tuple[str, int, int, str]]:
         """
         返回全部"被修改节点"的分叉展示信息。

@@ -1613,16 +1613,55 @@ class ChatApp:
         """刷新多对话模式消息列表，保持滚动位置不变。"""
         self._load_all_messages(scroll_to_bottom=False)
 
-    def _on_tree_move(self, node_id: str, target_parent_id: str, position: object) -> None:
+    def _on_tree_move(
+        self,
+        node_id: str,
+        target_parent_id: str,
+        position: object,
+        prev_id: str = "",
+        next_id: str = "",
+    ) -> None:
         """
-        拖拽放置 → 移动节点到目标位置。
+        拖拽放置 → 移动节点到目标位置（分支感知，3.6）。
+
         target_parent_id 为空时移到根级，position 为 None 时追加到末尾。
+        prev_id/next_id 为目标插入点前后节点（分支判定用）。
         """
         if not self._can_mutate_tree():
             return
         parent = target_parent_id if target_parent_id else None
         print(f"[UI] Tree move: {node_id} -> parent={parent}, pos={position}")
-        self._ctrl.on_move_node(node_id, parent, position)
+
+        # 跨对话被修改节点：整体迁移确认（3.6.4）
+        node = self._ctrl.get_node(node_id)
+        if (
+            node is not None
+            and getattr(node, "node_type", "") == "message"
+            and parent is not None
+            and node.parent_id != parent
+            and self._ctrl.is_modified_node(node_id)
+        ):
+            box = QMessageBox(self._window)
+            box.setWindowTitle("跨对话迁移")
+            box.setText(
+                "该节点及其所有分支历史将整体迁移到当前对话。\n\n"
+                "源对话中该节点之后的消息将随之一同移动。确定继续吗？"
+            )
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                return
+
+        ok = self._ctrl.on_move_node_branch_aware(
+            node_id, parent, position, prev_id or None, next_id or None
+        )
+        if not ok:
+            # 被拒绝（3.6：被修改节点同对话移动等）→ 轻量提示
+            self._window.sidebar.tree_panel.show_rejected_hint(
+                "被修改节点不可在同一对话内移动"
+            )
+            return
         QTimer.singleShot(0, self._load_tree)
         # 移动后静默刷新消息列表（父级变化可能影响可见性）
         QTimer.singleShot(50, lambda: self._load_all_messages(scroll_to_bottom=False))

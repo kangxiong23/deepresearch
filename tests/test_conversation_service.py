@@ -1009,5 +1009,235 @@ class TestForkIntegration(unittest.TestCase):
         )
 
 
+# ──────────────────────────────────────────────
+# P4: 分支感知拖拽测试（3.6 组合表）
+# ──────────────────────────────────────────────
+
+class TestForkDragDrop(unittest.TestCase):
+    """move_message_with_fork 的分支感知拖拽处理。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmpdir = tempfile.TemporaryDirectory()
+        cls._base = Path(cls._tmpdir.name)
+        cls._scope = ConfigScope(
+            DB_PATH=str(cls._base / "test.db"),
+            TREE_STORE_PATH=str(cls._base / "tree"),
+            CONTEXT_STORE_PATH=str(cls._base / "context"),
+        )
+        cls._scope.__enter__()
+
+        from app.storage.database import initialize_database
+        from app.core.branch_service import BranchService
+        from app.storage.branch_store import BranchStore
+        initialize_database()
+
+        cls.tree_store = TreeStore()
+        cls.message_repo = MessageRepo()
+        cls.context_store = ContextStore()
+        cls.context_service = ContextService(
+            message_repo=cls.message_repo,
+            context_store=cls.context_store,
+            tree_store=cls.tree_store,
+        )
+        cls.branch_store = BranchStore()
+        cls.branch_service = BranchService(
+            tree_store=cls.tree_store,
+            branch_store=cls.branch_store,
+            message_repo=cls.message_repo,
+        )
+        cls.svc = ConversationService(
+            message_repo=cls.message_repo,
+            tree_store=cls.tree_store,
+            llm_client=_FakeLLM(),
+            context_service=cls.context_service,
+            search_service=_FakeSearch(),
+            file_service=_FakeFile(),
+            branch_service=cls.branch_service,
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._scope.__exit__(None, None, None)
+        cls._tmpdir.cleanup()
+
+    def setUp(self) -> None:
+        from app.storage.models import TreeRoot
+        from app.storage.database import get_connection
+        self.tree_store._root = TreeRoot(version="1.0", nodes=[])
+        self.tree_store._rebuild_cache()
+        root = FolderNode(
+            id="root", parent_id=None, sort_order=0, enabled="some",
+            title="未分类",
+            created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
+        )
+        self.tree_store._root.nodes.append(root)
+        self.tree_store._rebuild_cache()
+        self.tree_store._save_tree(self.tree_store._root)
+        self.tree_store._save_trash([])
+        conn = get_connection()
+        with conn:
+            conn.execute("DELETE FROM branch_nodes")
+            conn.execute("DELETE FROM fork_nodes")
+            conn.execute("DELETE FROM messages")
+
+        for conv_id in ("conv", "conv2"):
+            self.tree_store.create_node(ConversationNode(
+                id=conv_id, parent_id="root", title=conv_id,
+            ))
+            for node_id, role, content in [
+                ("u1", Role.USER, "问题一"), ("a1", Role.ASSISTANT, "回答一"),
+                ("u2", Role.USER, "问题二"), ("a2", Role.ASSISTANT, "回答二"),
+            ]:
+                nid = f"{conv_id}-{node_id}"
+                self.tree_store.create_node(MessageNode(
+                    id=nid, parent_id=conv_id, message_id=nid,
+                    role=role.value, title=f"{role.value}: {content}",
+                    preview=content,
+                ))
+                self.message_repo.save_message(Message(
+                    id=nid, conversation_id=conv_id, role=role, content=content,
+                ))
+        self.tree_store.clear_dirty()
+
+    def _chain(self, conv_id: str) -> list[str]:
+        return [n.id for n in self.tree_store.get_conversation_chain(conv_id)]
+
+    def _drain(self, agen) -> list:
+        async def _collect():
+            out = []
+            async for c in agen:
+                out.append(c)
+            return out
+        import asyncio
+        return asyncio.run(_collect())
+
+    def _make_fork(self, conv_id: str) -> None:
+        """在 conv 的 a2 上重新生成 → 分叉点 = 该对话的 u2。"""
+        self._drain(self.svc.regenerate_message(conv_id, f"{conv_id}-a2"))
+
+    # ── 普通移动 ──────────────────────────────
+
+    def test_plain_move(self) -> None:
+        """普通消息节点移动：纯移动，无分叉影响。"""
+        ok = self.svc.move_message_with_fork("conv-u1", "conv", 2)
+        self.assertTrue(ok)
+        self.assertEqual(self._chain("conv"), ["conv-a1", "conv-u2", "conv-u1", "conv-a2"])
+
+    def test_modified_node_same_conversation_rejected(self) -> None:
+        """被修改节点（同对话内）→ 拒绝（3.6.1，拍板 3）。"""
+        self._make_fork("conv")  # 分叉点 conv-u2;被修改节点 = 新 a
+        new_a = self._chain("conv")[-1]
+        ok = self.svc.move_message_with_fork(new_a, "conv", 0)
+        self.assertFalse(ok)
+        # 树未变
+        self.assertEqual(self._chain("conv")[-1], new_a)
+
+    # ── "之间"插入 ────────────────────────────
+
+    def test_drop_between_makes_new_fork_point(self) -> None:
+        """拖普通节点到分叉点与被修改节点之间 → 新节点成为分叉点（原则 3）。"""
+        self._make_fork("conv")
+        new_a = self._chain("conv")[-1]
+        # 把 conv-u1 拖到 conv-u2(分叉点) 与 new_a(被修改节点) 之间
+        ok = self.svc.move_message_with_fork(
+            "conv-u1", "conv", 2, prev_id="conv-u2", next_id=new_a
+        )
+        self.assertTrue(ok)
+        # 新链 = [a1, u2, u1, new_a];u1 成为分叉点,u2 退化
+        chain = self._chain("conv")
+        self.assertEqual(chain, ["conv-a1", "conv-u2", "conv-u1", new_a])
+        u1 = self.tree_store.get_node("conv-u1")
+        self.assertTrue(u1.is_fork_point)
+        self.assertEqual(u1.fork_branch_count, 2)
+        self.assertFalse(self.tree_store.get_node("conv-u2").is_fork_point)
+        # 分支数据迁移:分支 0 = [u1, u2, a2]?——原 u2 名下分支 re-anchor 到 u1
+        branches = self.branch_store.get_all_branches("conv-u1")
+        # 原分支 0 = [u2, a2] → [u1, a2];原分支 1 = [u2, new_a] → [u1, new_a]
+        self.assertEqual(branches[0], ["conv-u1", "conv-a2"])
+        self.assertEqual(branches[1], ["conv-u1", new_a])
+
+    # ── 分叉点移走 ────────────────────────────
+
+    def test_fork_point_moved_away_reanchors(self) -> None:
+        """分叉点移走 → 数据原地保留,re-anchor 到补位后的新前驱（3.6.2）。"""
+        self._make_fork("conv")
+        new_a = self._chain("conv")[-1]
+        # 把分叉点 conv-u2 移到链尾(普通位置)
+        ok = self.svc.move_message_with_fork(
+            "conv-u2", "conv", 4, prev_id=new_a, next_id=None
+        )
+        self.assertTrue(ok)
+        chain = self._chain("conv")
+        # 补位后 new_a 的前驱 = a1;数据迁移到 a1
+        self.assertEqual(chain, ["conv-u1", "conv-a1", new_a, "conv-u2"])
+        a1 = self.tree_store.get_node("conv-a1")
+        self.assertTrue(a1.is_fork_point)
+        self.assertEqual(a1.fork_branch_count, 2)
+        self.assertFalse(self.tree_store.get_node("conv-u2").is_fork_point)
+        # 分支数据:原 u2 分支 re-anchor 到 a1;
+        # 当前分支(1)随后被同步覆写为链切片(含移走的 u2)
+        branches = self.branch_store.get_all_branches("conv-a1")
+        self.assertEqual(branches[0], ["conv-a1", "conv-a2"])
+        self.assertEqual(branches[1], ["conv-a1", new_a, "conv-u2"])
+
+    # ── 跨对话整体迁移 ────────────────────────
+
+    def test_cross_conv_modified_transfers_to_prev(self) -> None:
+        """跨对话被修改节点 → 整体迁移;目标前驱成为新分叉点（拍板 1/2）。"""
+        self._make_fork("conv")
+        new_a = self._chain("conv")[-1]
+        # 拖到 conv2 的链尾(普通位置):前驱 = conv2-a2
+        ok = self.svc.move_message_with_fork(
+            new_a, "conv2", 4, prev_id="conv2-a2", next_id=None
+        )
+        self.assertTrue(ok)
+        # 源对话链回退到 X 之前
+        self.assertEqual(self._chain("conv"), ["conv-u1", "conv-a1", "conv-u2"])
+        # 目标对话链:X 插入链尾;前驱 conv2-a2 成为分叉点
+        tgt_chain = self._chain("conv2")
+        self.assertEqual(tgt_chain[-1], new_a)
+        a2 = self.tree_store.get_node("conv2-a2")
+        self.assertTrue(a2.is_fork_point)
+        self.assertEqual(a2.fork_branch_count, 2)
+        # 分支数据迁移到 conv2-a2 名下(源分叉点 u2 移除,头部替换)
+        branches = self.branch_store.get_all_branches("conv2-a2")
+        self.assertEqual(branches[0], ["conv2-a2", "conv-a2"])
+        self.assertEqual(branches[1], ["conv2-a2", new_a])
+        # 源分叉点 conv-u2 数据已清
+        self.assertEqual(self.branch_store.get_branch_indexes("conv-u2"), [])
+        self.assertFalse(self.tree_store.get_node("conv-u2").is_fork_point)
+
+    def test_cross_conv_modified_into_between(self) -> None:
+        """跨对话被修改节点拖到"之间" → 数据并入目标分叉点。"""
+        self._make_fork("conv")
+        new_a = self._chain("conv")[-1]
+        # conv2 上再造一个分叉:分叉点 conv2-u2,被修改节点 = conv2 新 a
+        self._make_fork("conv2")
+        tgt_new_a = self._chain("conv2")[-1]
+        # 把 conv 的 new_a 拖到 conv2-u2 与 tgt_new_a 之间
+        ok = self.svc.move_message_with_fork(
+            new_a, "conv2", 3, prev_id="conv2-u2", next_id=tgt_new_a
+        )
+        self.assertTrue(ok)
+        # 目标分叉点 conv2-u2 名下:原分支 + 迁移分支(编号接续)
+        branches = self.branch_store.get_all_branches("conv2-u2")
+        self.assertEqual(len(branches), 4)
+        self.assertEqual(branches[3], ["conv2-u2", new_a])
+        # 目标链含 new_a(在 u2 之后)
+        tgt_chain = self._chain("conv2")
+        self.assertEqual(tgt_chain[2], "conv2-u2")
+        self.assertEqual(tgt_chain[3], new_a)
+
+    def test_folder_move_plain(self) -> None:
+        """文件夹移动:纯移动,分支数据不动。"""
+        self.tree_store.create_node(FolderNode(
+            id="f1", parent_id="root", title="目录",
+        ))
+        ok = self.svc.move_message_with_fork("conv", "f1", 0)
+        self.assertTrue(ok)
+        self.assertEqual(self.tree_store.get_node("conv").parent_id, "f1")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

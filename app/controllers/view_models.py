@@ -119,6 +119,7 @@ class TreeNodeVM:
     attachment_count: int = 0                # 仅目录
     role: str = ""                           # 仅消息节点: "user" | "assistant" | "thinking"
     fork_display: str = ""                   # 分叉点标题前缀 "<m/n> "（仅信息展示，3.5.2）
+    is_modified: bool = False                # 仅消息节点: 被修改节点（分叉点后继，拖拽判定用 3.6）
 
 
 @dataclass

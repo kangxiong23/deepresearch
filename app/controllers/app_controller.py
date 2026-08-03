@@ -692,6 +692,9 @@ class AppController:
                     depth=depth,
                     role=node.role,
                     fork_display=_fork_display(node),
+                    is_modified=(
+                        self._conversation_svc.is_modified_node(node.id)
+                    ),
                 )
             elif isinstance(node, FolderNode):
                 vm = TreeNodeVM(
@@ -781,6 +784,28 @@ class AppController:
     ) -> None:
         """UI 调用：移动节点到目标父级下。"""
         self._conversation_svc.move_conversation(node_id, target_parent_id, position)
+
+    def on_move_node_branch_aware(
+        self,
+        node_id: str,
+        target_parent_id: str | None,
+        position: int | None = None,
+        prev_id: str | None = None,
+        next_id: str | None = None,
+    ) -> bool:
+        """
+        UI 调用：分支感知的拖拽移动（3.6 组合表）。
+
+        Returns:
+            True 执行成功；False 被拒绝（被修改节点同对话移动等）
+        """
+        return self._conversation_svc.move_message_with_fork(
+            node_id, target_parent_id, position, prev_id, next_id
+        )
+
+    def get_node(self, node_id: str):
+        """UI 调用：返回节点领域对象（None 表示不存在）。"""
+        return self._conversation_svc.get_node(node_id)
 
     def on_soft_delete_node(self, node_id: str, mode: str = "recursive") -> None:
         """UI 调用：软删除节点（移入回收站；被修改节点为硬删除，3.3.1）。"""
