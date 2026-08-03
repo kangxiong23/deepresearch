@@ -711,6 +711,9 @@ class _TreeView(QTreeView):
         拦截拖拽放置事件，计算目标父节点和插入位置，
         通过 drop_occurred（单拖）或 batch_drop_occurred（多选批量拖）信号通知上层。
         """
+        if self._ops_locked:
+            event.ignore()
+            return
         mime = event.mimeData()
         if not mime.hasFormat("application/x-treenode-id"):
             event.ignore()
@@ -1227,6 +1230,11 @@ class TreePanel(QWidget):
         self._model: QStandardItemModel | None = None
         self._building: bool = False  # 防止重建时的信号触发
 
+        # 分叉功能: 操作锁定（预分支/修改状态下禁用拖拽与变更，3.1.3/5.2）
+        self._ops_locked: bool = False
+        # 修改状态下半透明的节点（5.1.4）
+        self._edited_node_id: str = ""
+
         # ── Model ─────────────────────────────────
         self._model = QStandardItemModel(0, 1, self)
         self._model.setHorizontalHeaderLabels([""])
@@ -1409,6 +1417,65 @@ class TreePanel(QWidget):
         self._tree_view.viewport().update()
 
     # ──────────────────────────────────────────────
+    # 分叉功能：操作锁定 / 修改状态半透明（3.1.3/5.2）
+    # ──────────────────────────────────────────────
+
+    def set_ops_locked(self, locked: bool) -> None:
+        """
+        锁定/解锁树操作（拖拽、复选框、右键菜单）。
+
+        预分支状态（3.1.3）与修改状态（5.2）下调用，
+        防止任何可能触发对话树结构更新的操作。
+        """
+        self._ops_locked = locked
+        self._tree_view.setDragEnabled(not locked)
+        self._tree_view.setAcceptDrops(not locked)
+
+    @property
+    def ops_locked(self) -> bool:
+        return self._ops_locked
+
+    def set_edited_node(self, node_id: str) -> None:
+        """修改状态下将被修改节点标题置为半透明（5.1.4）。"""
+        if self._edited_node_id == node_id:
+            return
+        self._edited_node_id = node_id
+        self._update_edited_item()
+
+    def clear_edited_node(self) -> None:
+        """清除修改状态的半透明标记。"""
+        if not self._edited_node_id:
+            return
+        self._edited_node_id = ""
+        self._update_edited_item()
+
+    def _update_edited_item(self) -> None:
+        """按 _edited_node_id 更新条目文字颜色（半透明/恢复）。"""
+        if self._model is None:
+            return
+        for row in range(self._model.rowCount()):
+            item = self._model.item(row)
+            if item is None:
+                continue
+            self._apply_edited_style_recursive(item)
+
+    def _apply_edited_style_recursive(self, item: QStandardItem) -> None:
+        """递归设置/清除节点文字半透明。"""
+        from PySide6.QtGui import QBrush, QColor
+        node_id = item.data(ROLE_NODE_ID)
+        if node_id == self._edited_node_id:
+            item.setForeground(
+                QBrush(QColor(Colors.TEXT_SECONDARY + "88"))
+            )
+        else:
+            # 恢复默认前景色（由 item 初始创建时未设置 → 使用调色板默认色）
+            item.setForeground(QBrush())
+        for i in range(item.rowCount()):
+            child = item.child(i)
+            if child is not None:
+                self._apply_edited_style_recursive(child)
+
+    # ──────────────────────────────────────────────
     # 多选模式公开接口
     # ──────────────────────────────────────────────
 
@@ -1536,6 +1603,8 @@ class TreePanel(QWidget):
         - 自定义角色: node_type, node_id, enabled, depth 等
         """
         # ── 显示文本 ──────────────────────────────
+        # 分叉点标题前缀 "<m/n> "（3.5.2，仅信息展示）
+        fork_prefix = getattr(node, "fork_display", "") or ""
         if node.node_type == "message":
             # 消息节点格式: "  👤  用户: 内容预览前30字"
             # 显示文本始终单行 — 换行/制表/连续空格替换为单个空格
@@ -1549,6 +1618,8 @@ class TreePanel(QWidget):
                 display_title = preview
         else:
             display_title = node.title
+        if fork_prefix:
+            display_title = f"{fork_prefix}{display_title}"
 
         # 对话节点追加消息计数
         if node.node_type == "conversation" and node.message_count > 0:
@@ -1777,6 +1848,19 @@ class TreePanel(QWidget):
         if self._building:
             return
 
+        if self._ops_locked:
+            # 锁定状态下禁止复选框变更（预分支/修改状态，3.1.3/5.2）
+            old = item.data(ROLE_ENABLED)
+            self._model.blockSignals(True)
+            if old is True:
+                item.setCheckState(Qt.CheckState.Checked)
+            elif old is False:
+                item.setCheckState(Qt.CheckState.Unchecked)
+            else:
+                item.setCheckState(Qt.CheckState.PartiallyChecked)
+            self._model.blockSignals(False)
+            return
+
         node_type = item.data(ROLE_NODE_TYPE)
         new_check = item.checkState()
         node_id = item.data(ROLE_NODE_ID)
@@ -1851,6 +1935,10 @@ class TreePanel(QWidget):
         is_enabled = item.data(ROLE_ENABLED)
 
         if node_id is None:
+            return
+
+        if self._ops_locked:
+            # 锁定状态下禁用右键菜单（预分支/修改状态，3.1.3/5.2）
             return
 
         # ── 多选模式：仅已选中节点可弹出菜单 ──

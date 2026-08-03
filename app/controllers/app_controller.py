@@ -783,8 +783,16 @@ class AppController:
         self._conversation_svc.move_conversation(node_id, target_parent_id, position)
 
     def on_soft_delete_node(self, node_id: str, mode: str = "recursive") -> None:
-        """UI 调用：软删除节点（移入回收站）。"""
+        """UI 调用：软删除节点（移入回收站；被修改节点为硬删除，3.3.1）。"""
         self._conversation_svc.delete_conversation(node_id, mode)
+
+    def is_modified_node(self, node_id: str) -> bool:
+        """
+        UI 调用：节点是否为"被修改节点"（分叉点后继，3.3.1 硬删除判定）。
+
+        删除确认框据此展示"永久删除、不进回收站"的提示。
+        """
+        return self._conversation_svc.is_modified_node(node_id)
 
     def on_update_context_blocks(
         self,

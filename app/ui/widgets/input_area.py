@@ -409,11 +409,13 @@ class InputArea(QFrame):
     thinking_toggled = Signal(bool)
     search_toggled = Signal(bool)
     reasoning_effort_changed = Signal(str)
+    edit_cancel_requested = Signal()   # 修改状态下点击 ✕ 退出修改（5.2）
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("inputArea")
         self._generating: bool = False
+        self._edit_mode: bool = False   # 修改状态（5.1/5.2）
 
         # ── 附件条 ──────────────────────────────
         self._attachment_bar = AttachmentBar()
@@ -457,11 +459,33 @@ class InputArea(QFrame):
         self._send_btn.clicked.connect(self._on_send_click)
         self._apply_send_style()
 
+        # ── 修改状态 ✕ 按钮（输入框右上方，5.1.5）──
+        self._edit_cancel_btn = QPushButton("✕")
+        self._edit_cancel_btn.setFont(Fonts.body(14))
+        self._edit_cancel_btn.setFixedSize(28, 28)
+        self._edit_cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._edit_cancel_btn.setToolTip("退出修改状态")
+        self._edit_cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.TEXT_SECONDARY};
+                background-color: transparent;
+                border: 1px solid {Colors.BORDER};
+                border-radius: 14px;
+            }}
+            QPushButton:hover {{
+                color: {Colors.ERROR};
+                background-color: {Colors.BG_OVERLAY};
+            }}
+        """)
+        self._edit_cancel_btn.clicked.connect(self.edit_cancel_requested)
+        self._edit_cancel_btn.setVisible(False)
+
         # ── 输入行 ──────────────────────────────
         input_row = QHBoxLayout()
         input_row.setContentsMargins(0, 0, 0, 0)
         input_row.setSpacing(Spacing.SM)
         input_row.addWidget(self._text_edit, stretch=1)
+        input_row.addWidget(self._edit_cancel_btn)
         input_row.addWidget(self._send_btn)
         input_row.setAlignment(Qt.AlignmentFlag.AlignBottom)
 
@@ -643,3 +667,35 @@ class InputArea(QFrame):
         """启用/禁用输入区。"""
         self._text_edit.setEnabled(enabled)
         self._send_btn.setEnabled(enabled)
+
+    def set_text_locked(self, locked: bool) -> None:
+        """锁定/解锁输入框（预分支状态：禁发新消息，但停止按钮保持可用，3.1.3）。"""
+        self._text_edit.setEnabled(not locked)
+        self._file_btn.setEnabled(not locked)
+        self._thinking_chip.setEnabled(not locked)
+        self._search_chip.setEnabled(not locked)
+        self._model_selector.setEnabled(not locked)
+
+    # ── 修改状态（5.1/5.2）────────────────────
+
+    def enter_edit_mode(self, text: str) -> None:
+        """进入修改状态：文本填入输入框、显示 ✕ 按钮（5.1）。"""
+        self._edit_mode = True
+        self._text_edit.setPlainText(text or "")
+        self._text_edit.setFocus()
+        self._edit_cancel_btn.setVisible(True)
+
+    def exit_edit_mode(self, keep_text: bool = True) -> None:
+        """退出修改状态：隐藏 ✕ 按钮；文本保留（5.2）。"""
+        self._edit_mode = False
+        self._edit_cancel_btn.setVisible(False)
+        if not keep_text:
+            self._text_edit.clear()
+
+    def is_edit_mode(self) -> bool:
+        """当前是否处于修改状态。"""
+        return self._edit_mode
+
+    def has_text(self) -> bool:
+        """输入框是否有内容（修改状态进入时的覆盖确认用，5.1.2）。"""
+        return bool(self._text_edit.toPlainText().strip())

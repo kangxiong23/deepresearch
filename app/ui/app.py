@@ -70,6 +70,15 @@ class ChatApp:
         # 最近一次发送的文本（供未完成轮次"重新发送"用）
         self._last_sent_text: str = ""
 
+        # ── 分叉功能（P3）───────────────────────
+        # 修改状态：被修改的 user 消息节点 id（5.1）
+        self._edit_node_id: str | None = None
+        # 预分支状态（重新生成完整 assistant，3.1）：
+        #   {message_id, fork_point_id, hidden_widgets: list[ChatMessage]}
+        self._prefork: dict | None = None
+        # 本轮流式是否来自"修改重发送"（暂停态显示"放弃本次修改"，3.1.6/5.4）
+        self._last_turn_was_edit_resend: bool = False
+
         # ── 构建主窗口 ──────────────────────────
         self._window = MainWindow()
 
@@ -113,6 +122,7 @@ class ChatApp:
         input_area = self._window.input_area
         input_area.send_requested.connect(self._handle_send)
         input_area.stop_requested.connect(self._handle_stop)
+        input_area.edit_cancel_requested.connect(self._handle_edit_cancel)
         input_area.model_changed.connect(
             lambda m: self._settings_ctrl.on_change_model(m)
         )
@@ -248,11 +258,12 @@ class ChatApp:
 
         流式期间不重建：重建会销毁流式控件（_streaming_message / thinking block），
         后续 chunk 会追加到脱离布局的控件上，导致输出效果与最终回复丢失。
-        此时将请求延后到流结束/中止后统一执行。
+        预分支（重新生成）期间同样不重建：重建会销毁预分支流式控件与
+        隐藏的消息快照，导致回退逻辑失效。此时将请求延后到流结束/中止后统一执行。
         """
-        if self._streaming_message is not None:
+        if self._streaming_message is not None or self._prefork is not None:
             self._pending_rebuild_after_stream = True
-            print("[UI] 流式期间跳过消息列表重建，延后到流结束后执行")
+            print("[UI] 流式/预分支期间跳过消息列表重建，延后到结束后执行")
             return
 
         msg_list = self._window.message_list
@@ -332,6 +343,8 @@ class ChatApp:
         创建新对话作为当前发送目标，刷新树，但不影响消息列表显示。
         消息列表始终显示所有已启用消息。
         """
+        if not self._can_mutate_tree():
+            return
         session_id = self._ctrl.on_new_conversation()
         self._current_session_id = session_id
         self._window.sidebar.set_active(session_id)
@@ -414,6 +427,9 @@ class ChatApp:
                 is_thinking=getattr(vm, "is_thinking", False),
             )
             self._connect_message_signals(msg)
+            # 分叉功能：被修改消息气泡下方显示 <m/n> 切换控件（3.5.1）
+            if getattr(vm, "fork_n", 0) > 0:
+                msg.set_fork_info(vm.fork_m, vm.fork_n, vm.fork_point_id)
             # 在 stretch 之前插入（鲁棒：无 stretch 则在末尾）
             layout.insertWidget(self._find_stretch_index(layout), msg)
             # Phase 5: 注册消息以便精确滚动定位
@@ -531,7 +547,7 @@ class ChatApp:
         """连接消息气泡的操作按钮信号。"""
         msg.copy_requested.connect(self._on_copy_content)
         msg.regenerate_requested.connect(
-            lambda: self._handle_regenerate(self._current_session_id)
+            lambda mid: self._handle_regenerate(self._current_session_id, mid)
         )
         msg.remember_requested.connect(
             lambda: self._handle_remember(msg)
@@ -540,6 +556,12 @@ class ChatApp:
             lambda: self._handle_continue(self._current_session_id)
         )
         msg.resend_requested.connect(self._handle_resend)
+        # ── 分叉功能（P3）──────────────────────
+        msg.edit_requested.connect(self._handle_edit_requested)
+        msg.fork_nav.connect(
+            lambda delta: self._handle_fork_nav(msg.fork_point_id, delta)
+        )
+        msg.abandon_requested.connect(self._handle_abandon_edit_resend)
 
     def _on_copy_content(self, text: str) -> None:
         """复制文本到系统剪贴板。"""
@@ -549,17 +571,49 @@ class ChatApp:
 
     # ── 发送消息 ──────────────────────────────
 
+    def _can_mutate_tree(self, allow_send: bool = False) -> bool:
+        """
+        预分支/修改状态下的树变更门禁（3.1.3/5.2）。
+
+        预分支状态：除停止生成外全部禁止。
+        修改状态：仅允许发送修改后的消息（allow_send=True）。
+        """
+        if self._prefork is not None:
+            return False
+        if self._edit_node_id is not None:
+            return allow_send
+        return True
+
+    def _set_ui_locked(self, locked: bool) -> None:
+        """锁定/解锁 UI 树操作与消息操作按钮（3.1.3/5.2 的可见层）。"""
+        self._window.sidebar.tree_panel.set_ops_locked(locked)
+        layout = self._window.message_list.message_layout()
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if isinstance(w, ChatMessage):
+                w.set_actions_locked(locked)
+
     def _handle_send(self, text: str, files: list[str]) -> None:
         """
         发送消息入口。
 
-        1. 中止现有流（如有）
-        2. 确定消息插入目标：树中最后一个有效启用消息所在的对话
+        1. 修改状态 → 路由到修改重发送（5.3）
+        2. 中止现有流（如有）
+        3. 确定消息插入目标：树中最后一个有效启用消息所在的对话
            （使新内容在聚合时间线末尾继续）；无启用消息且无活跃会话时新建
-        3. 追加用户消息气泡
-        4. 清空输入区，切换到生成状态
-        5. 启动流式响应
+        4. 追加用户消息气泡
+        5. 清空输入区，切换到生成状态
+        6. 启动流式响应
         """
+        # 修改状态：发送修改后的消息（5.2，唯一允许的操作）
+        if self._edit_node_id is not None:
+            self._start_edit_resend_stream(text, files)
+            return
+
+        # 预分支期间禁发新消息（输入区已禁用，此处防御）
+        if self._prefork is not None:
+            return
+
         # 中止现有流（会标记旧轮次为未完成）
         if self._stream_worker is not None:
             self._handle_stop()
@@ -606,9 +660,20 @@ class ChatApp:
         self._start_stream(self._current_session_id, text, files)
 
     def _handle_stop(self) -> None:
-        """停止当前生成。"""
+        """停止当前生成。
+
+        预分支（重新生成）停止 = 丢弃回退（4.3）：不标记 incomplete、
+        不持久化，UI 恢复原状。
+        修改重发送/普通发送停止 = 正常 incomplete 暂停态（5.4）。
+        """
         self._ctrl.on_stop_generation()
         self._window.input_area.set_generating(False)
+        if self._prefork is not None:
+            # 预分支停止：丢弃回退（4.3），无 incomplete 标记
+            self._abort_prefork()
+            if self._stream_worker:
+                self._stream_worker.request_abort()
+            return
         if self._streaming_message:
             self._streaming_message.finalize_stream()
             self._streaming_message.mark_incomplete()
@@ -619,6 +684,9 @@ class ChatApp:
             self._stream_worker.request_abort()
         # 标记未完成轮次 + 处理三种停止场景的 UI
         self._mark_current_turn_incomplete()
+        # 修改重发送停止 → 暂停态：显示"放弃本次修改"（3.1.6/5.4）
+        if self._last_turn_was_edit_resend and self._incomplete_message is not None:
+            self._incomplete_message.show_abandon_button(True)
 
     def _mark_current_turn_incomplete(self) -> None:
         """停止生成后：标记用户消息节点未完成，并按三种场景调整 UI。
@@ -656,14 +724,18 @@ class ChatApp:
                 w.show_resend_button()
                 break
 
-    def _handle_regenerate(self, session_id: str) -> None:
+    def _handle_regenerate(self, session_id: str, message_id: str = "") -> None:
         """
         重新生成助手回复。
 
-        若当前是未完成轮次：丢弃部分内容，重新回答该用户消息；
-        否则走正常 regenerate。
+        - 未完成轮次：丢弃部分内容，重新回答该用户消息（原路径，无分支）。
+        - 完整 assistant：进入预分支状态（3.1），流式完成后创建分支；
+          停止 = 丢弃回退（4.3）。
         """
         if not session_id:
+            return
+        # 预分支/修改状态下禁止（门禁防御）
+        if not self._can_mutate_tree():
             return
         # 未完成轮次：重新回答该用户消息（清除标记 + 移除部分内容 + 重发）
         if self._incomplete_message is not None:
@@ -671,8 +743,269 @@ class ChatApp:
             return
 
         self._window.input_area.set_generating(True)
+        self._start_prefork_regenerate(session_id, message_id)
 
-        self._start_regenerate_stream(session_id)
+    # ── 分叉功能：预分支状态（3.1）─────────────
+
+    def _start_prefork_regenerate(self, session_id: str, message_id: str) -> None:
+        """
+        预分支状态（重新生成完整 assistant，3.1）。
+
+        - 快照并隐藏目标消息之后的所有 widget（1.3 级联替换的 UI 先行）
+        - 在目标位置插入流式气泡
+        - 流式完成 → 服务端创建分支 → 全量刷新（落地）
+        - 停止/出错 → 丢弃回退（4.3），零持久化
+        """
+        layout = self._window.message_list.message_layout()
+        hidden: list[ChatMessage] = []
+        target_widget: ChatMessage | None = None
+        passed_target = False
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if not isinstance(w, ChatMessage):
+                continue
+            if w.message_id == message_id:
+                target_widget = w
+                passed_target = True
+                continue
+            if passed_target:
+                hidden.append(w)
+                w.setVisible(False)
+
+        # 目标不在当前视图（防御）：交给服务端按最后一条 assistant 兜底
+        if target_widget is None:
+            message_id = ""
+
+        self._prefork = {
+            "message_id": message_id,
+            "hidden_widgets": hidden,
+            "thinking": None,
+        }
+        # 门禁：禁止一切树变更操作（3.1.3），仅允许停止生成
+        self._set_ui_locked(True)
+        self._window.input_area.set_text_locked(True)
+
+        # 插入流式气泡：目标 widget 之后（无目标则追加到末尾）
+        assistant_msg = ChatMessage(role="assistant", content="")
+        assistant_msg.start_stream()
+        self._streaming_message = assistant_msg
+        self._connect_message_signals(assistant_msg)
+        if target_widget is not None:
+            idx = layout.indexOf(target_widget)
+            layout.insertWidget(idx + 1, assistant_msg)
+        else:
+            self._append_message(assistant_msg)
+
+        thinking_ref: list = [None]
+
+        stream_thread = QThread()
+        stream_worker = AsyncStreamWorker()
+        stream_worker.moveToThread(stream_thread)
+        self._stream_thread = stream_thread
+        self._stream_worker = stream_worker
+
+        def on_chunk(delta: str, is_done: bool, chunk_type: str, _msg_id: str):
+            if not self._first_chunk_scrolled:
+                self._first_chunk_scrolled = True
+                self._window.message_list.force_scroll_to_bottom()
+            if chunk_type == "thinking":
+                if thinking_ref[0] is None:
+                    thinking_ref[0] = ThinkingBlock()
+                    self._prefork["thinking"] = thinking_ref[0]
+                    self._insert_before_last(thinking_ref[0])
+                thinking_ref[0].append_text(delta)
+                thinking_ref[0].repaint()
+            else:
+                if self._streaming_message:
+                    self._streaming_message.append_stream(delta)
+                    if _msg_id and not self._streaming_message.message_id:
+                        self._streaming_message.message_id = _msg_id
+                        self._window.message_list.register_message(
+                            _msg_id, self._streaming_message
+                        )
+                    self._streaming_message.repaint()
+            self._window.message_list.scroll_to_bottom()
+
+        def on_finished():
+            """流式完成：服务端已建分支并替换链 → 落地刷新。"""
+            if self._stream_worker is None:
+                return
+            if self._streaming_message:
+                self._streaming_message.finalize_stream()
+                self._streaming_message = None
+            self._window.input_area.set_generating(False)
+            self._window.input_area.set_text_locked(False)
+            self._cleanup_stream_thread()
+            self._prefork = None
+            self._set_ui_locked(False)
+            # 预分支期间若有延后的重建请求,本次全量刷新即为其执行
+            self._pending_rebuild_after_stream = False
+            QTimer.singleShot(0, self._load_tree)
+            QTimer.singleShot(0, lambda: self._load_all_messages(scroll_to_bottom=True))
+
+        def on_error(error_msg: str):
+            print(f"[UI] Prefork regenerate error: {error_msg}")
+            on_finished()
+
+        def on_aborted():
+            """停止/出错 → 丢弃回退（4.3）：恢复原视图，零持久化。"""
+            self._window.input_area.set_generating(False)
+            self._window.input_area.set_text_locked(False)
+            self._abort_prefork()
+            self._cleanup_stream_thread()
+
+        relay = StreamRelay()
+        self._stream_relay = relay
+
+        stream_worker.chunk_ready.connect(
+            relay._on_chunk, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_finished.connect(
+            relay._on_finished, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_error.connect(
+            relay._on_error, Qt.ConnectionType.QueuedConnection
+        )
+        stream_worker.stream_aborted.connect(
+            relay._on_aborted, Qt.ConnectionType.QueuedConnection
+        )
+        relay.chunk_ready.connect(on_chunk)
+        relay.stream_finished.connect(on_finished)
+        relay.stream_error.connect(on_error)
+        relay.stream_aborted.connect(on_aborted)
+        stream_thread.finished.connect(
+            relay._on_finished, Qt.ConnectionType.QueuedConnection
+        )
+
+        _ctrl = self._ctrl
+        stream_thread.started.connect(
+            lambda: stream_worker.run_stream(
+                _ctrl.on_regenerate_message, session_id, message_id
+            ),
+            Qt.ConnectionType.DirectConnection,
+        )
+        stream_thread.start()
+
+    def _abort_prefork(self) -> None:
+        """预分支回退（4.3）：移除流式气泡与 thinking 块、恢复隐藏消息、解除锁定。"""
+        if self._prefork is None:
+            return
+        layout = self._window.message_list.message_layout()
+        if self._streaming_message is not None:
+            layout.removeWidget(self._streaming_message)
+            self._streaming_message.setParent(None)
+            self._streaming_message = None
+        thinking = self._prefork.get("thinking")
+        if thinking is not None:
+            layout.removeWidget(thinking)
+            thinking.setParent(None)
+        for w in self._prefork.get("hidden_widgets", []):
+            w.setVisible(True)
+        self._prefork = None
+        self._set_ui_locked(False)
+
+    # ── 分叉功能：修改并重发送（5 章）───────────
+
+    def _handle_edit_requested(self, message_id: str) -> None:
+        """进入修改状态（5.1）。"""
+        if not message_id or not self._can_mutate_tree():
+            return
+        # 5.1.2：输入框已有内容 → 覆盖确认
+        if self._window.input_area.has_text():
+            box = QMessageBox(self._window)
+            box.setWindowTitle("修改消息")
+            box.setText("输入框已有内容，是否用这条消息覆盖？")
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                return
+        # 找到消息 widget 并置半透明（5.1.3）
+        content = ""
+        layout = self._window.message_list.message_layout()
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if isinstance(w, ChatMessage) and w.message_id == message_id:
+                content = w.current_content
+                w.set_translucent(True)
+                break
+        self._edit_node_id = message_id
+        self._window.input_area.enter_edit_mode(content)
+        self._window.sidebar.tree_panel.set_edited_node(message_id)
+        # 门禁：树操作禁用，仅发送修改后的消息可用（5.2）
+        self._set_ui_locked(True)
+
+    def _handle_edit_cancel(self) -> None:
+        """✕ 退出修改状态：输入框内容保留、恢复显示（5.2）。"""
+        if self._edit_node_id is None:
+            return
+        node_id = self._edit_node_id
+        self._edit_node_id = None
+        self._window.input_area.exit_edit_mode(keep_text=True)
+        self._window.sidebar.tree_panel.clear_edited_node()
+        layout = self._window.message_list.message_layout()
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if isinstance(w, ChatMessage) and w.message_id == node_id:
+                w.set_translucent(False)
+                break
+        self._set_ui_locked(False)
+
+    def _start_edit_resend_stream(self, text: str, files: list[str]) -> None:
+        """修改重发送（5.3）：发送修改后的消息并进入流式。"""
+        session_id = self._current_session_id
+        original_user_id = self._edit_node_id
+        if not session_id or not original_user_id:
+            self._handle_edit_cancel()
+            return
+        # 发送即结束修改状态：气泡更新为新内容、恢复半透明（5.3.3）
+        self._edit_node_id = None
+        self._window.input_area.exit_edit_mode(keep_text=False)
+        self._window.sidebar.tree_panel.clear_edited_node()
+        layout = self._window.message_list.message_layout()
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if isinstance(w, ChatMessage) and w.message_id == original_user_id:
+                w.set_content(text)
+                w.set_translucent(False)
+                break
+        self._set_ui_locked(False)
+        self._last_turn_was_edit_resend = True
+        self._window.input_area.set_generating(True)
+        # 复用流式引擎，worker 指向修改重发送服务
+        self._start_stream(
+            session_id, text, files,
+            worker_fn=self._ctrl.on_resend_edited_message,
+            worker_args=(session_id, original_user_id, text, files),
+        )
+
+    def _handle_abandon_edit_resend(self) -> None:
+        """放弃本次修改（3.1.6/5.4）：硬删除新分支并回退到修改前的分支。"""
+        user_id = self._incomplete_user_id
+        if not user_id:
+            return
+        # 被修改节点 → 硬删除 + 分支级联 + 自动切换（3.3）
+        self._ctrl.on_soft_delete_node(user_id, "recursive")
+        self._incomplete_message = None
+        self._incomplete_user_id = None
+        self._last_turn_was_edit_resend = False
+        self._window.input_area.set_generating(False)
+        QTimer.singleShot(0, self._load_tree)
+        QTimer.singleShot(50, lambda: self._load_all_messages(scroll_to_bottom=False))
+
+    # ── 分叉功能：分支切换（3.5）───────────────
+
+    def _handle_fork_nav(self, fork_point_id: str, delta: int) -> None:
+        """<m/n> 控件切换分支（3.5.3）。"""
+        if not fork_point_id:
+            return
+        if not self._can_mutate_tree():
+            return
+        if self._streaming_message is not None:
+            return
+        self._ctrl.on_switch_branch(fork_point_id, delta)
+        QTimer.singleShot(0, self._load_tree)
+        QTimer.singleShot(50, lambda: self._load_all_messages(scroll_to_bottom=False))
 
     def _handle_continue(self, session_id: str) -> None:
         """继续生成未完成的助手消息（DeepSeek Beta 前缀续写）。"""
@@ -779,13 +1112,24 @@ class ChatApp:
 
     # ── 流式引擎 ──────────────────────────────
 
-    def _start_stream(self, session_id: str, text: str, files: list[str]) -> None:
+    def _start_stream(
+        self,
+        session_id: str,
+        text: str,
+        files: list[str],
+        *,
+        worker_fn=None,
+        worker_args: tuple | None = None,
+    ) -> None:
         """
         启动异步流式响应。
 
         创建 AsyncStreamWorker 在后台线程中迭代
         controller.on_send_message() 的 async generator，
         通过 Qt 信号将每个 chunk 安全传递到主线程。
+
+        worker_fn/worker_args：替换 worker 调用的目标与参数
+        （修改重发送场景复用同一引擎，5.3）。
         """
         # 创建 assistant 消息气泡
         # ★ 本轮对话首次输出时强制滚动到底部一次（标志位，见 on_chunk）
@@ -846,6 +1190,7 @@ class ChatApp:
                 self._streaming_message = None
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
+            self._last_turn_was_edit_resend = False
             self._post_stream_refresh(aborted=False)
 
         def on_error(error_msg: str):
@@ -863,6 +1208,7 @@ class ChatApp:
                 self._streaming_message = None
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
+            self._last_turn_was_edit_resend = False
             self._post_stream_refresh(aborted=True)
 
         # ── 创建 StreamRelay 桥接器（主线程 QObject）────────────
@@ -899,127 +1245,14 @@ class ChatApp:
 
         # 在线程启动后运行流 — 用局部变量捕获，防止竞态
         _ctrl = self._ctrl
+        _fn = worker_fn or _ctrl.on_send_message
+        _args = worker_args if worker_args is not None else (session_id, text, files)
         # ★ 必须显式 DirectConnection：started 由 worker 线程发出，而 lambda
         #   没有 QObject receiver 时，AutoConnection 会按"连接时所在线程"
         #   （主线程）路由，导致 run_stream 阻塞主线程 → 无法流式显示。
         #   显式 DirectConnection 强制在发出信号的 worker 线程执行。
         stream_thread.started.connect(
-            lambda: stream_worker.run_stream(
-                _ctrl.on_send_message, session_id, text, files
-            ),
-            Qt.ConnectionType.DirectConnection,
-        )
-
-        stream_thread.start()
-
-    def _start_regenerate_stream(self, session_id: str) -> None:
-        """
-        启动重新生成流。
-        与 _start_stream 类似，但调用 controller.on_regenerate_message。
-        """
-        # ★ 本轮对话首次输出时强制滚动到底部一次（标志位，见 on_chunk）
-        self._first_chunk_scrolled = False
-        # 重置流式期间的延迟重建标志（防上一轮残留导致重复重建）
-        self._pending_rebuild_after_stream = False
-        assistant_msg = ChatMessage(role="assistant", content="")
-        assistant_msg.start_stream()
-        self._streaming_message = assistant_msg
-        self._connect_message_signals(assistant_msg)
-        self._append_message(assistant_msg)
-
-        thinking_ref: list = [None]
-
-        stream_thread = QThread()
-        stream_worker = AsyncStreamWorker()
-        stream_worker.moveToThread(stream_thread)
-        self._stream_thread = stream_thread
-        self._stream_worker = stream_worker
-
-        def on_chunk(delta: str, is_done: bool, chunk_type: str, _msg_id: str):
-            # ★ 本轮对话首次输出：强制滚动到底部一次（无论是否开思考模式）。
-            #   thinking + assistant 两条消息也只触发这一次。
-            if not self._first_chunk_scrolled:
-                self._first_chunk_scrolled = True
-                self._window.message_list.force_scroll_to_bottom()
-
-            if chunk_type == "thinking":
-                if thinking_ref[0] is None:
-                    thinking_ref[0] = ThinkingBlock()
-                    self._insert_before_last(thinking_ref[0])
-                thinking_ref[0].append_text(delta)
-                thinking_ref[0].repaint()
-            else:
-                if self._streaming_message:
-                    self._streaming_message.append_stream(delta)
-                    if _msg_id and not self._streaming_message.message_id:
-                        self._streaming_message.message_id = _msg_id
-                        self._window.message_list.register_message(
-                            _msg_id, self._streaming_message
-                        )
-                    self._streaming_message.repaint()
-            # 多对话模式：仅当用户在底部附近时才自动跟随
-            self._window.message_list.scroll_to_bottom()
-
-        def on_finished():
-            # 防止重入（同 _start_stream 中的 on_finished）
-            if self._stream_worker is None:
-                return
-            if self._streaming_message:
-                self._streaming_message.finalize_stream()
-                self._streaming_message = None
-            self._window.input_area.set_generating(False)
-            self._cleanup_stream_thread()
-            self._post_stream_refresh(aborted=False)
-
-        def on_error(error_msg: str):
-            print(f"[UI] Regenerate error: {error_msg}")
-            on_finished()
-
-        def on_aborted():
-            if self._streaming_message:
-                self._streaming_message.finalize_stream()
-                self._streaming_message.mark_incomplete()
-                # 保留引用供"继续生成"
-                self._incomplete_message = self._streaming_message
-                self._streaming_message = None
-            self._window.input_area.set_generating(False)
-            self._cleanup_stream_thread()
-            self._post_stream_refresh(aborted=True)
-
-        # ── StreamRelay 桥接（与 _start_stream 相同模式）──
-        relay = StreamRelay()
-        self._stream_relay = relay  # 保持引用，防止 GC 回收 relay
-
-        # Worker → Relay: 显式 QueuedConnection
-        stream_worker.chunk_ready.connect(
-            relay._on_chunk, Qt.ConnectionType.QueuedConnection
-        )
-        stream_worker.stream_finished.connect(
-            relay._on_finished, Qt.ConnectionType.QueuedConnection
-        )
-        stream_worker.stream_error.connect(
-            relay._on_error, Qt.ConnectionType.QueuedConnection
-        )
-        stream_worker.stream_aborted.connect(
-            relay._on_aborted, Qt.ConnectionType.QueuedConnection
-        )
-
-        # Relay → 回调: 同线程 DirectConnection
-        relay.chunk_ready.connect(on_chunk)
-        relay.stream_finished.connect(on_finished)
-        relay.stream_error.connect(on_error)
-        relay.stream_aborted.connect(on_aborted)
-
-        stream_thread.finished.connect(
-            relay._on_finished, Qt.ConnectionType.QueuedConnection
-        )
-
-        _ctrl = self._ctrl
-        # ★ 同 _start_stream：显式 DirectConnection 确保 run_stream 在 worker 线程执行
-        stream_thread.started.connect(
-            lambda: stream_worker.run_stream(
-                _ctrl.on_regenerate_message, session_id, ""
-            ),
+            lambda: stream_worker.run_stream(_fn, *_args),
             Qt.ConnectionType.DirectConnection,
         )
 
@@ -1226,6 +1459,9 @@ class ChatApp:
         2. 如果是消息节点 → 在消息列表中滚动到该消息并高亮
         3. 如果是对话/文件夹节点 → 在侧边栏高亮
         """
+        # 预分支/修改状态下禁止切换对话（3.1.3/5.2）
+        if not self._can_mutate_tree():
+            return
         print(f"[UI] Tree switch to node: {node_id}")
 
         # 查找节点信息，确定 _current_session_id 和滚动目标
@@ -1256,6 +1492,8 @@ class ChatApp:
         右键菜单 → 在指定目录下新建对话。
         创建后设为当前发送目标，刷新树。不改变消息列表。
         """
+        if not self._can_mutate_tree():
+            return
         session_id = self._ctrl.on_new_conversation(parent_id=parent_id)
         self._current_session_id = session_id
         self._window.sidebar.set_active(session_id)
@@ -1266,6 +1504,8 @@ class ChatApp:
         右键菜单 → 新建文件夹。
         弹出 QInputDialog 输入目录名称，调用 controller 创建。
         """
+        if not self._can_mutate_tree():
+            return
         name, ok = QInputDialog.getText(
             self._window,
             "新建目录",
@@ -1281,6 +1521,8 @@ class ChatApp:
         右键菜单 → 重命名节点。
         弹出 QInputDialog 输入新名称，调用 controller 重命名。
         """
+        if not self._can_mutate_tree():
+            return
         # 从当前树数据中获取当前标题作为预填值
         current_title = ""
         for n in self._tree_nodes:
@@ -1302,17 +1544,32 @@ class ChatApp:
         """
         右键菜单 → 删除节点（软删除到回收站）。
         弹出 QMessageBox 确认对话框。
+
+        被修改节点为硬删除（3.3.1 删除方式，拍板 3）：不进入回收站，
+        确认文案明确提示分支历史将被永久删除。
         """
+        if not self._can_mutate_tree():
+            return
         # 从树数据中获取节点信息用于确认消息
         node_title = node_id
         is_folder = False
+        is_message = False
         for n in self._tree_nodes:
             if n.id == node_id:
                 node_title = n.title or node_id
                 is_folder = (n.node_type == "folder")
+                is_message = (n.node_type == "message")
                 break
 
-        if is_folder:
+        is_modified = is_message and self._ctrl.is_modified_node(node_id)
+        if is_modified:
+            msg = (
+                f"确定要删除「{node_title}」吗？\n\n"
+                "该节点是分叉产生的修改节点：删除将连同其所属分支、"
+                "子分支的所有历史数据（含消息内容）一起永久删除，"
+                "且不会进入回收站，不可恢复。"
+            )
+        elif is_folder:
             msg = f"确定要删除目录「{node_title}」及其所有内容吗？\n\n删除后将移入回收站，可以恢复。"
         else:
             msg = f"确定要删除「{node_title}」吗？\n\n删除后将移入回收站，可以恢复。"
@@ -1342,6 +1599,8 @@ class ChatApp:
         2. 增量刷新树节点的 checkState（避免 _rebuild 竞态）
         3. 静默刷新消息列表（保持当前滚动位置不变）
         """
+        if not self._can_mutate_tree():
+            return
         self._ctrl.on_toggle_enabled(node_id)
         tree_nodes = self._ctrl.get_tree()
         self._tree_nodes = tree_nodes
@@ -1359,6 +1618,8 @@ class ChatApp:
         拖拽放置 → 移动节点到目标位置。
         target_parent_id 为空时移到根级，position 为 None 时追加到末尾。
         """
+        if not self._can_mutate_tree():
+            return
         parent = target_parent_id if target_parent_id else None
         print(f"[UI] Tree move: {node_id} -> parent={parent}, pos={position}")
         self._ctrl.on_move_node(node_id, parent, position)
@@ -1377,6 +1638,8 @@ class ChatApp:
         处理多选批量操作。
         对每个选中节点依次调用对应的单节点操作。
         """
+        if not self._can_mutate_tree():
+            return
         if not node_ids:
             return
 
@@ -1482,6 +1745,8 @@ class ChatApp:
 
     def _on_batch_ctx_save(self, node_ids: list[str], selected_ids: list[str]) -> None:
         """批量保存上下文块关联。"""
+        if not self._can_mutate_tree():
+            return
         for nid in node_ids:
             try:
                 self._ctrl.on_update_context_blocks(nid, selected_ids)
@@ -1495,6 +1760,8 @@ class ChatApp:
         按 DFS 反转顺序依次移动节点，保持相对顺序。
         反转移动确保所有节点插入到同一位置时顺次排列。
         """
+        if not self._can_mutate_tree():
+            return
         dragged_ids = [i for i in dragged_ids_str.split(",") if i]
         parent = target_parent_id if target_parent_id else None
 
@@ -1536,6 +1803,8 @@ class ChatApp:
         self, folder_id: str, selected_ids: list[str]
     ) -> None:
         """保存目录关联的上下文块。"""
+        if not self._can_mutate_tree():
+            return
         self._ctrl.on_update_context_blocks(folder_id, selected_ids)
         QTimer.singleShot(0, self._load_tree)
 
@@ -1544,6 +1813,8 @@ class ChatApp:
         右键菜单 → 添加附件（仅目录节点）。
         打开原生文件对话框，选择文件后调用 controller 挂载。
         """
+        if not self._can_mutate_tree():
+            return
         paths, _ = QFileDialog.getOpenFileNames(
             self._window,
             "选择附件",
@@ -1562,6 +1833,8 @@ class ChatApp:
         Sidebar 顶部"文件夹"按钮 → 在根目录下创建新文件夹。
         使用默认名称"新文件夹"。
         """
+        if not self._can_mutate_tree():
+            return
         self._ctrl.on_create_folder(None, "新文件夹")
         QTimer.singleShot(0, self._load_tree)
 
@@ -1591,16 +1864,22 @@ class ChatApp:
 
     def _on_trash_restore(self, trash_entry_id: str) -> None:
         """回收站：恢复条目。"""
+        if not self._can_mutate_tree():
+            return
         self._ctrl.on_restore_from_trash(trash_entry_id)
         QTimer.singleShot(0, self._load_tree)
 
     def _on_trash_permanent_delete(self, trash_entry_id: str) -> None:
         """回收站：彻底删除条目。"""
+        if not self._can_mutate_tree():
+            return
         self._ctrl.on_permanently_delete(trash_entry_id)
         QTimer.singleShot(0, self._load_tree)
 
     def _on_trash_clear_all(self) -> None:
         """回收站：清空全部。"""
+        if not self._can_mutate_tree():
+            return
         count = self._ctrl.on_clear_trash()
         QTimer.singleShot(0, self._load_tree)
         print(f"[UI] Cleared {count} items from trash")

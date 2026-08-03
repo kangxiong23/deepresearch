@@ -468,6 +468,13 @@ class ConversationService:
             conversation_id, fork_point_id, target_index
         )
 
+    def is_modified_node(self, node_id: str) -> bool:
+        """节点是否为"被修改节点"（分叉点后继；删除时触发分支删除，3.3.1）。"""
+        node = self._tree.get_node(node_id)
+        if node is None:
+            return False
+        return self._tree.find_fork_point_of(node) is not None
+
     def get_fork_info_map(self) -> dict[str, tuple[str, int, int, str]]:
         """
         返回全部"被修改节点"的分叉展示信息。
