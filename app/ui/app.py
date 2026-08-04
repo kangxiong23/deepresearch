@@ -952,7 +952,13 @@ class ChatApp:
         self._set_ui_locked(False)
 
     def _start_edit_resend_stream(self, text: str, files: list[str]) -> None:
-        """修改重发送（5.3）：发送修改后的消息并进入流式。"""
+        """修改重发送（5.3）：发送修改后的消息并进入流式。
+
+        分支在服务端发送时已创建（create_branch）、链已替换 —— 立即
+        全量重建消息列表：呈现新链与 <m/n> 控件，并清理被替换的旧分支
+        消息 widget（若只靠完成后的 _sync_message_widget_ids 轻量同步，
+        列表不重建，<m/n> 控件永远无法插入）。
+        """
         original_user_id = self._edit_node_id
         if not original_user_id:
             self._handle_edit_cancel()
@@ -969,28 +975,13 @@ class ChatApp:
             return
         # 同步当前发送目标，使流式/继续生成落在正确对话
         self._current_session_id = session_id
-        # 发送即结束修改状态：气泡更新为新内容、恢复半透明（5.3.3）
+        # 发送即结束修改状态（5.3.3）
         self._edit_node_id = None
         self._window.input_area.exit_edit_mode(keep_text=False)
         self._window.sidebar.tree_panel.clear_edited_node()
-        layout = self._window.message_list.message_layout()
-        target_idx = -1
-        for i in range(layout.count()):
-            w = layout.itemAt(i).widget()
-            if isinstance(w, ChatMessage) and w.message_id == original_user_id:
-                w.set_content(text)
-                w.set_translucent(False)
-                target_idx = i
-                break
-        # 隐藏被修改节点之后的所有旧消息（5.3/1.3 级联替换的 UI 先行：
-        # 它们属于旧分支，发送时分支已创建、链已替换；完成/放弃/切分支时
-        # 全量刷新接管显示）
-        if target_idx >= 0:
-            for i in range(target_idx + 1, layout.count()):
-                w = layout.itemAt(i).widget()
-                if w is not None:
-                    w.setVisible(False)
         self._set_ui_locked(False)
+        # 分支已落地 → 全量重建（此时无流式/预分支，不触发 guard）
+        self._load_all_messages(scroll_to_bottom=False)
         self._last_turn_was_edit_resend = True
         self._window.input_area.set_generating(True)
         # 复用流式引擎，worker 指向修改重发送服务
