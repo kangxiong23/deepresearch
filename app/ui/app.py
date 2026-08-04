@@ -954,10 +954,9 @@ class ChatApp:
     def _start_edit_resend_stream(self, text: str, files: list[str]) -> None:
         """修改重发送（5.3）：发送修改后的消息并进入流式。
 
-        分支在服务端发送时已创建（create_branch）、链已替换 —— 立即
-        全量重建消息列表：呈现新链与 <m/n> 控件，并清理被替换的旧分支
-        消息 widget（若只靠完成后的 _sync_message_widget_ids 轻量同步，
-        列表不重建，<m/n> 控件永远无法插入）。
+        发送时手动更新被修改气泡 + 隐藏旧分支尾链（UI 先行，1.3）。
+        完成后（on_finished）强制全量重建消息列表，呈现新链与 <m/n> 控件、
+        清理旧分支 widget。
         """
         original_user_id = self._edit_node_id
         if not original_user_id:
@@ -975,13 +974,28 @@ class ChatApp:
             return
         # 同步当前发送目标，使流式/继续生成落在正确对话
         self._current_session_id = session_id
-        # 发送即结束修改状态（5.3.3）
+        # 发送即结束修改状态：气泡更新为新内容、恢复半透明（5.3.3）
         self._edit_node_id = None
         self._window.input_area.exit_edit_mode(keep_text=False)
         self._window.sidebar.tree_panel.clear_edited_node()
+        # ⚠️ 不能在此 _load_all_messages 重建——worker 尚未执行 create_branch
+        # （异步），树仍是旧链，重建会错误显示旧分支数据。
+        # 手动更新被修改气泡 + 隐藏旧分支尾链（完成时统一重建）。
+        layout = self._window.message_list.message_layout()
+        target_idx = -1
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if isinstance(w, ChatMessage) and w.message_id == original_user_id:
+                w.set_content(text)
+                w.set_translucent(False)
+                target_idx = i
+                break
+        if target_idx >= 0:
+            for i in range(target_idx + 1, layout.count()):
+                w = layout.itemAt(i).widget()
+                if w is not None:
+                    w.setVisible(False)
         self._set_ui_locked(False)
-        # 分支已落地 → 全量重建（此时无流式/预分支，不触发 guard）
-        self._load_all_messages(scroll_to_bottom=False)
         self._last_turn_was_edit_resend = True
         self._window.input_area.set_generating(True)
         # 复用流式引擎，worker 指向修改重发送服务
@@ -1202,7 +1216,13 @@ class ChatApp:
                 self._streaming_message = None
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
+            was_edit_resend = self._last_turn_was_edit_resend
             self._last_turn_was_edit_resend = False
+            if was_edit_resend:
+                # 修改重发送：链已变为新分支，全量重建以呈现 <m/n> 控件、
+                # 清理旧分支 widget（_sync_message_widget_ids 轻量同步不重建，
+                # 无法反映新链）
+                self._pending_rebuild_after_stream = True
             self._post_stream_refresh(aborted=False)
 
         def on_error(error_msg: str):

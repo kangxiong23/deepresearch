@@ -181,9 +181,10 @@ class AsyncStreamWorker(QObject):
                     chunk_vm.chunk_type,
                     chunk_vm.message_id,
                 )
-
-                if chunk_vm.is_done:
-                    break
+                # ⚠️ 不在此 break —— 让 async generator 自然耗尽。
+                # 部分流方法（regenerate/resend/continue）在 is_done 之后
+                # 还有持久化逻辑（async for 之后的代码块）。worker 提前 break
+                # 会截断 generator，导致 assistant 未持久化、incomplete 未清除。
 
             self.stream_finished.emit()
 
