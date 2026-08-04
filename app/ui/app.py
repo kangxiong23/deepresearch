@@ -953,11 +953,22 @@ class ChatApp:
 
     def _start_edit_resend_stream(self, text: str, files: list[str]) -> None:
         """修改重发送（5.3）：发送修改后的消息并进入流式。"""
-        session_id = self._current_session_id
         original_user_id = self._edit_node_id
-        if not session_id or not original_user_id:
+        if not original_user_id:
             self._handle_edit_cancel()
             return
+        # ★ 发送目标 = 被修改消息所属对话（多对话聚合视图下
+        #   _current_session_id 可能为空或指向另一对话——直接用它
+        #   会导致消息发错对话甚至静默取消发送）
+        node = self._ctrl.get_node(original_user_id)
+        session_id = node.parent_id if node is not None else None
+        if not session_id:
+            session_id = self._current_session_id
+        if not session_id:
+            self._handle_edit_cancel()
+            return
+        # 同步当前发送目标，使流式/继续生成落在正确对话
+        self._current_session_id = session_id
         # 发送即结束修改状态：气泡更新为新内容、恢复半透明（5.3.3）
         self._edit_node_id = None
         self._window.input_area.exit_edit_mode(keep_text=False)
