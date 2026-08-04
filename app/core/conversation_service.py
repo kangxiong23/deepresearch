@@ -475,6 +475,12 @@ class ConversationService:
             return False
         return self._tree.find_fork_point_of(node) is not None
 
+    def get_predecessor(
+        self, conversation_id: str, node_id: str
+    ) -> MessageNode | None:
+        """返回节点在同一对话消息链中的前一个节点（无则 None）。"""
+        return self._tree.get_predecessor(conversation_id, node_id)
+
     # ──────────────────────────────────────────
     # 分支感知拖拽（spec 3.6）
     # ──────────────────────────────────────────

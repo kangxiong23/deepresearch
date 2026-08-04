@@ -980,14 +980,16 @@ class ChatApp:
         self._window.sidebar.tree_panel.clear_edited_node()
         # ⚠️ 不能在此 _load_all_messages 重建——worker 尚未执行 create_branch
         # （异步），树仍是旧链，重建会错误显示旧分支数据。
-        # 手动更新被修改气泡 + 隐藏旧分支尾链（完成时统一重建）。
+        # 手动更新被修改气泡 + 隐藏旧分支尾链（完成后增量刷新 <m/n>）。
         layout = self._window.message_list.message_layout()
+        target_widget: ChatMessage | None = None
         target_idx = -1
         for i in range(layout.count()):
             w = layout.itemAt(i).widget()
             if isinstance(w, ChatMessage) and w.message_id == original_user_id:
                 w.set_content(text)
                 w.set_translucent(False)
+                target_widget = w
                 target_idx = i
                 break
         if target_idx >= 0:
@@ -996,6 +998,15 @@ class ChatApp:
                 if w is not None:
                     w.setVisible(False)
         self._set_ui_locked(False)
+        # 发送后立即显示 <m/n>：预估 m/n + 临时禁用点击（后端 create_branch
+        # 尚未执行完成；完成后由 _refresh_fork_controls 增量启用）。
+        # 同时锁定该消息的操作（流式轮次中，隐藏修改按钮）。
+        if target_widget is not None:
+            target_widget.set_actions_locked(True)
+            preview = self._ctrl.on_get_fork_preview(original_user_id)
+            if preview:
+                pm, pn, fp_id = preview
+                target_widget.set_fork_info(pm, pn, fp_id, interactive=False)
         self._last_turn_was_edit_resend = True
         self._window.input_area.set_generating(True)
         # 复用流式引擎，worker 指向修改重发送服务
@@ -1022,16 +1033,43 @@ class ChatApp:
     # ── 分叉功能：分支切换（3.5）───────────────
 
     def _handle_fork_nav(self, fork_point_id: str, delta: int) -> None:
-        """<m/n> 控件切换分支（3.5.3）。"""
+        """<m/n> 控件切换分支（3.5.3）。
+
+        若当前有流式输出（如修改重发送的 assistant 流式），先中止流式：
+        未完成内容保存在内存（_incomplete_message，由重建时的
+        _capture/_restore_incomplete_after_rebuild 还原），不丢失流式
+        输出进度；触发基于 incomplete 标签的系统删除时（_handle_send
+        的 cleanup）清空该内存。切换后回到该分支即可看到还原的进度。
+        """
         if not fork_point_id:
             return
         if not self._can_mutate_tree():
             return
         if self._streaming_message is not None:
-            return
+            self._handle_stop()
         self._ctrl.on_switch_branch(fork_point_id, delta)
         QTimer.singleShot(0, self._load_tree)
         QTimer.singleShot(50, lambda: self._load_all_messages(scroll_to_bottom=False))
+
+    def _refresh_fork_controls(self) -> None:
+        """
+        增量刷新被修改消息的 <m/n> 控件（真实状态 + 启用交互）。
+
+        编辑重发送发送时先显示预估的 <m/n>（禁用点击）；后端 create_branch
+        完成后（流结束/中止）用真实 m/n 更新并启用——无需全量重建，
+        避免对话多时的界面卡顿。
+        """
+        layout = self._window.message_list.message_layout()
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if not isinstance(w, ChatMessage) or not w.fork_point_id:
+                continue
+            # 解除发送时的操作锁定（完成后可再次修改）
+            w.set_actions_locked(False)
+            info = self._ctrl.on_get_fork_info(w.fork_point_id)
+            if info:
+                m, n = info
+                w.set_fork_info(m, n, w.fork_point_id, interactive=True)
 
     def _handle_continue(self, session_id: str) -> None:
         """继续生成未完成的助手消息（DeepSeek Beta 前缀续写）。"""
@@ -1218,12 +1256,12 @@ class ChatApp:
             self._cleanup_stream_thread()
             was_edit_resend = self._last_turn_was_edit_resend
             self._last_turn_was_edit_resend = False
-            if was_edit_resend:
-                # 修改重发送：链已变为新分支，全量重建以呈现 <m/n> 控件、
-                # 清理旧分支 widget（_sync_message_widget_ids 轻量同步不重建，
-                # 无法反映新链）
-                self._pending_rebuild_after_stream = True
             self._post_stream_refresh(aborted=False)
+            if was_edit_resend:
+                # 修改重发送完成：增量刷新 <m/n> 为真实状态并启用
+                # （发送时是预估 + 禁用；避免全量重建，聊天窗口的
+                #   新链形态已在发送时手动呈现）
+                QTimer.singleShot(0, self._refresh_fork_controls)
 
         def on_error(error_msg: str):
             """流出错。"""
@@ -1240,8 +1278,13 @@ class ChatApp:
                 self._streaming_message = None
             self._window.input_area.set_generating(False)
             self._cleanup_stream_thread()
+            was_edit_resend = self._last_turn_was_edit_resend
             self._last_turn_was_edit_resend = False
             self._post_stream_refresh(aborted=True)
+            if was_edit_resend:
+                # 修改重发送停止（暂停态）：create_branch 已执行，
+                # <m/n> 启用为真实状态
+                QTimer.singleShot(0, self._refresh_fork_controls)
 
         # ── 创建 StreamRelay 桥接器（主线程 QObject）────────────
         # Worker 信号 → Relay Slot（跨线程，有 QObject receiver →

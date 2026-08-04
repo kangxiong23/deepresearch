@@ -825,6 +825,45 @@ class AppController:
         """UI 调用：返回节点领域对象（None 表示不存在）。"""
         return self._conversation_svc.get_node(node_id)
 
+    def on_get_fork_info(self, fork_point_id: str):
+        """
+        UI 调用：返回分叉点的当前展示 (m, n)；非分叉点返回 None。
+
+        用于后端 create_branch 完成后增量刷新 <m/n> 控件（无需全量重建）。
+        """
+        node = self._conversation_svc.get_node(fork_point_id)
+        if node is None or not node.is_fork_point:
+            return None
+        return (node.fork_current_index + 1, node.fork_branch_count)
+
+    def on_get_fork_preview(self, message_id: str):
+        """
+        UI 调用：修改重发送发送前预估被修改消息的分叉展示 (m, n, fork_point_id)。
+
+        分叉点 = 被修改消息的前驱（第一条消息 → 对话节点）。
+        首次分叉 → (2, 2)；已有分叉 → (count+1, count+1)。
+        供发送后立即显示 <m/n>（临时禁用点击，create_branch 完成后启用）。
+        """
+        svc = self._conversation_svc
+        node = svc.get_node(message_id)
+        if node is None:
+            return None
+        conv_id = node.parent_id
+        pred = svc.get_predecessor(conv_id, message_id)
+        if pred is not None:
+            fp_id = pred.id
+            count = pred.fork_branch_count if pred.is_fork_point else 0
+        else:
+            fp_id = conv_id
+            conv_node = svc.get_node(conv_id)
+            count = (
+                conv_node.fork_branch_count
+                if conv_node is not None and conv_node.is_fork_point
+                else 0
+            )
+        m = n = (count + 1) if count >= 1 else 2
+        return (m, n, fp_id)
+
     def on_soft_delete_node(self, node_id: str, mode: str = "recursive") -> None:
         """UI 调用：软删除节点（移入回收站；被修改节点为硬删除，3.3.1）。"""
         self._conversation_svc.delete_conversation(node_id, mode)

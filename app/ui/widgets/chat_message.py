@@ -366,10 +366,11 @@ class ThinkingBlock(QFrame):
 
 class _ForkControl(QFrame):
     """
-    分支切换控件（spec 3.5.1）：显示在被修改消息气泡下方。
+    分支切换控件（spec 3.5.1）：嵌入消息操作栏。
 
     三元素：「<」按钮 + "m/n" 标签 + 「>」按钮（元素间距约 1 个英文字符）。
     m=1 时「<」禁用；m=n 时「>」禁用。
+    set_interactive(False)：临时禁用切换（后端 create_branch 未就绪时）。
     """
 
     fork_nav = Signal(int)  # delta: -1 上一个 / +1 下一个
@@ -379,6 +380,10 @@ class _ForkControl(QFrame):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)  # 约 1 个英文字符
+
+        self._m: int = 0
+        self._n: int = 0
+        self._interactive: bool = True
 
         self._prev_btn = QPushButton("‹")
         self._label = QLabel("1/1")
@@ -411,17 +416,33 @@ class _ForkControl(QFrame):
 
         self._prev_btn.clicked.connect(lambda: self.fork_nav.emit(-1))
         self._next_btn.clicked.connect(lambda: self.fork_nav.emit(1))
-        layout.addStretch()
         layout.addWidget(self._prev_btn)
         layout.addWidget(self._label)
         layout.addWidget(self._next_btn)
-        layout.addStretch()
 
     def set_state(self, m: int, n: int) -> None:
         """设置展示编号（1 起）与总数，并更新边界按钮可用性。"""
+        self._m, self._n = m, n
         self._label.setText(f"{m}/{n}")
-        self._prev_btn.setEnabled(m > 1)
-        self._next_btn.setEnabled(m < n)
+        self._apply_enabled()
+
+    def set_interactive(self, interactive: bool) -> None:
+        """
+        启用/禁用切换按钮。
+
+        编辑重发送发送后后端 create_branch 尚未执行完成，先显示
+        <m/n> 但禁用点击；后端就绪后启用。
+        """
+        self._interactive = interactive
+        self._apply_enabled()
+
+    def _apply_enabled(self) -> None:
+        if not self._interactive:
+            self._prev_btn.setEnabled(False)
+            self._next_btn.setEnabled(False)
+            return
+        self._prev_btn.setEnabled(self._m > 1)
+        self._next_btn.setEnabled(self._m < self._n)
 
 
 class ChatMessage(QFrame):
@@ -512,34 +533,48 @@ class ChatMessage(QFrame):
         if content:
             self._content_browser.setHtml(_render_markdown(content))
 
-        # ── 操作按钮行（仅助手消息）─────────────
+        # ── 操作按钮行（单行；user 靠右，assistant 靠左）─────
         self._action_widget = QWidget()
+        # 控件栏背景与气泡框颜色一致
+        action_bg = Colors.USER_BG if is_user else Colors.BG_SURFACE
+        self._action_widget.setStyleSheet(
+            f"QWidget {{ background-color: {action_bg}; }}"
+        )
         action_layout = QHBoxLayout(self._action_widget)
         action_layout.setContentsMargins(0, 0, 0, 0)
         action_layout.setSpacing(Spacing.XS)
+
+        # "复制"按钮（所有消息，效果一致）
+        self._copy_btn = self._make_icon_button("📋", "复制", Colors.TEXT_SECONDARY)
+        self._copy_btn.clicked.connect(self._on_copy)
 
         # "重新发送"按钮（仅首字延迟停止的用户消息场景显示）
         self._resend_btn = self._make_icon_button("↻", "重新发送", Colors.TEXT_SECONDARY)
         self._resend_btn.clicked.connect(self._on_resend)
         self._resend_btn.setVisible(False)
-        action_layout.addWidget(self._resend_btn)
 
         # "修改"按钮（user 消息：修改并重发送，5.1）
         self._edit_btn = self._make_icon_button("✏️", "修改这条消息并重新发送", Colors.TEXT_SECONDARY)
         self._edit_btn.clicked.connect(self._on_edit)
         self._edit_btn.setVisible(False)
-        action_layout.addWidget(self._edit_btn)
 
         # "放弃本次修改"按钮（修改重发送暂停态，3.1.6/5.4）
         self._abandon_btn = self._make_icon_button("✕", "放弃本次修改", Colors.TEXT_SECONDARY)
         self._abandon_btn.clicked.connect(self._on_abandon)
         self._abandon_btn.setVisible(False)
+
+        # ── 分叉切换控件（<m/n>，3.5.1）──────────
+        self._fork_control = _ForkControl()
+        self._fork_control.fork_nav.connect(self.fork_nav)
+        self._fork_control.setVisible(False)
+
+        # 组装（从左到右）：复制、重新发送、修改、放弃、
+        #   [assistant] 复制/重新生成/记住/继续、最后 <m/n>
+        action_layout.addWidget(self._copy_btn)
+        action_layout.addWidget(self._resend_btn)
+        action_layout.addWidget(self._edit_btn)
         action_layout.addWidget(self._abandon_btn)
-
         if not is_user:
-            self._copy_btn = self._make_icon_button("📋", "复制", Colors.TEXT_SECONDARY)
-            self._copy_btn.clicked.connect(self._on_copy)
-
             self._regen_btn = self._make_icon_button("🔄", "重新生成", Colors.TEXT_SECONDARY)
             self._regen_btn.clicked.connect(self._on_regenerate)
 
@@ -551,18 +586,14 @@ class ChatMessage(QFrame):
             self._continue_btn = self._make_icon_button("▶", "继续生成", Colors.TEXT_SECONDARY)
             self._continue_btn.clicked.connect(self._on_continue)
 
-            action_layout.addWidget(self._copy_btn)
             action_layout.addWidget(self._regen_btn)
             action_layout.addWidget(self._remember_btn)
             action_layout.addWidget(self._continue_btn)
-            action_layout.addStretch()
+        action_layout.addWidget(self._fork_control)
+        # user 靠右排列（stretch 在末尾）；assistant 靠左（同样在末尾）
+        action_layout.addStretch()
 
         self._action_widget.setVisible(not is_user)
-
-        # ── 分叉切换控件（被修改消息气泡下方，3.5.1）──────────
-        self._fork_control = _ForkControl()
-        self._fork_control.fork_nav.connect(self.fork_nav)
-        self._fork_control.setVisible(False)
 
         # ── 内部布局 ────────────────────────────
         inner = QVBoxLayout()
@@ -571,7 +602,6 @@ class ChatMessage(QFrame):
         inner.addLayout(badge_row)
         inner.addWidget(self._content_browser)
         inner.addWidget(self._action_widget)
-        inner.addWidget(self._fork_control)
 
         # ── 气泡外层 ────────────────────────────
         outer = QVBoxLayout(self)
@@ -844,12 +874,13 @@ class ChatMessage(QFrame):
 
     def _update_action_visibility(self) -> None:
         """根据当前状态更新操作按钮可见性。"""
+        fork_visible = self._fork_n > 0
         if self._is_streaming:
             # 流式中：整栏操作按钮隐藏
             self._action_widget.setVisible(False)
             return
         if self._is_user:
-            # 用户消息：重新发送 / 修改按钮按状态显示
+            # 用户消息：复制 / 重新发送 / 修改 / <m/n> 按状态显示
             self._resend_btn.setVisible(self._show_resend)
             # 修改按钮：完整的 user 消息且未锁定（5.1/3.2.1）
             can_edit = (
@@ -858,8 +889,10 @@ class ChatMessage(QFrame):
                 and not self._locked
             )
             self._edit_btn.setVisible(can_edit)
+            self._abandon_btn.setVisible(self._show_abandon)
             self._action_widget.setVisible(
                 self._show_resend or can_edit
+                or self._show_abandon or fork_visible
             )
             return
         if self._is_incomplete:
@@ -885,17 +918,23 @@ class ChatMessage(QFrame):
 
     # ── 分叉 / 修改状态（P3）──────────────────
 
-    def set_fork_info(self, m: int, n: int, fork_point_id: str) -> None:
+    def set_fork_info(
+        self, m: int, n: int, fork_point_id: str, interactive: bool = True
+    ) -> None:
         """被修改消息设置分叉展示信息并显示 <m/n> 切换控件（3.5.1）。
 
         m/n 为 1 起展示编号;fork_point_id 为分叉点(切换目标)。
+        interactive=False 时临时禁用切换(后端 create_branch 未就绪)。
         """
         self._fork_m, self._fork_n, self._fork_point_id = m, n, fork_point_id
         if n > 0:
             self._fork_control.set_state(m, n)
+            self._fork_control.set_interactive(interactive)
             self._fork_control.setVisible(True)
         else:
             self._fork_control.setVisible(False)
+        # <m/n> 嵌入操作栏后,可见性影响操作栏整体显示
+        self._update_action_visibility()
 
     def set_content(self, content: str) -> None:
         """更新气泡内容（修改重发送后立即显示新文本，5.3.3）。"""
