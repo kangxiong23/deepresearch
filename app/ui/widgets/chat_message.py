@@ -912,13 +912,15 @@ class ChatMessage(QFrame):
         """
         self._translucent = translucent
         if translucent:
-            if self._opacity_effect is None:
-                from PySide6.QtWidgets import QGraphicsOpacityEffect
-                self._opacity_effect = QGraphicsOpacityEffect(self)
-                self._opacity_effect.setOpacity(0.45)
+            # 每次进入都重建：setGraphicsEffect(None) 会销毁 C++ 对象，
+            # 残留引用再复用会触发 "already deleted" RuntimeError
+            from PySide6.QtWidgets import QGraphicsOpacityEffect
+            self._opacity_effect = QGraphicsOpacityEffect(self)
+            self._opacity_effect.setOpacity(0.45)
             self.setGraphicsEffect(self._opacity_effect)
         else:
             self.setGraphicsEffect(None)
+            self._opacity_effect = None  # Qt 已销毁该 C++ 对象，丢弃引用
 
     def set_actions_locked(self, locked: bool) -> None:
         """锁定/解锁操作按钮（预分支与修改状态下，3.1.3/5.2）。"""
