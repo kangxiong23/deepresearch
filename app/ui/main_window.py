@@ -322,6 +322,9 @@ class MessageListView(QWidget):
             return
 
         scrollbar = self._scroll_area.verticalScrollBar()
+        # 记录原滚动条数值：锚点消息消失（降级）时保持该数值，
+        # 视觉位置连续，不跳转到幸存消息（切分支场景）
+        self._anchor_scroll_value = scrollbar.value()
         viewport_center_y = scrollbar.value() + viewport.height() // 2
 
         best_id: str | None = None
@@ -365,15 +368,17 @@ class MessageListView(QWidget):
         offset = self._anchor_offset
 
         if anchor_id is None or anchor_id not in self._message_widget_map:
-            # 锚点消息已消失 — 向上查找最近幸存的
-            anchor_id = self._find_nearest_surviving(
-                self._anchor_message_id, self._anchor_old_ids, new_sorted_ids
+            # 锚点消息已消失（如切分支后被替换）：保持原滚动条数值
+            # （clamp 到新范围，低于底部则到底）——视觉位置连续，
+            # 不跳转到"最近幸存消息"（那会造成跳到上一个消息节点的观感）
+            scrollbar = self._scroll_area.verticalScrollBar()
+            target = max(
+                0, min(getattr(self, "_anchor_scroll_value", 0),
+                       scrollbar.maximum())
             )
-            offset = 0  # 降级后不使用偏移
-
-        if anchor_id is None:
-            # 无幸存消息 — 滚动到底部
-            self.scroll_to_bottom()
+            self._programmatic_scroll = True
+            scrollbar.setValue(target)
+            self._programmatic_scroll = False
             return
 
         widget = self._message_widget_map.get(anchor_id)
