@@ -712,7 +712,7 @@ class _TreeView(QTreeView):
         拦截拖拽放置事件，计算目标父节点和插入位置，
         通过 drop_occurred（单拖）或 batch_drop_occurred（多选批量拖）信号通知上层。
         """
-        if self._ops_locked:
+        if getattr(self, "_ops_locked", False):
             event.ignore()
             return
         mime = event.mimeData()
@@ -1481,6 +1481,8 @@ class TreePanel(QWidget):
         防止任何可能触发对话树结构更新的操作。
         """
         self._ops_locked = locked
+        # 同步到 _TreeView（其 dropEvent 也检查该标志）
+        self._tree_view._ops_locked = locked
         self._tree_view.setDragEnabled(not locked)
         self._tree_view.setAcceptDrops(not locked)
 
