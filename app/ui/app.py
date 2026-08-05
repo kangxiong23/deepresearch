@@ -781,7 +781,9 @@ class ChatApp:
             if w.message_id == message_id:
                 target_widget = w
                 passed_target = True
-                continue
+            # UI 先行（3.1.2）：被点击的 assistant 气泡及其之后的消息
+            # 一并隐藏——用户体感即"点击后立马产生新分支"；
+            # 后端分支在流式完成后才创建（停止/出错时全部恢复）。
             if passed_target:
                 hidden.append(w)
                 w.setVisible(False)
@@ -799,14 +801,15 @@ class ChatApp:
         self._set_ui_locked(True)
         self._window.input_area.set_text_locked(True)
 
-        # 插入流式气泡：目标 widget 之后（无目标则追加到末尾）
+        # 插入流式气泡：占据被点击 assistant 气泡的原位置（它已隐藏，
+        # 视觉上即"原回复被新回复取代"）；无目标则追加到末尾
         assistant_msg = ChatMessage(role="assistant", content="")
         assistant_msg.start_stream()
         self._streaming_message = assistant_msg
         self._connect_message_signals(assistant_msg)
         if target_widget is not None:
             idx = layout.indexOf(target_widget)
-            layout.insertWidget(idx + 1, assistant_msg)
+            layout.insertWidget(idx, assistant_msg)
         else:
             self._append_message(assistant_msg)
 
