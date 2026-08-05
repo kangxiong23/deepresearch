@@ -876,8 +876,17 @@ class ChatMessage(QFrame):
         """根据当前状态更新操作按钮可见性。"""
         fork_visible = self._fork_n > 0
         if self._is_streaming:
-            # 流式中：整栏操作按钮隐藏
-            self._action_widget.setVisible(False)
+            # 流式中：仅 <m/n> 预览可见（预分支流式期间的预估标记，
+            # 其余按钮隐藏）
+            self._copy_btn.setVisible(False)
+            self._resend_btn.setVisible(False)
+            self._edit_btn.setVisible(False)
+            self._abandon_btn.setVisible(False)
+            if not self._is_user:
+                self._regen_btn.setVisible(False)
+                self._remember_btn.setVisible(False)
+                self._continue_btn.setVisible(False)
+            self._action_widget.setVisible(fork_visible)
             return
         if self._is_user:
             # 用户消息：复制 / 重新发送 / 修改 / <m/n> 按状态显示

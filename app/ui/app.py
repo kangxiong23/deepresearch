@@ -812,6 +812,13 @@ class ChatApp:
             layout.insertWidget(idx, assistant_msg)
         else:
             self._append_message(assistant_msg)
+        # 预分支流式期间显示 <m/n> 预览（预估 m/n，禁用点击——
+        # 后端分支未生成；落地后全量刷新为真实状态并启用）
+        if message_id:
+            preview = self._ctrl.on_get_fork_preview(message_id)
+            if preview:
+                pm, pn, fp_id = preview
+                assistant_msg.set_fork_info(pm, pn, fp_id, interactive=False)
 
         thinking_ref: list = [None]
 
