@@ -58,6 +58,7 @@ class Sidebar(QWidget):
     open_kg_panel_clicked = Signal()
     search_requested = Signal(str)  # 携带搜索关键词（去抖后）
     multi_select_toggled = Signal(bool)  # True=进入多选, False=退出多选
+    refresh_requested = Signal()    # 刷新整个对话树界面与对话界面
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -158,12 +159,33 @@ class Sidebar(QWidget):
             }}
         """)
 
+        # 刷新按钮（标题右侧：重绘整个对话树界面与对话界面）
+        refresh_btn = QPushButton("⟳")
+        refresh_btn.setFont(Fonts.body(Fonts.SIZE_MD))
+        refresh_btn.setFixedSize(28, 28)
+        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        refresh_btn.setToolTip("刷新对话树与对话界面")
+        refresh_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {Colors.TEXT_SECONDARY};
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.BG_OVERLAY};
+            }}
+        """)
+        refresh_btn.clicked.connect(self.refresh_requested)
+
         # 头行
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 0, 0)
         header_row.setSpacing(Spacing.SM)
         header_row.addWidget(logo_container)
         header_row.addWidget(title_label)
+        header_row.addWidget(refresh_btn)
         header_row.addStretch()
 
         header_widget = QWidget()

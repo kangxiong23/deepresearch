@@ -1473,6 +1473,10 @@ class TreePanel(QWidget):
                 # 更新 tooltip
                 item.setToolTip(_build_tooltip(node))
             self._model.blockSignals(False)
+            # ⚠️ blockSignals 期间 setCheckState/setData 不发 dataChanged，
+            # QTreeView 不会自动重绘 —— 强制刷新视口，保证级联后的
+            # checkState 视觉立即更新
+            self._tree_view.viewport().update()
         finally:
             self._building = False
 

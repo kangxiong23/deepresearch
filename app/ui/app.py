@@ -147,6 +147,7 @@ class ChatApp:
         sidebar.open_kg_panel_clicked.connect(self._handle_open_kg_panel)
         sidebar.search_requested.connect(self._on_search)
         sidebar.multi_select_toggled.connect(self._on_multi_select_toggled)
+        sidebar.refresh_requested.connect(self._handle_refresh)
 
         # ── TreePanel 信号 ────────────────────────
         tree = sidebar.tree_panel
@@ -1720,6 +1721,16 @@ class ChatApp:
 
     def _refresh_multi_conv_messages(self) -> None:
         """刷新多对话模式消息列表，保持滚动位置不变。"""
+        self._load_all_messages(scroll_to_bottom=False)
+
+    def _handle_refresh(self) -> None:
+        """
+        刷新整个对话树界面与对话界面（侧边栏 ⟳ 按钮）。
+
+        重绘对话树面板与消息列表；流式/预分支期间消息列表刷新
+        由 _load_all_messages 的 guard 延后到结束后统一执行。
+        """
+        self._load_tree()
         self._load_all_messages(scroll_to_bottom=False)
 
     def _on_tree_move(
