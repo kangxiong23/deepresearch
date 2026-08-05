@@ -71,6 +71,8 @@ class ChatApp:
         self._last_sent_text: str = ""
 
         # ── 分叉功能（P3）───────────────────────
+        # 本轮流式首次输出滚动标志（各流式启动方法在每次流式前重置）
+        self._first_chunk_scrolled: bool = False
         # 修改状态：被修改的 user 消息节点 id（5.1）
         self._edit_node_id: str | None = None
         # 预分支状态（重新生成完整 assistant，3.1）：
@@ -766,6 +768,8 @@ class ChatApp:
         - 流式完成 → 服务端创建分支 → 全量刷新（落地）
         - 停止/出错 → 丢弃回退（4.3），零持久化
         """
+        # ★ 本轮对话首次输出时强制滚动到底部一次（on_chunk 使用）
+        self._first_chunk_scrolled = False
         layout = self._window.message_list.message_layout()
         hidden: list[ChatMessage] = []
         target_widget: ChatMessage | None = None
