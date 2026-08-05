@@ -517,6 +517,14 @@ class ConversationService:
             self._tree.move_node(dragged_id, new_parent_id, position)
             return True
 
+        # 消息节点只能存在于对话下：目标必须是对话节点（防御——
+        # 验证层已拒绝文件夹/根级目标，此处兜底避免分支数据错乱）
+        if new_parent_id is None:
+            return False
+        target = self._tree.get_node(new_parent_id)
+        if target is None or not isinstance(target, ConversationNode):
+            return False
+
         dragged_conv = node.parent_id
         is_modified = self._tree.find_fork_point_of(node) is not None
         target_conv = new_parent_id

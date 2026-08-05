@@ -746,6 +746,7 @@ class _TreeView(QTreeView):
                     self.drop_occurred.emit(dragged_id, "", None, "", "")
             else:
                 event.ignore()
+                self._show_drop_rejected()
             self._clear_drag_feedback()
             return
 
@@ -794,6 +795,19 @@ class _TreeView(QTreeView):
                 )
         else:
             event.ignore()
+            self._show_drop_rejected()
+
+    def _show_drop_rejected(self) -> None:
+        """被禁止的拖拽操作:弹窗告知用户(如消息节点脱离对话)。"""
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setWindowTitle("无法移动")
+        box.setText(
+            "该拖拽操作被禁止：\n\n"
+            "· 消息节点只能存在于对话中，不能移入文件夹或根级；\n"
+            "· 文件夹/对话不能被移入消息或对话内部。"
+        )
+        box.exec()
 
     def _drop_sibling_context(
         self, parent_id: str, position: object
@@ -879,7 +893,9 @@ class _TreeView(QTreeView):
                 # 消息放入对话：parent = 对话, position = 末尾
                 return (True, target_id, None)
             elif target_type == "folder":
-                # 目录接受任何节点
+                # 目录接受任何节点,但消息节点不能脱离对话存在
+                if dragged_type == "message":
+                    return (False, "", None)
                 return (True, target_id, None)
             else:
                 return (False, "", None)
@@ -897,6 +913,15 @@ class _TreeView(QTreeView):
                 if parent_type == "message":
                     return (False, "", None)
                 parent_id_str = target_parent.data(ROLE_NODE_ID) or ""
+
+            # 消息节点只能作为对话的子节点:兄弟插入时父必须是对话
+            if dragged_type == "message" and parent_id_str != "":
+                parent_node = self._find_item_by_node_id(parent_id_str)
+                if parent_node is None or parent_node.data(ROLE_NODE_TYPE) != "conversation":
+                    return (False, "", None)
+            if dragged_type == "message" and parent_id_str == "":
+                # 消息拖到根级(作为文件夹/对话的兄弟)→ 拒绝
+                return (False, "", None)
 
             # 计算位置
             target_row = target_item.row()
@@ -916,6 +941,10 @@ class _TreeView(QTreeView):
         # 如果拖拽的是根目录本身 → 不允许
         root_item = self._find_item_by_node_id("root")
         if root_item is not None and dragged_id == "root":
+            return False
+        # 消息节点不能脱离对话存在 → 不允许拖到根级
+        item = self._find_item_by_node_id(dragged_id)
+        if item is not None and item.data(ROLE_NODE_TYPE) == "message":
             return False
         return True
 
@@ -968,6 +997,11 @@ class _TreeView(QTreeView):
                         return (False, "", None)
                 return (True, target_id, None)
             elif target_type == "folder":
+                # 目录接受任何节点,但消息节点不能脱离对话存在
+                for did in dragged_ids:
+                    d_item = self._find_item_by_node_id(did)
+                    if d_item is not None and d_item.data(ROLE_NODE_TYPE) == "message":
+                        return (False, "", None)
                 return (True, target_id, None)
             else:
                 return (False, "", None)
@@ -990,6 +1024,21 @@ class _TreeView(QTreeView):
                 if parent_type == "message":
                     return (False, "", None)
                 parent_id_str = target_parent.data(ROLE_NODE_ID) or ""
+
+            # 消息节点只能作为对话的子节点:含消息的批量拖拽,
+            # 兄弟插入时父必须是对话
+            has_msg = False
+            for did in dragged_ids:
+                d_item = self._find_item_by_node_id(did)
+                if d_item is not None and d_item.data(ROLE_NODE_TYPE) == "message":
+                    has_msg = True
+                    break
+            if has_msg:
+                if parent_id_str == "":
+                    return (False, "", None)
+                parent_node = self._find_item_by_node_id(parent_id_str)
+                if parent_node is None or parent_node.data(ROLE_NODE_TYPE) != "conversation":
+                    return (False, "", None)
 
             # ── 防循环：检查每个拖拽节点 ──
             for did in dragged_ids:

@@ -1766,9 +1766,13 @@ class ChatApp:
             node_id, parent, position, prev_id or None, next_id or None
         )
         if not ok:
-            # 被拒绝（3.6：被修改节点同对话移动等）→ 轻量提示
-            self._window.sidebar.tree_panel.show_rejected_hint(
-                "被修改节点不可在同一对话内移动"
+            # 被拒绝（3.6：被修改节点同对话移动等）→ 弹窗告知
+            QMessageBox.warning(
+                self._window,
+                "无法移动",
+                "该拖拽操作被禁止：\n\n"
+                "· 被修改节点（产生过分叉的消息）不可在同一对话内移动；\n"
+                "· 消息节点只能存在于对话中。",
             )
             return
         QTimer.singleShot(0, self._load_tree)
