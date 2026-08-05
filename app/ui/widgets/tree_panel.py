@@ -165,7 +165,8 @@ class _TreeView(QTreeView):
     """
 
     # 信号：dragged_node_id, target_parent_id, position (0-based 插入位置，None=末尾)
-    drop_occurred = Signal(str, str, object)
+    # node_id, target_parent_id, position, prev_id, next_id（分支感知拖拽，3.6）
+    drop_occurred = Signal(str, str, object, str, str)
     # 多选模式 — 批量拖拽：逗号分隔的 dragged_ids, target_parent_id, position
     batch_drop_occurred = Signal(str, str, object)
     # 选中状态变化
@@ -742,7 +743,7 @@ class _TreeView(QTreeView):
                         ",".join(all_dragged_ids), "", None
                     )
                 else:
-                    self.drop_occurred.emit(dragged_id, "", None)
+                    self.drop_occurred.emit(dragged_id, "", None, "", "")
             else:
                 event.ignore()
             self._clear_drag_feedback()
