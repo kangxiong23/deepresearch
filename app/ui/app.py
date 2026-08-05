@@ -731,7 +731,17 @@ class ChatApp:
         - 未完成轮次：丢弃部分内容，重新回答该用户消息（原路径，无分支）。
         - 完整 assistant：进入预分支状态（3.1），流式完成后创建分支；
           停止 = 丢弃回退（4.3）。
+
+        会话以被点击消息所属对话为准（多对话聚合视图下
+        _current_session_id 可能为空或指向另一对话，直接用它
+        会导致静默无反应）。
         """
+        if message_id:
+            node = self._ctrl.get_node(message_id)
+            if node is not None:
+                parent = getattr(node, "parent_id", None)
+                if parent:
+                    session_id = parent
         if not session_id:
             return
         # 预分支/修改状态下禁止（门禁防御）
@@ -1072,7 +1082,17 @@ class ChatApp:
                 w.set_fork_info(m, n, w.fork_point_id, interactive=True)
 
     def _handle_continue(self, session_id: str) -> None:
-        """继续生成未完成的助手消息（DeepSeek Beta 前缀续写）。"""
+        """继续生成未完成的助手消息（DeepSeek Beta 前缀续写）。
+
+        会话以未完成轮次的 user 节点所属对话为准（聚合视图下
+        _current_session_id 可能为空或指向另一对话）。
+        """
+        if self._incomplete_user_id:
+            node = self._ctrl.get_node(self._incomplete_user_id)
+            if node is not None:
+                parent = getattr(node, "parent_id", None)
+                if parent:
+                    session_id = parent
         if not session_id:
             return
         incomplete = self._incomplete_message
