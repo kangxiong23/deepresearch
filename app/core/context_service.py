@@ -108,17 +108,13 @@ class ContextService:
         Returns:
             LLMContext — 可直接传给 LLMClientProtocol.stream_chat()
         """
-        # ── Phase 3: 收集树形上下文资源 ────────
-        tree_block_ids: list[str] = []
+        # ── Phase 3: 收集树形上下文资源（仅附件；上下文块改为整树前序）──
         tree_attachment_paths: list[str] = []
         if self._tree is not None:
-            tree_block_ids, tree_attachment_paths = (
-                self._collect_context_resources(conversation_id)
-            )
+            _, tree_attachment_paths = self._collect_context_resources(conversation_id)
 
-        # 1. 构建系统提示（含树上下文 + 知识图谱注入）
+        # 1. 构建系统提示（含整树前序上下文块 + 附件 + 知识图谱注入）
         system_prompt = self._build_system_prompt(
-            tree_block_ids=tree_block_ids,
             tree_attachment_paths=tree_attachment_paths,
         )
         if self._knowledge_svc and app_config.kg_injection_enabled:
@@ -319,6 +315,46 @@ class ContextService:
     # Phase 3: 树形上下文收集
     # ──────────────────────────────────────────
 
+    def _preorder_context_blocks(self) -> list[ContextBlock]:
+        """按树前序遍历（root → 子节点，DFS）收集所有已挂靠且生效的 ContextBlock。
+
+        ## 模型约定（重要，勿误解为"按对话隔离"）
+        - 对话并非隔离关系：所有启用的消息共同组成一份历史，上下文块也必须全部组织在一起。
+        - 每个上下文块都必须挂靠到某个目录/对话节点才能存在，不存在"未挂靠的全局块"。
+        - 判断某节点挂靠的块是否进 system prompt，看的是该节点**自身** enabled 值：
+            * true 或 "some" → 其下存在启用消息 → 必须加入；
+            * false → 其下无启用消息 → 不加。
+          （级联切换会把状态写回子节点字段，故直接看自身值即可。）
+        - 另有 per-node 开关 context_blocks_enabled：为 False 时该节点挂靠的块也不加入。
+        - 任何对话的 system prompt 一致（整树前序的全部块）。
+        """
+        if self._tree is None:
+            return []
+        all_blocks_by_id = {b.id: b for b in self._store.get_blocks()}
+        tree_root = self._tree.get_tree()
+        nodes_by_parent: dict[str | None, list] = {}
+        for node in tree_root.nodes:
+            nodes_by_parent.setdefault(node.parent_id, []).append(node)
+        for children in nodes_by_parent.values():
+            children.sort(key=lambda n: n.sort_order)
+
+        result: list[ContextBlock] = []
+
+        def visit(node) -> None:
+            if isinstance(node, (FolderNode, ConversationNode)):
+                # 自身 enabled 为 true/"some" 且上下文块未禁用 → 加入其挂靠块
+                if node.enabled is not False and node.context_blocks_enabled:
+                    for bid in node.context_block_ids:
+                        block = all_blocks_by_id.get(bid)
+                        if block is not None and block.enabled and block.content.strip():
+                            result.append(block)
+            for child in nodes_by_parent.get(node.id, []):
+                visit(child)
+
+        for top in nodes_by_parent.get(None, []):
+            visit(top)
+        return result
+
     def _collect_context_resources(
         self,
         conversation_id: str,
@@ -326,6 +362,9 @@ class ContextService:
         """
         从对话节点向上遍历所有父目录，收集 context_block_ids 和
         attachment_paths（去重，保持由近到远的顺序）。
+
+        注意：上下文块的 system prompt 注入已改为整树前序（_preorder_context_blocks），
+        本方法返回的 block_ids 已不再用于拼接，仅保留供测试/扩展；附件仍按当前对话链收集。
 
         仅收集 effectively-enabled 的 FolderNode 的资源。
 
@@ -642,61 +681,35 @@ class ContextService:
 
     def _build_system_prompt(
         self,
-        tree_block_ids: list[str] | None = None,
         tree_attachment_paths: list[str] | None = None,
     ) -> str:
         """
         构建完整的 system prompt，按以下顺序拼接：
 
-        1. 全局用户上下文块（手动添加，source=MANUAL / FILE / TEMPLATE）
-        2. 树目录收集的 ContextBlock（按父目录由近到远，去重）
-        3. 树目录附件文件内容
-        4. 默认系统提示（_DEFAULT_SYSTEM_PROMPT）
+        1. 所有已挂靠的 ContextBlock —— 按**树前序遍历**（root → 子节点，DFS）顺序
+           收集整棵树上挂靠到目录/对话节点的启用块，全部拼入（任何对话一致）
+        2. 树目录附件文件内容
+        3. 默认系统提示（_DEFAULT_SYSTEM_PROMPT，仅当无任何内容时兜底）
+
+        模型约定：每个上下文块都必须挂靠到某个目录或对话节点才能存在；
+        不存在"未挂靠的全局块"。
 
         Args:
-            tree_block_ids:        树收集到的 ContextBlock ID 列表
             tree_attachment_paths: 树收集到的附件文件路径列表
 
         Returns:
             拼接完成的 system prompt 字符串
         """
-        if tree_block_ids is None:
-            tree_block_ids = []
         if tree_attachment_paths is None:
             tree_attachment_paths = []
 
         parts: list[str] = []
-        tree_id_set: set[str] = set(tree_block_ids) if tree_block_ids else set()
 
-        # ── 1. 全局上下文块（排除已在树中的）─
-        all_blocks = self._store.get_blocks()
-        global_enabled = [
-            b for b in all_blocks
-            if b.enabled and b.id not in tree_id_set
-        ]
-        for block in global_enabled:
-            if block.content.strip():
-                parts.append(block.content.strip())
+        # ── 1. 所有已挂靠块，按树前序遍历顺序拼接 ──
+        for block in self._preorder_context_blocks():
+            parts.append(block.content.strip())
 
-        # ── 2. 树目录 ContextBlock ──────────
-        if tree_block_ids and self._tree is not None:
-            all_blocks_by_id = {b.id: b for b in all_blocks}
-            tree_blocks: list[ContextBlock] = []
-            for bid in tree_block_ids:
-                block = all_blocks_by_id.get(bid)
-                if block is None:
-                    print(f"[CTX] 树 ContextBlock 未找到 (全局 storage): {bid}")
-                    continue
-                if block.enabled and block.content.strip():
-                    tree_blocks.append(block)
-
-            if tree_blocks:
-                print(f"[CTX] 注入 {len(tree_blocks)} 个树目录 ContextBlock")
-                tree_text = self._assemble_context_blocks(tree_blocks)
-                if tree_text.strip():
-                    parts.append(tree_text.strip())
-
-        # ── 3. 树目录附件文件 ───────────────
+        # ── 2. 树目录附件文件 ───────────────
         if tree_attachment_paths:
             loaded = 0
             for ap in tree_attachment_paths:
@@ -708,9 +721,9 @@ class ContextService:
             if loaded:
                 print(f"[CTX] 注入 {loaded} 个树附件文件")
 
-        # ── 4. 默认系统提示（兜底）───────────
+        # ── 3. 默认系统提示（兜底）───────────
         # 仅当没有任何上下文内容时追加；只要存在已启用的上下文块 /
-        # 树目录块 / 附件，默认英文提示便不参与拼接
+        # 附件，默认英文提示便不参与拼接
         # （"可被上下文块覆盖"的兜底语义，与拼接预览保持一致）。
         if not parts:
             parts.append(_DEFAULT_SYSTEM_PROMPT)

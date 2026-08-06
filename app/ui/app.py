@@ -164,6 +164,7 @@ class ChatApp:
         tree.move_node.connect(self._on_tree_move)
         tree.manage_context.connect(self._on_tree_manage_context)
         tree.attach_file.connect(self._on_tree_attach_file)
+        tree.toggle_context_blocks.connect(self._on_tree_toggle_context_blocks)
         # 多选批量操作
         tree.batch_operation.connect(self._on_batch_operation)
         tree.batch_move_nodes.connect(self._on_batch_move_nodes)
@@ -1936,6 +1937,13 @@ class ChatApp:
         复用主上下文面板进入节点模式。
         """
         self._open_node_context_mode([folder_id])
+
+    def _on_tree_toggle_context_blocks(self, node_id: str) -> None:
+        """右键菜单 → 启用/禁用节点上下文块。"""
+        if not self._can_mutate_tree():
+            return
+        self._ctrl.on_toggle_context_blocks(node_id)
+        QTimer.singleShot(0, self._load_tree)
 
     def _on_tree_attach_file(self, folder_id: str) -> None:
         """

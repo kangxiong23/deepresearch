@@ -209,6 +209,7 @@ class FolderNode(TreeNode):
     - 可关联上下文块和附件
     """
     context_block_ids: list[str] = field(default_factory=list)
+    context_blocks_enabled: bool = True   # 节点上下文块是否启用（禁用后"+"变半透明、不注入）
     attachment_paths: list[str] = field(default_factory=list)
     node_type: NodeType = field(default=NodeType.FOLDER, init=False)
 
@@ -224,6 +225,7 @@ class ConversationNode(TreeNode):
     summary: str = ""
     message_count: int = 0
     context_block_ids: list[str] = field(default_factory=list)
+    context_blocks_enabled: bool = True   # 节点上下文块是否启用
     attachment_paths: list[str] = field(default_factory=list)
     node_type: NodeType = field(default=NodeType.CONVERSATION, init=False)
 

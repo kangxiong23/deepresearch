@@ -853,6 +853,7 @@ class AppController:
                     has_children=has_children,
                     depth=depth,
                     context_block_count=len(getattr(node, "context_block_ids", [])),
+                    context_blocks_enabled=bool(getattr(node, "context_blocks_enabled", True)),
                     attachment_count=len(getattr(node, "attachment_paths", [])),
                 )
             else:  # ConversationNode
@@ -869,6 +870,7 @@ class AppController:
                     depth=depth,
                     message_count=getattr(node, "message_count", 0),
                     context_block_count=len(getattr(node, "context_block_ids", [])),
+                    context_blocks_enabled=bool(getattr(node, "context_blocks_enabled", True)),
                     attachment_count=len(getattr(node, "attachment_paths", [])),
                 )
             result.append(vm)
@@ -1027,6 +1029,10 @@ class AppController:
     ) -> None:
         """UI 调用：更新目录关联的 ContextBlock 列表。"""
         self._conversation_svc.update_folder_context(folder_id, block_ids)
+
+    def on_toggle_context_blocks(self, node_id: str) -> bool:
+        """UI 调用：切换节点上下文块启用/禁用（右键菜单）。"""
+        return self._conversation_svc.toggle_context_blocks_enabled(node_id)
 
     def on_get_folder_context(self, folder_id: str) -> dict:
         """

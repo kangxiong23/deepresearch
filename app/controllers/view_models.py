@@ -115,7 +115,8 @@ class TreeNodeVM:
     has_children: bool = False               # 是否有子节点（预计算）
     depth: int = 0                           # 缩进级别（预计算）
     message_count: int = 0                   # 仅对话
-    context_block_count: int = 0             # 仅目录
+    context_block_count: int = 0             # 仅目录/对话
+    context_blocks_enabled: bool = True      # 节点上下文块是否启用（仅目录/对话）
     attachment_count: int = 0                # 仅目录
     role: str = ""                           # 仅消息节点: "user" | "assistant" | "thinking"
     fork_display: str = ""                   # 分叉点标题前缀 "<m/n> "（仅信息展示，3.5.2）

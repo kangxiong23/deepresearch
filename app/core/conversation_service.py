@@ -1023,6 +1023,27 @@ class ConversationService:
         self._tree.update_node(folder_id, context_block_ids=context_block_ids)
         print(f"[TREE] 更新节点上下文块 {folder_id}: {len(context_block_ids)} 个块")
 
+    def toggle_context_blocks_enabled(self, node_id: str) -> bool:
+        """
+        切换节点上下文块的启用/禁用状态（右键菜单）。
+
+        Args:
+            node_id: 目录或对话节点 ID
+
+        Returns:
+            切换后的新状态（True=启用，False=禁用）
+        """
+        node = self._tree.get_node(node_id)
+        if node is None or not isinstance(node, (FolderNode, ConversationNode)):
+            return True
+        new_state = not getattr(node, "context_blocks_enabled", True)
+        self._tree.update_node(
+            node_id, context_blocks_enabled=new_state
+        )
+        print(f"[TREE] 切换节点上下文块 {node_id}: -> "
+              f"{'启用' if new_state else '禁用'}")
+        return new_state
+
     def attach_file(self, folder_id: str, file_path: str) -> None:
         """
         将文件路径挂载到节点（目录或对话）。

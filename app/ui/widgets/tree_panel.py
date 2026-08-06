@@ -45,6 +45,7 @@ from PySide6.QtGui import (
     QPolygonF,
     QPixmap,
     QCursor,
+    QIcon,
 )
 
 from app.controllers.view_models import TreeNodeVM
@@ -89,6 +90,14 @@ _MESSAGE_ROLE_LABELS: dict[str, str] = {
     "system": "系统",
 }
 
+# 节点图标（DecorationRole）逻辑尺寸。
+# QTreeView 会把图标缩放到 setIconSize() 指定的图标槽，因此 _ICON_W 需 ≥ 图标最大宽度。
+# 每项图标宽度独立影响文字起点：无块节点只画 emoji（不留白），挂块节点 emoji + "+"。
+_ICON_H = 20               # 图标高度
+_ICON_EMOJI_W = 18         # emoji 区域宽度（无块节点图标总宽 = 此值，不留白）
+_ICON_PLUS_W = 10           # "+" 徽标区域宽度（仅挂块节点，紧贴 emoji 右侧）
+_ICON_W = _ICON_EMOJI_W + _ICON_PLUS_W   # 挂块节点图标总宽 / setIconSize 图标槽上限
+
 # 消息节点预览最大字符数
 _MESSAGE_PREVIEW_MAX = 30
 
@@ -124,6 +133,51 @@ def _icon_for_node(node_type: str, role: str = "") -> str:
     if node_type == "message":
         return _MESSAGE_ROLE_ICONS.get(role, "💬")
     return _NODE_ICONS.get(node_type, "📄")
+
+
+def _build_node_icon(node: TreeNodeVM) -> QIcon:
+    """构建节点图标（emoji + 可选 "+" 徽标），返回 QIcon。
+
+    模型约定：上下文块必须挂靠到目录/对话节点才能存在；挂靠了块的节点
+    图标后显示 "+" 徽标（仅展示、不可交互）。禁用上下文块（context_blocks_enabled=False）
+    时，"+" 用低 alpha（半透明）绘制，仅该徽标变淡，不整行变淡。
+
+    尺寸注意：QTreeView 的 iconSize() 会把 DecorationRole 图标缩放到图标槽，
+    因此图标 pixmap 逻辑尺寸必须与树视图 setIconSize() 一致（_ICON_W×_ICON_H），
+    并做 DPR 适配（否则 HiDPI 下会缩小一半）。emoji 用与文字相同字号（SIZE_SM）。
+    """
+    emoji = _icon_for_node(node.node_type, node.role)
+    has_ctx = (
+        node.node_type in ("folder", "conversation")
+        and getattr(node, "context_block_count", 0) > 0
+    )
+    disabled = has_ctx and not getattr(node, "context_blocks_enabled", True)
+
+    app = QApplication.instance()
+    dpr = app.devicePixelRatio() if app is not None else 1.0
+    h = _ICON_H
+    # 无块节点图标只含 emoji（不留白）；挂块节点 emoji + "+" 徽标
+    total_w = _ICON_EMOJI_W + (_ICON_PLUS_W if has_ctx else 0)
+    pix = QPixmap(int(total_w * dpr), int(h * dpr))
+    pix.setDevicePixelRatio(dpr)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    painter.setFont(Fonts.body(Fonts.SIZE_SM))
+    painter.setPen(QColor(Colors.TEXT_SECONDARY))
+    painter.drawText(
+        0, 0, _ICON_EMOJI_W, h,
+        Qt.AlignmentFlag.AlignCenter, emoji,
+    )
+    if has_ctx:
+        alpha = 100 if disabled else 255
+        painter.setPen(QColor(122, 128, 153, alpha))
+        painter.drawText(
+            _ICON_EMOJI_W, 0, _ICON_PLUS_W, h,
+            Qt.AlignmentFlag.AlignCenter, "+",
+        )
+    painter.end()
+    return QIcon(pix)
 
 
 def _enabled_tooltip(enabled) -> str:
@@ -1312,6 +1366,7 @@ class TreePanel(QWidget):
     #       空串表示无;供分支感知拖拽判定"分叉点与被修改节点之间"等场景,3.6）
     manage_context = Signal(str)
     attach_file = Signal(str)
+    toggle_context_blocks = Signal(str)   # 启用/禁用节点上下文块（右键菜单）
 
     # ── 多选模式批量操作信号 ──
     # operation: str ("toggle_enabled", "delete", "rename", "manage_context", "attach_file")
@@ -1349,6 +1404,9 @@ class TreePanel(QWidget):
             self._tree_view.setStyle(_TreeStyle(base_style))
         self._tree_view.setModel(self._model)
         self._tree_view.setHeaderHidden(True)
+        # 图标槽尺寸必须与 _build_node_icon 的 pixmap 逻辑尺寸一致，
+        # 否则 DecorationRole 图标会被缩放到默认小图标槽（约 16px）而变小。
+        self._tree_view.setIconSize(QSize(_ICON_W, _ICON_H))
         self._tree_view.setIndentation(18)
         self._tree_view.setAnimated(False)  # 禁用动画：展开动画在模型重建后可能访问已删除的 item 导致 segfault
         self._tree_view.setExpandsOnDoubleClick(True)
@@ -1790,20 +1848,11 @@ class TreePanel(QWidget):
             display_text = display_title
 
         # ── 图标 ──────────────────────────────────
-        icon_text = _icon_for_node(node.node_type, node.role)
-        # 挂载了上下文块的文件夹/对话 → 图标后追加 "+" 标记（仅展示，占宽最小）
-        ctx_marker = ""
-        if (
-            node.node_type in ("folder", "conversation")
-            and getattr(node, "context_block_count", 0) > 0
-        ):
-            ctx_marker = "+"
-        # QStandardItem 不支持 emoji 作为 icon 的 decoration，
-        # 所以将图标作为文本前缀
-        display_text = f"  {icon_text}{ctx_marker}  {display_text}"
-
-        # ── 创建 item ─────────────────────────────
-        item = QStandardItem(display_text)
+        # 挂载了上下文块的文件夹/对话 → 图标内合成 "+" 徽标（禁用时"+"半透明）
+        # 图标用 QPixmap 作为 DecorationRole，从而能单独控制 "+" 的 alpha
+        # （QTreeView 不支持富文本，无法只给行内 "+" 上色，故改用图标合成）。
+        item = QStandardItem(f" {display_text}")
+        item.setIcon(_build_node_icon(node))
         item.setToolTip(_build_tooltip(node))
         item.setFont(Fonts.body(Fonts.SIZE_SM))
 
@@ -2198,6 +2247,17 @@ class TreePanel(QWidget):
         if "attach_file" in available_ops:
             menu.addAction("📎 添加附件", lambda: self.batch_operation.emit("attach_file", batch_ids))
 
+        # ── 启用/禁用上下文块（仅该节点有上下文块时，单节点）──
+        if node_type in ("folder", "conversation") and not is_batch:
+            node_vm = next((n for n in self._tree_data if n.id == nid), None)
+            if node_vm is not None and node_vm.context_block_count > 0:
+                ctx_on = getattr(node_vm, "context_blocks_enabled", True)
+                ctx_label = "🚫 禁用上下文块" if ctx_on else "✅ 启用上下文块"
+                menu.addAction(
+                    ctx_label,
+                    lambda: self.toggle_context_blocks.emit(nid),
+                )
+
         menu.addSeparator()
 
         # ── 删除（所有节点通用）──
@@ -2271,6 +2331,8 @@ def _build_tooltip(node: TreeNodeVM) -> str:
     if node.node_type in ("folder", "conversation"):
         if node.context_block_count > 0:
             parts.append(f"上下文块: {node.context_block_count}")
+            if not getattr(node, "context_blocks_enabled", True):
+                parts.append("上下文块: 已禁用")
         if node.attachment_count > 0:
             parts.append(f"附件: {node.attachment_count}")
     if node.updated_at:
