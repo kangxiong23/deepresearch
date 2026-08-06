@@ -73,6 +73,19 @@ class ContextStore:
                 break
         self._write_json(self._blocks_path, blocks)
 
+    def reorder_blocks(self, block_ids: list[str]) -> None:
+        """按给定 ID 顺序重排所有块的 order 值（0..N-1）。
+
+        Args:
+            block_ids: 目标顺序的块 ID 列表；不在列表中的块保留原 order。
+        """
+        blocks = self._load_blocks_raw()
+        order_map = {bid: i for i, bid in enumerate(block_ids)}
+        for b in blocks:
+            if b.get("id") in order_map:
+                b["order"] = order_map[b["id"]]
+        self._write_json(self._blocks_path, blocks)
+
     # ──────────────────────────────────────────
     # ContextTemplate CRUD
     # ──────────────────────────────────────────

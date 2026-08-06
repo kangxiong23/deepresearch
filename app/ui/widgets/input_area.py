@@ -17,8 +17,8 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QFileDialog,
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QKeyEvent, QTextOption
+from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtGui import QFont, QFontMetrics, QKeyEvent, QTextOption
 
 import config as app_config
 from app.ui.theme import Colors, Fonts, Spacing, Radius
@@ -417,6 +417,13 @@ class InputArea(QFrame):
         self._generating: bool = False
         self._edit_mode: bool = False   # 修改状态（5.1/5.2）
 
+        # ── 输入栏高度控制 ──────────────────────
+        self._pinned: bool = True          # True=自动调整高度, False=手动拖动
+        self._manual_height: int = 0       # 手动模式下保存的用户拖拽高度
+        self._resize_dragging: bool = False
+        self._resize_drag_start_y: float = 0.0
+        self._resize_drag_start_h: int = 0
+
         # ── 附件条 ──────────────────────────────
         self._attachment_bar = AttachmentBar()
 
@@ -449,6 +456,43 @@ class InputArea(QFrame):
         # 启用 Enter 发送
         self._text_edit.installEventFilter(self)
         self._text_edit.setWordWrapMode(QTextOption.WrapMode.WordWrap)
+
+        # ── 行高 & 最大高度（14 行）─────────────
+        fm = self._text_edit.fontMetrics()
+        self._line_height = fm.lineSpacing()
+        # 14 行文字高度 + 上下 padding (8+8 from stylesheet)
+        self._max_text_height = self._line_height * 14 + 16
+        self._text_edit.setMaximumHeight(self._max_text_height)
+        # 文本变化时自动调整高度（仅图钉模式生效）
+        self._text_edit.textChanged.connect(self._on_text_changed_for_resize)
+
+        # ── 拖拽把手（手动调整高度模式可见）────
+        self._resize_handle = QFrame()
+        self._resize_handle.setObjectName("resizeHandle")
+        self._resize_handle.setFixedHeight(6)
+        self._resize_handle.setCursor(Qt.CursorShape.SizeVerCursor)
+        self._resize_handle.setToolTip("拖动调整输入栏高度")
+        self._resize_handle.setStyleSheet(f"""
+            QFrame#resizeHandle {{
+                background-color: transparent;
+                border: none;
+            }}
+            QFrame#resizeHandle:hover {{
+                background-color: {Colors.BORDER};
+            }}
+        """)
+        self._resize_handle.setVisible(False)  # 初始图钉模式=自动，隐藏把手
+        self._resize_handle.installEventFilter(self)
+        # 启用 hover 样式（QFrame 默认不追踪鼠标）
+        self._resize_handle.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+        # ── 图钉按钮 ────────────────────────────
+        self._pin_btn = QPushButton("📌")
+        self._pin_btn.setFont(Fonts.body(12))
+        self._pin_btn.setFixedSize(28, 28)
+        self._pin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._pin_btn.clicked.connect(self._on_pin_toggle)
+        self._apply_pin_style()
 
         # ── 发送/停止按钮 ───────────────────────
         self._send_btn = QPushButton()
@@ -517,6 +561,7 @@ class InputArea(QFrame):
         toolbar.setContentsMargins(0, Spacing.SM, 0, 0)
         toolbar.setSpacing(Spacing.SM)
         toolbar.addWidget(self._file_btn)
+        toolbar.addWidget(self._pin_btn)
         toolbar.addWidget(self._thinking_chip)
         toolbar.addWidget(self._effort_selector)
         toolbar.addWidget(self._search_chip)
@@ -529,8 +574,9 @@ class InputArea(QFrame):
             Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD
         )
         layout.setSpacing(Spacing.SM)
+        layout.addWidget(self._resize_handle)
         layout.addWidget(self._attachment_bar)
-        layout.addLayout(input_row)
+        layout.addLayout(input_row, stretch=1)
         layout.addLayout(toolbar)
 
         # ── 边框样式 ────────────────────────────
@@ -546,10 +592,140 @@ class InputArea(QFrame):
             }}
         """)
 
-    # ── 事件过滤器（Enter 发送）────────────────
+    # ── 图钉 / 高度控制 ───────────────────────
+
+    def _on_pin_toggle(self) -> None:
+        """切换图钉模式：自动调整 ↔ 手动拖动。"""
+        self._pinned = not self._pinned
+        self._apply_pin_style()
+        self._resize_handle.setVisible(not self._pinned)
+
+        if self._pinned:
+            # 切回自动模式：解除 InputArea 的固定高度，让文本驱动高度
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(16777215)  # QWIDGETSIZE_MAX
+            self._auto_resize_text_edit()
+        else:
+            # 切到手动模式：以当前高度为初始手动高度
+            current = self.height()
+            self._manual_height = current if current > 50 else 200
+            self._apply_manual_height()
+
+    def _apply_pin_style(self) -> None:
+        """根据图钉状态更新按钮样式。"""
+        if self._pinned:
+            self._pin_btn.setStyleSheet(f"""
+                QPushButton {{
+                    color: {Colors.PRIMARY};
+                    background-color: {Colors.PRIMARY_GLOW};
+                    border: 1px solid {Colors.PRIMARY};
+                    border-radius: 4px;
+                    padding: 2px;
+                }}
+                QPushButton:hover {{
+                    background-color: {Colors.PRIMARY}33;
+                }}
+            """)
+            self._pin_btn.setToolTip("自动调整高度：已启用（点击切换为手动调整）")
+        else:
+            self._pin_btn.setStyleSheet(f"""
+                QPushButton {{
+                    color: {Colors.TEXT_SECONDARY};
+                    background-color: transparent;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 2px;
+                }}
+                QPushButton:hover {{
+                    color: {Colors.TEXT_PRIMARY};
+                    background-color: {Colors.BG_OVERLAY};
+                }}
+            """)
+            self._pin_btn.setToolTip("手动调整高度：已禁用（点击切换为自动调整）")
+
+    def _on_text_changed_for_resize(self) -> None:
+        """文本内容变化时，图钉模式下自动调整高度。"""
+        if self._pinned:
+            # 延迟到下一轮事件循环，确保 QTextDocument 已完成布局
+            QTimer.singleShot(0, self._auto_resize_text_edit)
+
+    def _auto_resize_text_edit(self) -> None:
+        """根据文档内容高度调整文本编辑框高度（1~14 行）。"""
+        if not self._pinned:
+            return
+
+        doc = self._text_edit.document()
+        doc_height = int(doc.size().height())
+        # stylesheet padding 8px top + 8px bottom
+        target = doc_height + 16
+        min_h = self._line_height + 16   # 最少 1 行
+        target = max(min_h, min(target, self._max_text_height))
+
+        self._text_edit.setMinimumHeight(target)
+        self._text_edit.setMaximumHeight(target)
+
+    def _estimate_chrome(self) -> int:
+        """估算输入栏中除文本编辑框内容区之外的总高度（布局边距/间距/控件）。"""
+        chrome = 0
+        # layout margins (top + bottom)
+        chrome += Spacing.MD * 2  # 24
+        # layout spacing: resize_handle ↔ attachment ↔ input_row ↔ toolbar
+        # 4 widgets → 3 gaps (attachment 隐藏时不计高度但 gap 仍存在)
+        chrome += Spacing.SM * 3  # 24
+        # resize handle
+        if self._resize_handle.isVisible():
+            chrome += self._resize_handle.height()  # 6
+        # attachment bar
+        if self._attachment_bar.isVisible():
+            chrome += self._attachment_bar.sizeHint().height()
+        # toolbar — 芯片/按钮高度 ≈ 每行 36~40
+        chrome += 40
+        return chrome
+
+    def _apply_manual_height(self) -> None:
+        """将手动拖拽高度应用到 InputArea 和文本编辑框。"""
+        h = self._manual_height
+        # 上下限：至少 1 行文字 + chrome，至多 14 行文字 + chrome
+        chrome = self._estimate_chrome()
+        min_total = self._line_height + 16 + chrome
+        max_total = self._max_text_height + chrome
+        h = max(min_total, min(h, max_total))
+        self._manual_height = h
+
+        self.setMinimumHeight(h)
+        self.setMaximumHeight(h)
+
+        # 文本编辑框填充剩余空间
+        text_h = h - chrome
+        text_h = max(self._line_height + 16, min(text_h, self._max_text_height))
+        self._text_edit.setMinimumHeight(text_h)
+        self._text_edit.setMaximumHeight(text_h)
+
+    # ── 事件过滤器（Enter 发送 + 拖拽把手）───
 
     def eventFilter(self, obj, event) -> bool:
-        """拦截文本编辑框的按键事件：Enter 发送，Shift+Enter 换行。"""
+        """拦截文本编辑框按键（Enter 发送）和拖拽把手鼠标事件。"""
+        # ── 拖拽把手：鼠标拖拽调整输入栏高度 ──
+        if obj is self._resize_handle:
+            if event.type() == event.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._resize_dragging = True
+                    self._resize_drag_start_y = event.globalPosition().y()
+                    self._resize_drag_start_h = self.height()
+                    self._resize_handle.grabMouse()
+                    return True
+            elif event.type() == event.Type.MouseMove and self._resize_dragging:
+                delta = self._resize_drag_start_y - event.globalPosition().y()
+                self._manual_height = self._resize_drag_start_h + int(delta)
+                self._apply_manual_height()
+                return True
+            elif event.type() == event.Type.MouseButtonRelease and self._resize_dragging:
+                self._resize_dragging = False
+                self._resize_handle.releaseMouse()
+                return True
+            return super().eventFilter(obj, event)
+
+        # ── 文本编辑框：Enter 发送 ──
         if obj is self._text_edit and event.type() == event.Type.KeyPress:
             key_event = event
             if key_event.key() == Qt.Key.Key_Return or key_event.key() == Qt.Key.Key_Enter:
@@ -557,6 +733,12 @@ class InputArea(QFrame):
                     self._on_send_click()
                     return True
         return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event) -> None:
+        """InputArea 宽度变化时（窗口缩放），图钉模式下重算文本高度（影响换行）。"""
+        super().resizeEvent(event)
+        if self._pinned:
+            QTimer.singleShot(0, self._auto_resize_text_edit)
 
     # ── 按钮样式 ──────────────────────────────
 

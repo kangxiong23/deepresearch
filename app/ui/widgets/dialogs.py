@@ -165,6 +165,94 @@ def show_confirm_dialog(
         on_confirm()
 
 
+# ──────────────────────────────────────────────
+# 节点上下文管理相关确认对话框
+# ──────────────────────────────────────────────
+
+
+def _style_msg_box(msg_box: QMessageBox) -> None:
+    """统一 QMessageBox 深色样式。"""
+    msg_box.setStyleSheet(f"""
+        QMessageBox {{
+            background-color: {Colors.BG_ELEVATED};
+        }}
+        QLabel {{
+            color: {Colors.TEXT_PRIMARY};
+            font-size: {Fonts.SIZE_MD}px;
+        }}
+        QPushButton {{
+            background-color: {Colors.BG_OVERLAY};
+            color: {Colors.TEXT_PRIMARY};
+            border: 1px solid {Colors.BORDER};
+            border-radius: {Radius.SM}px;
+            padding: 6px 16px;
+            font-size: {Fonts.SIZE_SM}px;
+        }}
+        QPushButton:hover {{
+            background-color: {Colors.BG_ELEVATED};
+            border-color: {Colors.PRIMARY};
+        }}
+    """)
+
+
+def show_template_overwrite_confirm_dialog(parent: QWidget, name: str) -> str:
+    """
+    模板标题已存在时的三选一确认。
+
+    Returns:
+        "cancel"       — 取消本次保存（保留输入）
+        "no_overwrite" — 不覆盖（保留输入，用户可改名重试）
+        "overwrite"    — 覆盖同名模板
+    """
+    msg_box = QMessageBox(parent)
+    msg_box.setWindowTitle("模板已存在")
+    msg_box.setText(
+        f"模板库中已存在标题为「{name}」的模板，\n保存将覆盖该模板。是否继续？"
+    )
+    msg_box.setIcon(QMessageBox.Icon.Question)
+    cancel_btn = msg_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+    no_btn = msg_box.addButton("不覆盖", QMessageBox.ButtonRole.DestructiveRole)
+    overwrite_btn = msg_box.addButton("覆盖", QMessageBox.ButtonRole.AcceptRole)
+    msg_box.setDefaultButton(no_btn)
+    _style_msg_box(msg_box)
+    msg_box.exec()
+    clicked = msg_box.clickedButton()
+    if clicked is overwrite_btn:
+        return "overwrite"
+    if clicked is no_btn:
+        return "no_overwrite"
+    return "cancel"
+
+
+def show_node_apply_confirm_dialog(parent: QWidget, node_name: str) -> str:
+    """
+    节点模式下关闭面板且有未应用修改时的三选一确认。
+
+    Returns:
+        "cancel"  — 不关闭，继续编辑
+        "discard" — 不应用，直接关闭
+        "apply"   — 应用后关闭
+    """
+    msg_box = QMessageBox(parent)
+    msg_box.setWindowTitle("确认是否应用")
+    msg_box.setText(
+        f"节点「{node_name}」的上下文块有未应用的修改。\n\n是否应用？"
+    )
+    msg_box.setIcon(QMessageBox.Icon.Question)
+    cancel_btn = msg_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+    discard_btn = msg_box.addButton("不应用", QMessageBox.ButtonRole.DestructiveRole)
+    apply_btn = msg_box.addButton("应用", QMessageBox.ButtonRole.AcceptRole)
+    msg_box.setDefaultButton(apply_btn)
+    _style_msg_box(msg_box)
+    msg_box.exec()
+    clicked = msg_box.clickedButton()
+    if clicked is apply_btn:
+        return "apply"
+    if clicked is discard_btn:
+        return "discard"
+    return "cancel"
+
+
 # ══════════════════════════════════════════════════
 # 回收站对话框
 # ══════════════════════════════════════════════════
@@ -448,194 +536,3 @@ def show_recycle_bin_dialog(
     dlg.exec()
 
 
-# ══════════════════════════════════════════════════
-# 上下文块管理对话框
-# ══════════════════════════════════════════════════
-
-
-class _ContextBlockManagerDialog(QDialog):
-    """
-    上下文块管理对话框 — 列出所有可用块，用复选框选择关联到目录。
-    """
-
-    def __init__(
-        self,
-        parent: QWidget,
-        folder_title: str,
-        all_blocks: list[dict],
-        current_block_ids: list[str],
-        on_save: Callable[[list[str]], None],
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(f"管理上下文 — {folder_title}")
-        self.setMinimumSize(480, 380)
-        self.setModal(True)
-        self._on_save = on_save
-
-        # 选中状态集合
-        self._selected_ids: set[str] = set(current_block_ids)
-        self._checkboxes: list[tuple[str, QCheckBox]] = []
-
-        self._setup_ui(folder_title, all_blocks)
-        self._apply_style()
-
-    def _setup_ui(self, folder_title: str, all_blocks: list[dict]) -> None:
-        """构建对话框 UI。"""
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
-        layout.setSpacing(Spacing.MD)
-
-        # ── 提示标签 ──────────────────────────────
-        hint = QLabel("选择要关联到该目录的上下文块:")
-        hint.setFont(Fonts.body(Fonts.SIZE_SM))
-        hint.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; background: transparent; border: none;")
-        layout.addWidget(hint)
-
-        # ── 块列表区域 ────────────────────────────
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(f"""
-            QScrollArea {{
-                background-color: transparent;
-                border: 1px solid {Colors.BORDER};
-                border-radius: {Radius.MD}px;
-            }}
-        """)
-
-        container = QWidget()
-        container.setStyleSheet("QWidget { background-color: transparent; }")
-        container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(Spacing.SM, Spacing.SM, Spacing.SM, Spacing.SM)
-        container_layout.setSpacing(Spacing.XS)
-
-        if not all_blocks:
-            empty_label = QLabel("暂无可用上下文块")
-            empty_label.setFont(Fonts.body(Fonts.SIZE_SM))
-            empty_label.setStyleSheet(f"color: {Colors.TEXT_DISABLED}; background: transparent; border: none;")
-            empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            container_layout.addWidget(empty_label)
-        else:
-            for block in all_blocks:
-                bid = block.get("id", "")
-                label_text = block.get("label", "")
-                preview = block.get("preview", "")[:40]
-
-                cb = QCheckBox(f"{label_text} — {preview}")
-                cb.setFont(Fonts.body(Fonts.SIZE_SM))
-                cb.setChecked(bid in self._selected_ids)
-                cb.setStyleSheet(f"""
-                    QCheckBox {{
-                        color: {Colors.TEXT_PRIMARY};
-                        spacing: {Spacing.SM}px;
-                    }}
-                    QCheckBox::indicator {{
-                        width: 18px;
-                        height: 18px;
-                        border: 1px solid {Colors.BORDER};
-                        border-radius: 3px;
-                        background-color: transparent;
-                    }}
-                    QCheckBox::indicator:checked {{
-                        background-color: {Colors.PRIMARY};
-                        border-color: {Colors.PRIMARY};
-                    }}
-                    QCheckBox::indicator:hover {{
-                        border-color: {Colors.PRIMARY};
-                    }}
-                """)
-                cb.toggled.connect(
-                    lambda checked, block_id=bid: self._on_toggle(block_id, checked)
-                )
-                self._checkboxes.append((bid, cb))
-                container_layout.addWidget(cb)
-
-        container_layout.addStretch()
-        scroll.setWidget(container)
-        layout.addWidget(scroll, stretch=1)
-
-        # ── 底部按钮行 ────────────────────────────
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(Spacing.SM)
-        btn_layout.addStretch()
-
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setFont(Fonts.body(Fonts.SIZE_SM))
-        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        cancel_btn.setStyleSheet(f"""
-            QPushButton {{
-                color: {Colors.TEXT_PRIMARY};
-                background-color: {Colors.BG_OVERLAY};
-                border: 1px solid {Colors.BORDER};
-                border-radius: {Radius.MD}px;
-                padding: 6px 16px;
-            }}
-            QPushButton:hover {{
-                border-color: {Colors.PRIMARY};
-            }}
-        """)
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-
-        save_btn = QPushButton("保存")
-        save_btn.setFont(Fonts.body(Fonts.SIZE_SM, QFont.Weight.Bold))
-        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        save_btn.setStyleSheet(f"""
-            QPushButton {{
-                color: {Colors.BG_BASE};
-                background-color: {Colors.PRIMARY};
-                border: none;
-                border-radius: {Radius.MD}px;
-                padding: 6px 16px;
-            }}
-            QPushButton:hover {{
-                background-color: {Colors.PRIMARY_DIM};
-            }}
-        """)
-        save_btn.clicked.connect(self._on_save_clicked)
-        btn_layout.addWidget(save_btn)
-
-        layout.addLayout(btn_layout)
-
-    def _on_toggle(self, block_id: str, checked: bool) -> None:
-        """切换复选框时更新选中集合。"""
-        if checked:
-            self._selected_ids.add(block_id)
-        else:
-            self._selected_ids.discard(block_id)
-
-    def _on_save_clicked(self) -> None:
-        """保存按钮：触发回调并关闭。"""
-        self._on_save(list(self._selected_ids))
-        self.accept()
-
-    def _apply_style(self) -> None:
-        """应用对话框整体样式。"""
-        self.setStyleSheet(f"""
-            QDialog {{
-                background-color: {Colors.BG_SURFACE};
-            }}
-        """)
-
-
-def show_context_block_manager_dialog(
-    parent: QWidget,
-    folder_title: str,
-    all_blocks: list[dict],
-    current_block_ids: list[str],
-    on_save: Callable[[list[str]], None],
-) -> None:
-    """
-    弹出上下文块管理对话框。
-
-    Args:
-        parent:            父窗口
-        folder_title:      目录名称（用于标题）
-        all_blocks:        所有可用的 ContextBlock（dict 格式，含 id/label/preview/enabled）
-        current_block_ids: 当前已选中的 block ID 列表
-        on_save:           保存回调，传入新的选中 ID 列表
-    """
-    dlg = _ContextBlockManagerDialog(
-        parent, folder_title, all_blocks, current_block_ids, on_save
-    )
-    dlg.exec()

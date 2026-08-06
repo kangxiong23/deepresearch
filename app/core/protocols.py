@@ -208,6 +208,10 @@ class ContextStoreProtocol(Protocol):
         """切换上下文块的启用状态。"""
         ...
 
+    def reorder_blocks(self, block_ids: list[str]) -> None:
+        """按给定 ID 顺序重排所有块的 order 值（0..N-1）。"""
+        ...
+
     def list_templates(self) -> list[ContextTemplate]:
         """获取所有模板。"""
         ...

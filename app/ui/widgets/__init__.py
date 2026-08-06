@@ -12,7 +12,6 @@ from app.ui.widgets.dialogs import (
     show_new_folder_dialog,
     show_confirm_dialog,
     show_recycle_bin_dialog,
-    show_context_block_manager_dialog,
 )
 
 __all__ = [
@@ -31,5 +30,4 @@ __all__ = [
     "show_new_folder_dialog",
     "show_confirm_dialog",
     "show_recycle_bin_dialog",
-    "show_context_block_manager_dialog",
 ]

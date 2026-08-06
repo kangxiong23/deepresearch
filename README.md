@@ -53,6 +53,6 @@ LOG_LEVEL=DEBUG python main.py
 | `DEEPSEEK_API_KEY` | ✅ | — | DeepSeek API 密钥 |
 | `DEEPSEEK_BASE_URL` | ❌ | `https://api.deepseek.com` | API 基础 URL |
 | `DEFAULT_MODEL` | ❌ | `deepseek-v4-flash` | 默认模型 |
-| `MAX_TOKENS` | ❌ | `8192` | 单次回复最大 token |
+| `MAX_TOKENS` | ❌ | `100000` | 单次回复最大 token |
 | `LOG_LEVEL` | ❌ | `INFO` | 日志级别（DEBUG/INFO/WARNING）|
 | `DB_PATH` | ❌ | `data/deepresearch.db` | SQLite 数据库路径 |

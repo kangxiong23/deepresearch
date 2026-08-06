@@ -115,6 +115,9 @@ _OPS_BY_TYPE: dict[str, set[str]] = {
 SELECTION_BG = QColor("#1E2A4A")
 SELECTION_BORDER = QColor("#5B7EC2")
 
+# 节点上下文管理模式高亮（区别于激活/选中/拖拽）
+NODE_CTX_BG = QColor("#17345C")
+
 
 def _icon_for_node(node_type: str, role: str = "") -> str:
     """返回节点类型对应的 emoji 图标。"""
@@ -181,6 +184,8 @@ class _TreeView(QTreeView):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._last_click_on_checkbox: bool = False
+        # 节点上下文管理模式高亮的节点 id（"" = 无；与 TreePanel 同步）
+        self._node_ctx_highlight_id: str = ""
         # 拖拽状态跟踪
         self._drag_active: bool = False
         self._drag_node_type: str = ""
@@ -244,13 +249,9 @@ class _TreeView(QTreeView):
             item.setBackground(QBrush(SELECTION_BG))
             item.setData(True, ROLE_IS_SELECTED)
         else:
-            # 恢复默认背景（保留 active 状态的颜色）
-            is_active = item.data(ROLE_IS_ACTIVE)
-            if is_active:
-                item.setBackground(QBrush(QColor(Colors.BG_OVERLAY)))
-            else:
-                item.setBackground(QBrush(QColor("transparent")))
+            # 恢复默认背景（保留 active / 节点上下文高亮状态的颜色）
             item.setData(False, ROLE_IS_SELECTED)
+            self._restore_item_background(item)
 
     def _update_selection_visual(self, item: QStandardItem, selected: bool) -> None:
         """更新选中视觉（_apply_selection_visual 的别名，对外统一命名）。"""
@@ -440,13 +441,16 @@ class _TreeView(QTreeView):
         super().mouseMoveEvent(event)
 
     def _restore_item_background(self, item: QStandardItem) -> None:
-        """按优先级恢复 item 背景：选中 > 激活 > 透明。"""
+        """按优先级恢复 item 背景：选中 > 激活 > 节点上下文高亮 > 透明。"""
         is_selected = item.data(ROLE_IS_SELECTED)
         is_active = item.data(ROLE_IS_ACTIVE)
+        nid = item.data(ROLE_NODE_ID)
         if is_selected:
             item.setBackground(QBrush(SELECTION_BG))
         elif is_active:
             item.setBackground(QBrush(QColor(Colors.BG_OVERLAY)))
+        elif nid and nid == self._node_ctx_highlight_id:
+            item.setBackground(QBrush(NODE_CTX_BG))
         else:
             item.setBackground(QBrush(QColor("transparent")))
 
@@ -1131,15 +1135,8 @@ class _TreeView(QTreeView):
         if self._hover_target_index is not None and self._hover_target_index.isValid():
             item = self.model().itemFromIndex(self._hover_target_index)
             if item is not None:
-                # 恢复原始背景（选中 > 激活 > 默认）
-                is_selected = item.data(ROLE_IS_SELECTED)
-                is_active = item.data(ROLE_IS_ACTIVE)
-                if is_selected:
-                    item.setBackground(QBrush(SELECTION_BG))
-                elif is_active:
-                    item.setBackground(QBrush(QColor(Colors.BG_OVERLAY)))
-                else:
-                    item.setBackground(QBrush(QColor("transparent")))
+                # 恢复原始背景（选中 > 激活 > 节点上下文高亮 > 默认）
+                self._restore_item_background(item)
                 # 不清除 ROLE_IS_ACTIVE（由 set_active 管理）
         self._last_highlighted_row = -1
         self._last_highlighted_parent = None
@@ -1337,6 +1334,8 @@ class TreePanel(QWidget):
         self._ops_locked: bool = False
         # 修改状态下半透明的节点（5.1.4）
         self._edited_node_id: str = ""
+        # 节点上下文管理模式高亮的节点 id（"" = 无）
+        self._node_ctx_highlight_id: str = ""
 
         # ── Model ─────────────────────────────────
         self._model = QStandardItemModel(0, 1, self)
@@ -1496,11 +1495,8 @@ class TreePanel(QWidget):
             # 清除旧激活节点的背景
             old_item = self._find_item_by_node_id(previous_id)
             if old_item is not None:
-                if old_item.data(ROLE_IS_SELECTED):
-                    old_item.setBackground(QBrush(SELECTION_BG))
-                else:
-                    old_item.setBackground(QBrush(QColor("transparent")))
                 old_item.setData(False, ROLE_IS_ACTIVE)
+                self._tree_view._restore_item_background(old_item)
 
             # 设置新激活节点的背景
             new_item = self._find_item_by_node_id(node_id)
@@ -1593,6 +1589,47 @@ class TreePanel(QWidget):
             child = item.child(i)
             if child is not None:
                 self._apply_edited_style_recursive(child)
+
+    # ──────────────────────────────────────────────
+    # 节点上下文管理模式高亮
+    # ──────────────────────────────────────────────
+
+    def set_node_context_highlight(self, node_id: str) -> None:
+        """高亮正在管理上下文块的节点（独立于激活/选中高亮）。"""
+        self._node_ctx_highlight_id = node_id or ""
+        self._tree_view._node_ctx_highlight_id = self._node_ctx_highlight_id
+        self._apply_node_ctx_highlight()
+
+    def clear_node_context_highlight(self) -> None:
+        """清除节点上下文管理模式高亮。"""
+        self._node_ctx_highlight_id = ""
+        self._tree_view._node_ctx_highlight_id = ""
+        self._apply_node_ctx_highlight()
+
+    def _apply_node_ctx_highlight(self) -> None:
+        """按当前 _node_ctx_highlight_id 重绘整棵树的条目背景。"""
+        if self._model is None:
+            return
+        self._building = True
+        try:
+            root = self._model.invisibleRootItem()
+            if root is not None:
+                self._walk_node_ctx(root)
+        finally:
+            self._building = False
+
+    def _walk_node_ctx(self, parent: QStandardItem) -> None:
+        """递归应用/清除节点上下文高亮。"""
+        for row in range(parent.rowCount()):
+            child = parent.child(row)
+            if child is None:
+                continue
+            nid = child.data(ROLE_NODE_ID)
+            if nid and nid == self._node_ctx_highlight_id:
+                child.setBackground(QBrush(NODE_CTX_BG))
+            else:
+                self._tree_view._restore_item_background(child)
+            self._walk_node_ctx(child)
 
     # ──────────────────────────────────────────────
     # 多选模式公开接口
@@ -1708,6 +1745,12 @@ class TreePanel(QWidget):
                     if sel_item is not None:
                         sel_item.setBackground(QBrush(SELECTION_BG))
                         sel_item.setData(True, ROLE_IS_SELECTED)
+
+            # ── 8. 恢复节点上下文管理模式高亮 ──────
+            if self._node_ctx_highlight_id:
+                hl_item = self._find_item_by_node_id(self._node_ctx_highlight_id)
+                if hl_item is not None:
+                    hl_item.setBackground(QBrush(NODE_CTX_BG))
         finally:
             self._building = False
 
@@ -1748,9 +1791,16 @@ class TreePanel(QWidget):
 
         # ── 图标 ──────────────────────────────────
         icon_text = _icon_for_node(node.node_type, node.role)
+        # 挂载了上下文块的文件夹/对话 → 图标后追加 "+" 标记（仅展示，占宽最小）
+        ctx_marker = ""
+        if (
+            node.node_type in ("folder", "conversation")
+            and getattr(node, "context_block_count", 0) > 0
+        ):
+            ctx_marker = "+"
         # QStandardItem 不支持 emoji 作为 icon 的 decoration，
         # 所以将图标作为文本前缀
-        display_text = f"  {icon_text}  {display_text}"
+        display_text = f"  {icon_text}{ctx_marker}  {display_text}"
 
         # ── 创建 item ─────────────────────────────
         item = QStandardItem(display_text)

@@ -27,6 +27,15 @@ python main.py 2>&1 | grep "\[CTRL \]"      # Controller layer
 LOG_LEVEL=DEBUG python main.py
 ```
 
+## Data safety during testing（测试数据安全）
+
+**任何会修改持久化数据的测试（SQLite DB、`tree.json`、`recycle_bin.json`、分叉存储、`blocks.json`、`templates.json` 等），必须先备份原数据，测完再还原。**
+
+- 涉及真实数据目录的测试/启动前，先备份整个数据目录（例如 `data/`），或把 `config.py` 中的路径（`DB_PATH`、`TREE_STORE_PATH`、`RECYCLE_BIN_PATH`、`BRANCH_STORE_PATH`、`CONTEXT_STORE_PATH`）指向一次性临时目录。
+- 测完后若真实文件被改动，必须还原备份。
+- 严禁在**没有备份**的情况下对真实数据目录运行 `assemble_app()` / `initialize_database()` / 应用启动 —— 迁移逻辑可能重写 `tree.json` 等文件。
+- 只需全新状态的测试一律用临时目录隔离（与 `tests/` 中的做法一致）。
+
 ## One-time maintenance scripts (`scripts/`)
 
 One-time / maintenance utilities live in `scripts/`. They are **not** part of the app and must be run manually from the project root. Both follow a **dry-run by default, `--execute` to apply** pattern and read paths via `config.py`:

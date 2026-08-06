@@ -81,6 +81,10 @@ class ChatApp:
         # 本轮流式是否来自"修改重发送"（暂停态显示"放弃本次修改"，3.1.6/5.4）
         self._last_turn_was_edit_resend: bool = False
 
+        # 节点上下文管理模式：正在管理的节点 ID 列表 + 暂存的挂靠块
+        self._ctx_node_ids: list[str] | None = None
+        self._ctx_node_staged: list[dict] = []
+
         # ── 构建主窗口 ──────────────────────────
         self._window = MainWindow()
 
@@ -168,11 +172,21 @@ class ChatApp:
         ctx_panel = self._window.context_panel
         ctx_panel.remove_block.connect(self._on_ctx_remove_block)
         ctx_panel.toggle_block.connect(self._on_ctx_toggle_block)
+        ctx_panel.reorder_block.connect(self._on_ctx_reorder_block)
         ctx_panel.add_text_block.connect(self._on_ctx_add_text_block)
+        ctx_panel.edit_block_requested.connect(self._on_ctx_edit_block)
+        ctx_panel.save_block_edit.connect(self._on_ctx_save_block_edit)
+        ctx_panel.copy_block.connect(self._on_ctx_copy_block)
         ctx_panel.save_as_template.connect(self._on_ctx_save_template)
-        ctx_panel.apply_template.connect(self._on_ctx_apply_template)
+        ctx_panel.apply_template.connect(
+            lambda tid: self._on_ctx_apply_template(tid, "replace")
+        )
+        ctx_panel.add_template.connect(
+            lambda tid: self._on_ctx_apply_template(tid, "add")
+        )
         ctx_panel.delete_template.connect(self._on_ctx_delete_template)
-        ctx_panel.close_requested.connect(self._window.hide_right_panel)
+        ctx_panel.close_requested.connect(self._on_context_panel_close)
+        ctx_panel.apply_node_clicked.connect(self._on_ctx_apply_node)
 
         # ── KGPanel 信号 ─────────────────────────
         kg_panel = self._window.kg_panel
@@ -1873,21 +1887,8 @@ class ChatApp:
                 QTimer.singleShot(0, self._load_tree)
 
         elif operation == "manage_context":
-            # 批量管理上下文块：取第一个节点的当前设置
-            first_id = node_ids[0]
-            folder_info = self._ctrl.on_get_folder_context(first_id)
-            folder_title = folder_info.get("title", "节点")
-            current_ids = folder_info.get("context_block_ids", [])
-            all_blocks = self._ctrl.on_get_context_blocks()
-
-            from app.ui.widgets.dialogs import show_context_block_manager_dialog
-            show_context_block_manager_dialog(
-                self._window,
-                f"{folder_title} 等{len(node_ids)}个节点",
-                all_blocks,
-                current_ids,
-                on_save=lambda selected_ids: self._on_batch_ctx_save(node_ids, selected_ids),
-            )
+            # 批量管理上下文块：复用主上下文面板（应用时写入所有选中节点）
+            self._open_node_context_mode(node_ids)
 
         elif operation == "attach_file":
             # 批量添加附件
@@ -1905,17 +1906,6 @@ class ChatApp:
                         except Exception as exc:
                             print(f"[UI] Batch attach error for {nid}: {exc}")
                 QTimer.singleShot(0, self._load_tree)
-
-    def _on_batch_ctx_save(self, node_ids: list[str], selected_ids: list[str]) -> None:
-        """批量保存上下文块关联。"""
-        if not self._can_mutate_tree():
-            return
-        for nid in node_ids:
-            try:
-                self._ctrl.on_update_context_blocks(nid, selected_ids)
-            except Exception as exc:
-                print(f"[UI] Batch context save error for {nid}: {exc}")
-        QTimer.singleShot(0, self._load_tree)
 
     def _on_batch_move_nodes(self, dragged_ids_str: str, target_parent_id: str, position: object) -> None:
         """
@@ -1942,34 +1932,10 @@ class ChatApp:
 
     def _on_tree_manage_context(self, folder_id: str) -> None:
         """
-        右键菜单 → 管理上下文块（仅目录节点）。
-        弹出上下文块管理对话框，选择要关联的块并保存。
+        右键菜单 → 管理上下文块（目录/对话节点）。
+        复用主上下文面板进入节点模式。
         """
-        folder_info = self._ctrl.on_get_folder_context(folder_id)
-        folder_title = folder_info.get("title", "目录")
-        current_ids = folder_info.get("context_block_ids", [])
-
-        all_blocks = self._ctrl.on_get_context_blocks()
-
-        from app.ui.widgets.dialogs import show_context_block_manager_dialog
-        show_context_block_manager_dialog(
-            self._window,
-            folder_title,
-            all_blocks,
-            current_ids,
-            on_save=lambda selected_ids: self._on_ctx_save_folder_blocks(
-                folder_id, selected_ids
-            ),
-        )
-
-    def _on_ctx_save_folder_blocks(
-        self, folder_id: str, selected_ids: list[str]
-    ) -> None:
-        """保存目录关联的上下文块。"""
-        if not self._can_mutate_tree():
-            return
-        self._ctrl.on_update_context_blocks(folder_id, selected_ids)
-        QTimer.singleShot(0, self._load_tree)
+        self._open_node_context_mode([folder_id])
 
     def _on_tree_attach_file(self, folder_id: str) -> None:
         """
@@ -2050,8 +2016,11 @@ class ChatApp:
     def _handle_open_context_panel(self) -> None:
         """
         Sidebar 底部"上下文管理"入口。
-        显示右侧上下文管理面板并刷新数据。
+        若节点模式有未应用修改先确认；退出节点模式后显示全局上下文管理面板。
         """
+        if not self._resolve_pending_node_changes():
+            return
+        self._exit_node_context_mode()
         self._refresh_context_panel()
         self._window.show_context_panel()
 
@@ -2163,36 +2132,276 @@ class ChatApp:
         templates = self._ctrl.on_get_templates()
         ctx_panel.load_templates(templates)
 
+    # ── 节点上下文管理模式 ────────────────────
+
+    def _open_node_context_mode(self, node_ids: list[str]) -> None:
+        """进入节点上下文管理模式：复用主上下文面板管理节点挂靠块。"""
+        if not node_ids:
+            return
+        if not self._can_mutate_tree():
+            return
+        # 若已有节点模式处于未应用状态，先弹确认（取消则中止）
+        if not self._resolve_pending_node_changes():
+            return
+        first_id = node_ids[0]
+        folder_info = self._ctrl.on_get_folder_context(first_id)
+        folder_title = folder_info.get("title", "节点")
+        current_ids = folder_info.get("context_block_ids", [])
+
+        if len(node_ids) > 1:
+            title = f"{folder_title} 等{len(node_ids)}个节点"
+        else:
+            title = folder_title
+
+        panel = self._window.context_panel
+        blocks = self._ctrl.on_get_blocks_by_ids(current_ids)
+        self._ctx_node_ids = list(node_ids)
+        self._ctx_node_staged = blocks
+
+        panel.enter_node_mode(title, blocks)
+        panel.set_preview(self._assemble_node_blocks())
+        templates = self._ctrl.on_get_templates()
+        panel.load_templates(templates)
+
+        # 高亮节点
+        self._window.sidebar.tree_panel.set_node_context_highlight(first_id)
+        self._window.show_context_panel()
+
+    def _assemble_node_blocks(self) -> str:
+        """把节点模式下暂存且启用的块拼成预览文本。"""
+        parts: list[str] = []
+        for b in self._ctx_node_staged:
+            content = (b.get("content") or "").strip()
+            if b.get("enabled", True) and content:
+                parts.append(f"[{b.get('label', '')}]\n{content}")
+        return "\n\n".join(parts) or "（尚无上下文）"
+
+    def _refresh_node_context_panel(self) -> None:
+        """节点模式下刷新面板（已选块 = 暂存的节点挂靠块）。"""
+        panel = self._window.context_panel
+        panel.load_blocks(self._ctx_node_staged)
+        panel.set_preview(self._assemble_node_blocks())
+        templates = self._ctrl.on_get_templates()
+        panel.load_templates(templates)
+
+    def _apply_node_context(self) -> None:
+        """应用节点上下文：把暂存中启用的块 ID 写入节点的 context_block_ids。"""
+        if not self._ctx_node_ids:
+            return
+        if not self._can_mutate_tree():
+            return
+        enabled_ids = [
+            b["id"] for b in self._ctx_node_staged if b.get("enabled", True)
+        ]
+        for nid in self._ctx_node_ids:
+            self._ctrl.on_update_context_blocks(nid, enabled_ids)
+        self._window.context_panel.set_dirty(False)
+        print(f"[UI] 应用节点上下文 {self._ctx_node_ids}: {len(enabled_ids)} 个块")
+        QTimer.singleShot(0, self._load_tree)
+
+    def _resolve_pending_node_changes(self) -> bool:
+        """
+        打开/切换上下文管理窗口前，若当前节点模式有未应用修改，弹三选一确认。
+
+        Returns:
+            True — 可以继续（已按"应用"或"不应用"处理）；False — 用户选择"取消"。
+        """
+        if self._ctx_node_ids is None or not self._window.context_panel.has_dirty():
+            return True
+        from app.ui.widgets.dialogs import show_node_apply_confirm_dialog
+        name = self._ctrl.on_get_folder_context(
+            self._ctx_node_ids[0]
+        ).get("title", "节点")
+        result = show_node_apply_confirm_dialog(self._window, name)
+        if result == "cancel":
+            return False
+        if result == "apply":
+            self._apply_node_context()
+        # "不应用" → 直接丢弃
+        return True
+
+    def _exit_node_context_mode(self) -> None:
+        """退出节点上下文管理模式：恢复标题、清除高亮。"""
+        if self._ctx_node_ids is None:
+            return
+        self._ctx_node_ids = None
+        self._ctx_node_staged = []
+        self._window.context_panel.exit_node_mode()
+        self._window.sidebar.tree_panel.clear_node_context_highlight()
+
+    def _on_context_panel_close(self) -> None:
+        """关闭上下文面板；节点模式下有未应用修改时先三选一确认。"""
+        if self._ctx_node_ids is not None and self._window.context_panel.has_dirty():
+            from app.ui.widgets.dialogs import show_node_apply_confirm_dialog
+            name = self._ctrl.on_get_folder_context(
+                self._ctx_node_ids[0]
+            ).get("title", "节点")
+            result = show_node_apply_confirm_dialog(self._window, name)
+            if result == "cancel":
+                return  # 取消：不关闭子窗口
+            if result == "apply":
+                self._apply_node_context()
+            # "不应用" 直接关闭
+        self._exit_node_context_mode()
+        self._window.hide_right_panel()
+
+    def _on_ctx_apply_node(self) -> None:
+        """节点模式：点击标题栏"应用"。"""
+        self._apply_node_context()
+
     def _on_ctx_remove_block(self, block_id: str) -> None:
-        """上下文面板：移除上下文块。"""
+        """上下文面板：移除上下文块（节点模式下仅从暂存中移除，不删全局块）。"""
+        if self._ctx_node_ids is not None:
+            self._ctx_node_staged = [
+                b for b in self._ctx_node_staged if b.get("id") != block_id
+            ]
+            self._window.context_panel.set_dirty(True)
+            self._refresh_node_context_panel()
+            return
         self._ctrl.on_remove_context_block(block_id)
         self._refresh_context_panel()
 
     def _on_ctx_toggle_block(self, block_id: str, enabled: bool) -> None:
-        """上下文面板：切换块启用/禁用状态。"""
+        """上下文面板：切换块启用/禁用状态（节点模式下同时更新暂存）。"""
         self._ctrl.on_toggle_context_block(block_id, enabled)
+        if self._ctx_node_ids is not None:
+            for b in self._ctx_node_staged:
+                if b.get("id") == block_id:
+                    b["enabled"] = enabled
+            self._window.context_panel.set_dirty(True)
+            self._refresh_node_context_panel()
+            return
         self._refresh_context_panel()
 
-    def _on_ctx_add_text_block(self, text: str) -> None:
-        """上下文面板：添加自定义文本块。"""
-        self._ctrl.on_add_text_block(text)
+    def _on_ctx_reorder_block(self, block_id: str, new_index: int) -> None:
+        """上下文面板：拖拽调整上下文块顺序（节点模式下调整暂存顺序）。"""
+        if self._ctx_node_ids is not None:
+            ids = [b.get("id") for b in self._ctx_node_staged]
+            if block_id in ids:
+                ids.remove(block_id)
+                new_index = max(0, min(new_index, len(ids)))
+                ids.insert(new_index, block_id)
+                by_id = {b["id"]: b for b in self._ctx_node_staged}
+                self._ctx_node_staged = [by_id[i] for i in ids]
+            self._window.context_panel.set_dirty(True)
+            self._refresh_node_context_panel()
+            return
+        self._ctrl.on_reorder_context_block(block_id, new_index)
+        self._refresh_context_panel()
+
+    def _on_ctx_edit_block(self, block_id: str) -> None:
+        """上下文面板：进入编辑模式（填充内容与标题到输入框）。"""
+        info = self._ctrl.on_get_context_block(block_id)
+        self._window.context_panel.enter_edit_mode(
+            block_id, info.get("content", ""), info.get("label", "")
+        )
+
+    def _on_ctx_save_block_edit(
+        self, block_id: str, content: str, title: str
+    ) -> None:
+        """上下文面板：保存修改的块内容与标题（节点模式下同步暂存）。"""
+        label = self._ctrl.on_update_context_block(block_id, content, title)
+        if self._ctx_node_ids is not None:
+            for b in self._ctx_node_staged:
+                if b.get("id") == block_id:
+                    b["content"] = content
+                    b["label"] = label
+                    b["preview"] = content[:60]
+            self._window.context_panel.set_dirty(True)
+            self._refresh_node_context_panel()
+            return
+        self._refresh_context_panel()
+
+    def _on_ctx_add_text_block(self, text: str, title: str = "") -> None:
+        """上下文面板：添加自定义文本块（节点模式下追加到暂存）。"""
+        new_block = self._ctrl.on_add_text_block(text, title)
+        if self._ctx_node_ids is not None:
+            self._ctx_node_staged.append(new_block)
+            self._window.context_panel.set_dirty(True)
+            self._refresh_node_context_panel()
+            return
         self._refresh_context_panel()
 
     def _on_ctx_save_template(self, name: str) -> None:
-        """上下文面板：保存当前块为模板。"""
-        result = self._ctrl.on_save_current_as_template(name)
+        """上下文面板：保存当前块为模板（节点模式下保存暂存启用的块）。
+
+        模板库不允许标题重名：若已存在同名模板，弹出"取消/不覆盖/覆盖"确认。
+        """
+        existing = self._ctrl.on_find_template_by_name(name)
+        if existing is not None:
+            from app.ui.widgets.dialogs import show_template_overwrite_confirm_dialog
+            result = show_template_overwrite_confirm_dialog(self._window, name)
+            if result != "overwrite":
+                # 取消 / 不覆盖：保留输入，用户可改名后重试
+                self._window.context_panel.set_template_name(name)
+                return
+            # 覆盖：用当前块替换同名模板（保留 ID 与描述）
+            if self._ctx_node_ids is not None:
+                enabled = [b for b in self._ctx_node_staged if b.get("enabled", True)]
+                result = self._ctrl.on_overwrite_template(
+                    existing["id"], name, enabled
+                )
+            else:
+                result = self._ctrl.on_overwrite_template(existing["id"], name)
+        else:
+            if self._ctx_node_ids is not None:
+                enabled = [b for b in self._ctx_node_staged if b.get("enabled", True)]
+                result = self._ctrl.on_save_blocks_as_template(name, enabled)
+            else:
+                result = self._ctrl.on_save_current_as_template(name)
+
         print(f"[UI] Template saved: {result}")
+        if self._ctx_node_ids is not None:
+            self._refresh_node_context_panel()
+        else:
+            self._refresh_context_panel()
+
+    def _on_ctx_apply_template(self, template_id: str, mode: str = "replace") -> None:
+        """上下文面板：应用模板。
+
+        mode="replace" 整体替换已选上下文块；mode="add" 增量追加。
+        节点模式下只影响暂存（全局库不整体替换）。
+        """
+        svc_mode = "add" if self._ctx_node_ids is not None else mode
+        created = self._ctrl.on_apply_template(template_id, svc_mode)
+        if self._ctx_node_ids is not None:
+            if mode == "replace":
+                self._ctx_node_staged = list(created)
+            else:
+                self._ctx_node_staged.extend(created)
+            self._window.context_panel.set_dirty(True)
+            self._refresh_node_context_panel()
+            return
         self._refresh_context_panel()
 
-    def _on_ctx_apply_template(self, template_id: str) -> None:
-        """上下文面板：应用模板。"""
-        self._ctrl.on_apply_template(template_id)
+    def _on_ctx_copy_block(self, block_id: str) -> None:
+        """上下文面板：复制上下文块（克隆到原块下一个位置）。"""
+        new_block = self._ctrl.on_clone_context_block(block_id)
+        if self._ctx_node_ids is not None:
+            idx = next(
+                (
+                    i
+                    for i, b in enumerate(self._ctx_node_staged)
+                    if b.get("id") == block_id
+                ),
+                None,
+            )
+            if idx is not None:
+                self._ctx_node_staged.insert(idx + 1, new_block)
+            else:
+                self._ctx_node_staged.append(new_block)
+            self._window.context_panel.set_dirty(True)
+            self._refresh_node_context_panel()
+            return
         self._refresh_context_panel()
 
     def _on_ctx_delete_template(self, template_id: str) -> None:
         """上下文面板：删除模板。"""
         self._ctrl.on_delete_template(template_id)
-        self._refresh_context_panel()
+        if self._ctx_node_ids is not None:
+            self._refresh_node_context_panel()
+        else:
+            self._refresh_context_panel()
 
     # ── 知识图谱面板操作 ────────────────────
 

@@ -466,29 +466,93 @@ class AppController:
 
     # ── 上下文块管理 ──────────────────────────────
 
-    def on_add_text_block(self, text: str) -> dict:
+    def on_add_text_block(self, text: str, title: str = "") -> dict:
         """
         添加自定义文本块到上下文。
-        Returns: {"id": str, "label": str, "preview": str}
+        Args:
+            text:  内容文本
+            title: 标题；空缺时默认取内容前 15 个中文字符
+        Returns: {"id", "label", "content", "preview", "enabled"}
         """
         block = self._context_svc.add_text_block(
             content=text,
-            label=text[:20].replace("\n", " "),
+            label=_default_block_title(text, title),
         )
         return {
             "id": block.id,
             "label": block.label,
+            "content": block.content,
             "preview": block.content[:60],
             "enabled": block.enabled,
         }
+
+    def on_get_blocks_by_ids(self, block_ids: list[str]) -> list[dict]:
+        """按给定 ID 顺序返回上下文块完整信息（含 content/preview），供节点模式使用。"""
+        by_id = {b.id: b for b in self._context_svc.get_blocks()}
+        result: list[dict] = []
+        for bid in block_ids:
+            b = by_id.get(bid)
+            if b is not None:
+                result.append(
+                    {
+                        "id": b.id,
+                        "label": b.label,
+                        "content": b.content,
+                        "preview": b.content[:60],
+                        "enabled": b.enabled,
+                    }
+                )
+        return result
 
     def on_remove_context_block(self, block_id: str) -> None:
         """删除上下文块。"""
         self._context_svc._store.delete_block(block_id)
 
+    def on_clone_context_block(self, block_id: str) -> dict:
+        """克隆上下文块到原块下一个位置，返回新块。"""
+        clone = self._context_svc.clone_block(block_id)
+        if clone is None:
+            return {}
+        return {
+            "id": clone.id,
+            "label": clone.label,
+            "content": clone.content,
+            "preview": clone.content[:60],
+            "enabled": clone.enabled,
+        }
+
     def on_toggle_context_block(self, block_id: str, enabled: bool) -> None:
         """启用/禁用上下文块。"""
         self._context_svc._store.update_block_enabled(block_id, enabled)
+
+    def on_reorder_context_block(self, block_id: str, new_index: int) -> None:
+        """拖拽调整上下文块顺序。"""
+        self._context_svc.reorder_block(block_id, new_index)
+
+    def on_get_context_block_content(self, block_id: str) -> str:
+        """获取单个上下文块的完整内容（编辑模式填充用）。"""
+        block = self._context_svc.get_block(block_id)
+        return block.content if block else ""
+
+    def on_get_context_block(self, block_id: str) -> dict:
+        """获取单个上下文块信息（内容 + 标题，编辑模式填充用）。"""
+        block = self._context_svc.get_block(block_id)
+        if block is None:
+            return {"id": "", "label": "", "content": "", "enabled": True}
+        return {
+            "id": block.id,
+            "label": block.label,
+            "content": block.content,
+            "enabled": block.enabled,
+        }
+
+    def on_update_context_block(
+        self, block_id: str, content: str, title: str = ""
+    ) -> str:
+        """更新上下文块内容与标题（编辑保存），返回新标题。"""
+        label = _default_block_title(content, title)
+        self._context_svc.update_block(block_id, content, label)
+        return label
 
     def on_get_context_blocks(self) -> list[dict]:
         """获取所有上下文块列表。"""
@@ -516,13 +580,72 @@ class AppController:
             for t in templates
         ]
 
-    def on_apply_template(self, template_id: str) -> None:
-        """应用模板：把模板里的块全部加入当前上下文。"""
-        self._context_svc.apply_template(template_id)
+    def on_apply_template(self, template_id: str, mode: str = "replace") -> list[dict]:
+        """应用模板：mode="replace" 整体替换当前上下文块；"add" 增量追加。
+        返回新建的块（节点模式暂存用）。"""
+        blocks = self._context_svc.apply_template(template_id, mode)
+        return [
+            {
+                "id": b.id,
+                "label": b.label,
+                "content": b.content,
+                "preview": b.content[:60],
+                "enabled": b.enabled,
+            }
+            for b in blocks
+        ]
 
     def on_delete_template(self, template_id: str) -> None:
         """删除模板。"""
         self._context_svc.delete_template(template_id)
+
+    def on_find_template_by_name(self, name: str) -> dict | None:
+        """按标题精确查找模板（重名检测用）。"""
+        for t in self._context_svc.get_templates():
+            if t.name == name:
+                return {"id": t.id, "name": t.name, "description": t.description}
+        return None
+
+    def on_overwrite_template(
+        self, template_id: str, name: str, blocks: list[dict] | None = None
+    ) -> dict:
+        """用当前块覆盖指定 ID 的模板（保留 ID 与描述）。
+
+        Args:
+            template_id: 被覆盖的模板 ID
+            name:        模板标题
+            blocks:      新的块列表；None 时用全局上下文块
+        """
+        import uuid
+        from app.storage.models import ContextBlock, ContextSource, ContextTemplate
+        existing = self._context_svc._store.get_template(template_id)
+        if existing is None:
+            # 目标不存在 → 退化为新建
+            if blocks is None:
+                return self.on_save_current_as_template(name)
+            return self.on_save_blocks_as_template(name, blocks)
+        if blocks is None:
+            src_blocks = self._context_svc.get_blocks()
+        else:
+            src_blocks = [
+                ContextBlock(
+                    id=b.get("id", ""),
+                    label=b.get("label", ""),
+                    content=b.get("content", ""),
+                    source=ContextSource.MANUAL,
+                    enabled=b.get("enabled", True),
+                    order=i,
+                )
+                for i, b in enumerate(blocks)
+            ]
+        template = ContextTemplate(
+            id=template_id,
+            name=name,
+            description=existing.description,
+            blocks=src_blocks,
+        )
+        self._context_svc._store.save_template(template)
+        return {"id": template_id, "name": name, "description": existing.description}
 
     def on_save_current_as_template(self, name: str, description: str = "") -> dict:
         """把当前所有上下文块保存为新模板。"""
@@ -537,6 +660,27 @@ class AppController:
         )
         self._context_svc._store.save_template(template)
         return {"id": template.id, "name": name, "description": description}
+
+    def on_save_blocks_as_template(self, name: str, blocks: list[dict]) -> dict:
+        """把指定块列表保存为新模板（节点模式下保存节点挂靠块）。"""
+        import uuid
+        from app.storage.models import ContextBlock, ContextSource, ContextTemplate
+        tmpl_blocks = [
+            ContextBlock(
+                id=b.get("id", ""),
+                label=b.get("label", ""),
+                content=b.get("content", ""),
+                source=ContextSource.MANUAL,
+                enabled=b.get("enabled", True),
+                order=i,
+            )
+            for i, b in enumerate(blocks)
+        ]
+        template = ContextTemplate(
+            id=str(uuid.uuid4()), name=name, description="", blocks=tmpl_blocks
+        )
+        self._context_svc._store.save_template(template)
+        return {"id": template.id, "name": name, "description": ""}
 
 
     # ──────────────────────────────────────────
@@ -950,3 +1094,24 @@ def _format_datetime(dt) -> str:
         return dt.strftime("%m-%d %H:%M")
     except AttributeError:
         return str(dt)
+
+
+def _default_block_title(content: str, title: str = "") -> str:
+    """计算文本块标题：用户输入优先；空缺时取内容前 15 个中文字符
+    （每 2 个 ASCII 字符计 1 个中文字符，忽略换行）。"""
+    source = title.strip() if title and title.strip() else content
+    return _truncate_to_cn_chars(source, 15)
+
+
+def _truncate_to_cn_chars(text: str, max_cn: int = 15) -> str:
+    """按"中文字符"权重截断：ASCII 计 0.5，其余计 1；忽略换行；不超过 max_cn。"""
+    cleaned = text.replace("\r", "").replace("\n", "")
+    out: list[str] = []
+    weight = 0.0
+    for ch in cleaned:
+        w = 0.5 if ord(ch) < 128 else 1.0
+        if weight + w > max_cn:
+            break
+        out.append(ch)
+        weight += w
+    return "".join(out)

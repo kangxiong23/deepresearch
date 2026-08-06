@@ -212,18 +212,80 @@ class ContextService:
         """启用/禁用某个上下文块。"""
         self._store.update_block_enabled(block_id, enabled)
 
+    def reorder_block(self, block_id: str, new_index: int) -> None:
+        """将上下文块移动到 new_index 位置（面板拖拽排序）。
+
+        get_blocks() 按 order 正序返回，即当前展示顺序；
+        从中移除目标块再插入到 new_index，最后按新顺序重写 0..N-1 的 order。
+        """
+        blocks = self._store.get_blocks()
+        ids = [b.id for b in blocks]
+        if block_id not in ids:
+            return
+        ids.remove(block_id)
+        new_index = max(0, min(new_index, len(ids)))
+        ids.insert(new_index, block_id)
+        self._store.reorder_blocks(ids)
+
     def get_blocks(self) -> list[ContextBlock]:
         """获取所有上下文块（按 order 排序）。"""
         return self._store.get_blocks()
 
-    def apply_template(self, template_id: str) -> list[ContextBlock]:
-        """应用模板：将模板中的块全部追加到当前上下文块列表。"""
+    def get_block(self, block_id: str) -> ContextBlock | None:
+        """按 ID 获取单个上下文块。"""
+        for b in self._store.get_blocks():
+            if b.id == block_id:
+                return b
+        return None
+
+    def clone_block(self, block_id: str) -> ContextBlock | None:
+        """克隆上下文块：生成内容/标题完全相同的块，插到原块的下一个位置。"""
+        blocks = self._store.get_blocks()
+        ids = [b.id for b in blocks]
+        if block_id not in ids:
+            return None
+        src = next(b for b in blocks if b.id == block_id)
+        idx = ids.index(block_id)
+        clone = ContextBlock(
+            id=str(uuid.uuid4()),
+            label=src.label,
+            content=src.content,
+            source=src.source,
+            enabled=src.enabled,
+            order=0,  # 由 reorder_blocks 重排
+        )
+        self._store.save_block(clone)
+        new_ids = ids[: idx + 1] + [clone.id] + ids[idx + 1 :]
+        self._store.reorder_blocks(new_ids)
+        return clone
+
+    def update_block(self, block_id: str, content: str, label: str | None = None) -> None:
+        """更新上下文块内容（及可选标题，编辑保存）。"""
+        for b in self._store.get_blocks():
+            if b.id == block_id:
+                b.content = content
+                if label is not None:
+                    b.label = label
+                self._store.save_block(b)
+                return
+
+    def apply_template(self, template_id: str, mode: str = "replace") -> list[ContextBlock]:
+        """应用模板。
+
+        Args:
+            template_id: 模板 ID
+            mode:
+                "replace" — 整体替换：删除当前所有上下文块，再用模板块填充；
+                "add"     — 增量追加：在现有块之后追加模板块。
+
+        Returns:
+            新建的 ContextBlock 列表
+        """
         template = self._store.get_template(template_id)
         if template is None:
             return []
-        existing = self._store.get_blocks()
-        for b in existing:
-            if b.source == ContextSource.TEMPLATE:
+        if mode == "replace":
+            for b in self._store.get_blocks():
                 self._store.delete_block(b.id)
         base_order = self._next_order()
         new_blocks: list[ContextBlock] = []
@@ -647,7 +709,11 @@ class ContextService:
                 print(f"[CTX] 注入 {loaded} 个树附件文件")
 
         # ── 4. 默认系统提示（兜底）───────────
-        parts.append(_DEFAULT_SYSTEM_PROMPT)
+        # 仅当没有任何上下文内容时追加；只要存在已启用的上下文块 /
+        # 树目录块 / 附件，默认英文提示便不参与拼接
+        # （"可被上下文块覆盖"的兜底语义，与拼接预览保持一致）。
+        if not parts:
+            parts.append(_DEFAULT_SYSTEM_PROMPT)
 
         return "\n\n".join(p for p in parts if p.strip())
 

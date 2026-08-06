@@ -76,7 +76,7 @@ _defaults: dict = {
     # 采样温度（0.0 ~ 2.0）
     "temperature": float(os.getenv("TEMPERATURE", "1.0")),
     # 发送给 LLM 的历史消息最大 token 预算
-    "max_history_tokens": int(os.getenv("MAX_HISTORY_TOKENS", "32000")),
+    "max_history_tokens": int(os.getenv("MAX_HISTORY_TOKENS", "1000000")),
     # 每次搜索最多返回的结果条数
     "search_max_results": int(os.getenv("SEARCH_MAX_RESULTS", "5")),
     # 多对话模式：显示所有启用对话的消息（合并时间线），而非仅当前对话
