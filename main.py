@@ -9,7 +9,7 @@ import sys
 import faulthandler
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QPalette, QColor
+from PySide6.QtGui import QPalette, QColor, QFont
 
 # 启用 faulthandler — segfault 时输出 Python 堆栈到 stderr
 faulthandler.enable()
@@ -158,6 +158,7 @@ def main() -> int:
     """应用程序主入口。"""
     # PySide6 要求在创建任何 QWidget 之前先创建 QApplication
     app = QApplication(sys.argv)
+    font = QFont("WenQuanYi Micro Hei", 20)
     app.setApplicationName("DeepResearch")
     app.setOrganizationName("DeepResearch")
 
