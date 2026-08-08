@@ -159,7 +159,7 @@ def main() -> int:
     # PySide6 要求在创建任何 QWidget 之前先创建 QApplication
     app = QApplication(sys.argv)
     # linux版本中文适配
-    font = QFont("WenQuanYi Micro Hei", 15)
+    font = QFont("WenQuanYi Micro Hei", 18)
     app.setApplicationName("DeepResearch")
     app.setOrganizationName("DeepResearch")
 
