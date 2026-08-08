@@ -37,6 +37,7 @@ python scripts/fix_thinking_order.py [--execute]     # fix thinking-before-assis
 ## Gotchas
 
 - `deepseek-v4-pro`/`deepseek-v4-flash` behave identically re: thinking. When `thinking_enabled` is falsy the payload sends `thinking: {type: "disabled"}` and **must NOT** include `reasoning_effort` (API rejects it); when enabled send `{type: "enabled"}` plus `reasoning_effort` (`low|high|max`).
-- `temperature` is only sent for non-`deepseek-v4-pro` models.
+- `temperature` is only sent when `thinking_enabled` is off (flash and pro alike); thinking mode → no `temperature`.
+- Web search has **no model gating** — both models get it. Search results (external Bing/DDG/Arxiv adapters) are injected as text into the user message; the payload itself has no search field.
 - `app/ui_flet_legacy/` is dead Flet code — never imported. Requirements still include Flet (unused).
 - `DEEPSEEK_API_KEY` is required; load `DEEPSEEK_API_KEY` etc. from `.env` (`.env.example` is documented in README but not checked in).
