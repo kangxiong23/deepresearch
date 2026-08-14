@@ -4,8 +4,6 @@ certifi==2026.6.17
 cffi==2.0.0
 charset-normalizer==3.4.7
 cryptography==49.0.0
-flet==0.85.0
-flet-desktop==0.85.0
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
