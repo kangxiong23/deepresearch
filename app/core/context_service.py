@@ -327,8 +327,6 @@ class ContextService:
           （级联切换会把状态写回子节点字段，故直接看自身值即可。）
         - 另有 per-node 开关 context_blocks_enabled：为 False 时该节点挂靠的块也不加入。
         - 任何对话的 system prompt 一致（整树前序的全部块）。
-        - **去重**：同一块被多个节点挂靠（或一处节点重复挂载）时只取前序第一个；
-          内容完全一致的不同块同样只保留第一个（按前序顺序，前者胜出）。
         """
         if self._tree is None:
             return []
@@ -341,8 +339,6 @@ class ContextService:
             children.sort(key=lambda n: n.sort_order)
 
         result: list[ContextBlock] = []
-        seen_ids: set[str] = set()          # 同 ID 块：仅保留首次出现
-        seen_contents: set[str] = set()     # 内容完全相同的块：去重后仅保留前序第一个
 
         def visit(node) -> None:
             if isinstance(node, (FolderNode, ConversationNode)):
@@ -350,16 +346,8 @@ class ContextService:
                 if node.enabled is not False and node.context_blocks_enabled:
                     for bid in node.context_block_ids:
                         block = all_blocks_by_id.get(bid)
-                        if block is None or not block.enabled:
-                            continue
-                        content = block.content.strip()
-                        if not content:
-                            continue
-                        if bid in seen_ids or content in seen_contents:
-                            continue
-                        seen_ids.add(bid)
-                        seen_contents.add(content)
-                        result.append(block)
+                        if block is not None and block.enabled and block.content.strip():
+                            result.append(block)
             for child in nodes_by_parent.get(node.id, []):
                 visit(child)
 

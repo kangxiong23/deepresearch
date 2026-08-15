@@ -14,7 +14,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QComboBox,
     QLabel,
-    QSlider,
     QSizePolicy,
     QFileDialog,
 )
@@ -266,120 +265,6 @@ class ReasoningEffortSelector(QComboBox):
 
 
 # ──────────────────────────────────────────────
-# 温度滑块
-# ──────────────────────────────────────────────
-
-
-class TemperatureSlider(QWidget):
-    """
-    温度滑块（0.0 ~ 2.0，浮点，步长 0.01）。
-
-    作用：控制输出随机性 —— 更高值（如 0.8）输出更随机、更多样；
-    更低值（如 0.2）输出更集中、更确定。
-
-    仅非思考模式下生效（temperature 只在 thinking 关闭时随请求下发）；
-    思考模式开启时由 InputArea 禁用本控件。
-    """
-
-    temperature_changed = Signal(float)
-
-    _SCALE = 100  # 滑块整数 0..200 ↔ 浮点 0.0..2.0
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        initial = float(getattr(app_config, "temperature", 1.0))
-        initial = max(0.0, min(2.0, initial))
-
-        # ── 标签 ──
-        label = QLabel("TEMP")
-        label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        label.setStyleSheet(f"""
-            QLabel {{
-                color: {Colors.TEXT_SECONDARY};
-                background-color: transparent;
-                border: none;
-            }}
-        """)
-
-        # ── 滑块（0..200 映射 0.0..2.0）──
-        self._slider = QSlider(Qt.Orientation.Horizontal)
-        self._slider.setRange(0, int(2.0 * self._SCALE))
-        self._slider.setValue(int(round(initial * self._SCALE)))
-        self._slider.setFixedWidth(100)
-        # 负左边距：抵掉 Fusion 滑块槽的固有缩进，让轨道视觉上紧贴"TEMP"文字
-        # （min/max 两端 handle 中心距边缘仍 ≥4px，不会裁剪）
-        self._slider.setContentsMargins(-4, 0, 0, 0)
-        self._slider.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._slider.setStyleSheet(f"""
-            QSlider {{
-                background: transparent;
-            }}
-            QSlider::groove:horizontal {{
-                height: 4px;
-                background: {Colors.BORDER};
-                border-radius: 2px;
-            }}
-            QSlider::sub-page:horizontal {{
-                background: {Colors.PRIMARY};
-                border-radius: 2px;
-            }}
-            QSlider::handle:horizontal {{
-                width: 12px;
-                height: 12px;
-                margin: -4px 0;
-                background: {Colors.PRIMARY};
-                border-radius: 6px;
-            }}
-            QSlider::handle:horizontal:disabled {{
-                background: {Colors.TEXT_DISABLED};
-            }}
-        """)
-
-        # ── 数值显示 ──
-        self._value_label = QLabel(f"{initial:.2f}")
-        self._value_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        self._value_label.setFixedWidth(36)
-        self._value_label.setStyleSheet(f"""
-            QLabel {{
-                color: {Colors.TEXT_PRIMARY};
-                background-color: transparent;
-                border: none;
-            }}
-        """)
-
-        self._slider.valueChanged.connect(self._on_value_changed)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        layout.addWidget(label)
-        layout.addWidget(self._slider)
-        layout.addWidget(self._value_label)
-
-        self.setToolTip(
-            "温度：控制输出随机性。更高值（如 0.8）输出更随机、多样；"
-            "更低值（如 0.2）输出更集中、确定。思考模式开启时不生效。"
-        )
-        # 固定宽度（关键）：内部 QSlider 默认水平 sizePolicy 为 Expanding，
-        # 会让外层 toolbar 把本控件撑宽、多出的宽度全落进 QLabel 的透明方框，
-        # 造成"TEMP 与滑块被拉开、滑块仿佛居中"的视觉假象。
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
-
-    def _on_value_changed(self, value: int) -> None:
-        """滑块移动 → 写入 config 并发出信号。"""
-        temp = value / self._SCALE
-        app_config.temperature = temp
-        self._value_label.setText(f"{temp:.2f}")
-        self.temperature_changed.emit(temp)
-
-    @property
-    def value(self) -> float:
-        """当前温度值（0.0 ~ 2.0）。"""
-        return self._slider.value() / self._SCALE
-
-
-# ──────────────────────────────────────────────
 # 附件条
 # ──────────────────────────────────────────────
 
@@ -516,7 +401,6 @@ class InputArea(QFrame):
         model_changed(str)             — 模型变更
         thinking_toggled(bool)         — 思考模式切换
         search_toggled(bool)           — 搜索开关切换
-        temperature_changed(float)     — 温度滑块变更（0.0 ~ 2.0）
     """
 
     send_requested = Signal(str, list)
@@ -525,7 +409,6 @@ class InputArea(QFrame):
     thinking_toggled = Signal(bool)
     search_toggled = Signal(bool)
     reasoning_effort_changed = Signal(str)
-    temperature_changed = Signal(float)
     edit_cancel_requested = Signal()   # 修改状态下点击 ✕ 退出修改（5.2）
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -674,11 +557,6 @@ class InputArea(QFrame):
         self._effort_selector.effort_changed.connect(self.reasoning_effort_changed)
         self._effort_selector.setEnabled(initial_thinking)
 
-        # 温度滑块（思考开启时禁用：temperature 仅非思考模式随请求下发）
-        self._temp_slider = TemperatureSlider()
-        self._temp_slider.temperature_changed.connect(self.temperature_changed)
-        self._temp_slider.setEnabled(not initial_thinking)
-
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(0, Spacing.SM, 0, 0)
         toolbar.setSpacing(Spacing.SM)
@@ -687,7 +565,6 @@ class InputArea(QFrame):
         toolbar.addWidget(self._thinking_chip)
         toolbar.addWidget(self._effort_selector)
         toolbar.addWidget(self._search_chip)
-        toolbar.addWidget(self._temp_slider)   # SEARCH 右侧
         toolbar.addStretch()
         toolbar.addWidget(self._model_selector)
 
@@ -949,8 +826,6 @@ class InputArea(QFrame):
         app_config.thinking_enabled = val
         # 思考关闭时禁用思考强度控件（API 要求 thinking 启用才可传 reasoning_effort）
         self._effort_selector.setEnabled(val)
-        # 思考开启时禁用温度滑块（temperature 仅非思考模式随请求下发）
-        self._temp_slider.setEnabled(not val)
         self.thinking_toggled.emit(val)
 
     def _on_search_toggle(self, val: bool) -> None:
@@ -982,8 +857,6 @@ class InputArea(QFrame):
         self._thinking_chip.setEnabled(not locked)
         self._search_chip.setEnabled(not locked)
         self._model_selector.setEnabled(not locked)
-        # 温度滑块始终遵循"思考开启时禁用"规则
-        self._temp_slider.setEnabled(not locked and not app_config.thinking_enabled)
 
     # ── 修改状态（5.1/5.2）────────────────────
 
