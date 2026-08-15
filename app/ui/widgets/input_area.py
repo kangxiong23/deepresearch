@@ -21,7 +21,7 @@ from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont, QFontMetrics, QKeyEvent, QTextOption
 
 import config as app_config
-from app.ui.theme import Colors, Fonts, Spacing, Radius
+from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
 
 
 # ──────────────────────────────────────────────
@@ -103,6 +103,10 @@ class ToggleChip(QPushButton):
             self._active = val
             self._apply_style()
 
+    def refresh_theme(self) -> None:
+        """切主题时按当前状态重绘样式。"""
+        self._apply_style()
+
 
 # ──────────────────────────────────────────────
 # 模型选择器
@@ -139,7 +143,7 @@ class ModelSelector(QComboBox):
         self.setFont(Fonts.mono(Fonts.SIZE_SM))
         self.setFixedWidth(150)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             QComboBox {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: {Colors.BG_ELEVATED};
@@ -216,7 +220,7 @@ class ReasoningEffortSelector(QComboBox):
         self.setFixedWidth(90)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("思考强度 (reasoning_effort)：low / high / max，仅思考模式开启时生效")
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             QComboBox {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: {Colors.BG_ELEVATED};
@@ -265,6 +269,120 @@ class ReasoningEffortSelector(QComboBox):
 
 
 # ──────────────────────────────────────────────
+# 温度滑块
+# ──────────────────────────────────────────────
+
+
+class TemperatureSlider(QWidget):
+    """
+    温度滑块（0.0 ~ 2.0，浮点，步长 0.01）。
+
+    作用：控制输出随机性 —— 更高值（如 0.8）输出更随机、更多样；
+    更低值（如 0.2）输出更集中、更确定。
+
+    仅非思考模式下生效（temperature 只在 thinking 关闭时随请求下发）；
+    思考模式开启时由 InputArea 禁用本控件。
+    """
+
+    temperature_changed = Signal(float)
+
+    _SCALE = 100  # 滑块整数 0..200 ↔ 浮点 0.0..2.0
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        initial = float(getattr(app_config, "temperature", 1.0))
+        initial = max(0.0, min(2.0, initial))
+
+        # ── 标签 ──
+        label = QLabel("TEMP")
+        label.setFont(Fonts.mono(Fonts.SIZE_XS))
+        label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        apply_style(label, lambda: f"""
+            QLabel {{
+                color: {Colors.TEXT_SECONDARY};
+                background-color: transparent;
+                border: none;
+            }}
+        """)
+
+        # ── 滑块（0..200 映射 0.0..2.0）──
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, int(2.0 * self._SCALE))
+        self._slider.setValue(int(round(initial * self._SCALE)))
+        self._slider.setFixedWidth(100)
+        # 负左边距：抵掉 Fusion 滑块槽的固有缩进，让轨道视觉上紧贴"TEMP"文字
+        # （min/max 两端 handle 中心距边缘仍 ≥4px，不会裁剪）
+        self._slider.setContentsMargins(-4, 0, 0, 0)
+        self._slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_style(self._slider, lambda: f"""
+            QSlider {{
+                background: transparent;
+            }}
+            QSlider::groove:horizontal {{
+                height: 4px;
+                background: {Colors.BORDER};
+                border-radius: 2px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {Colors.PRIMARY};
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                width: 12px;
+                height: 12px;
+                margin: -4px 0;
+                background: {Colors.PRIMARY};
+                border-radius: 6px;
+            }}
+            QSlider::handle:horizontal:disabled {{
+                background: {Colors.TEXT_DISABLED};
+            }}
+        """)
+
+        # ── 数值显示 ──
+        self._value_label = QLabel(f"{initial:.2f}")
+        self._value_label.setFont(Fonts.mono(Fonts.SIZE_XS))
+        self._value_label.setFixedWidth(36)
+        apply_style(self._value_label, lambda: f"""
+            QLabel {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: transparent;
+                border: none;
+            }}
+        """)
+
+        self._slider.valueChanged.connect(self._on_value_changed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(label)
+        layout.addWidget(self._slider)
+        layout.addWidget(self._value_label)
+
+        self.setToolTip(
+            "温度：控制输出随机性。更高值（如 0.8）输出更随机、多样；"
+            "更低值（如 0.2）输出更集中、确定。思考模式开启时不生效。"
+        )
+        # 固定宽度（关键）：内部 QSlider 默认水平 sizePolicy 为 Expanding，
+        # 会让外层 toolbar 把本控件撑宽、多出的宽度全落进 QLabel 的透明方框，
+        # 造成"TEMP 与滑块被拉开、滑块仿佛居中"的视觉假象。
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+
+    def _on_value_changed(self, value: int) -> None:
+        """滑块移动 → 写入 config 并发出信号。"""
+        temp = value / self._SCALE
+        app_config.temperature = temp
+        self._value_label.setText(f"{temp:.2f}")
+        self.temperature_changed.emit(temp)
+
+    @property
+    def value(self) -> float:
+        """当前温度值（0.0 ~ 2.0）。"""
+        return self._slider.value() / self._SCALE
+
+
+# ──────────────────────────────────────────────
 # 附件条
 # ──────────────────────────────────────────────
 
@@ -300,7 +418,7 @@ class AttachmentBar(QWidget):
     def _make_chip(self, name: str) -> QFrame:
         """创建单个文件标签控件。"""
         chip = QFrame()
-        chip.setStyleSheet(f"""
+        apply_style(chip, lambda: f"""
             QFrame {{
                 background-color: transparent;
                 border: 1px solid {Colors.BORDER};
@@ -320,7 +438,7 @@ class AttachmentBar(QWidget):
         # 文件名
         name_label = QLabel(name)
         name_label.setFont(Fonts.body(Fonts.SIZE_XS))
-        name_label.setStyleSheet(f"""
+        apply_style(name_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_SECONDARY};
                 background-color: transparent;
@@ -334,7 +452,7 @@ class AttachmentBar(QWidget):
         remove_btn.setFont(Fonts.body(8))
         remove_btn.setFixedSize(16, 16)
         remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        remove_btn.setStyleSheet(f"""
+        apply_style(remove_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.TEXT_DISABLED};
                 background-color: transparent;
@@ -433,7 +551,7 @@ class InputArea(QFrame):
             "输入消息，Shift+Enter 换行，Enter 发送..."
         )
         self._text_edit.setFont(Fonts.body(Fonts.SIZE_MD))
-        self._text_edit.setStyleSheet(f"""
+        apply_style(self._text_edit, lambda: f"""
             QTextEdit {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: transparent;
@@ -472,7 +590,7 @@ class InputArea(QFrame):
         self._resize_handle.setFixedHeight(6)
         self._resize_handle.setCursor(Qt.CursorShape.SizeVerCursor)
         self._resize_handle.setToolTip("拖动调整输入栏高度")
-        self._resize_handle.setStyleSheet(f"""
+        apply_style(self._resize_handle, lambda: f"""
             QFrame#resizeHandle {{
                 background-color: transparent;
                 border: none;
@@ -509,7 +627,7 @@ class InputArea(QFrame):
         self._edit_cancel_btn.setFixedSize(28, 28)
         self._edit_cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._edit_cancel_btn.setToolTip("退出修改状态")
-        self._edit_cancel_btn.setStyleSheet(f"""
+        apply_style(self._edit_cancel_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.TEXT_SECONDARY};
                 background-color: transparent;
@@ -584,7 +702,7 @@ class InputArea(QFrame):
             border-top: 1px solid {Colors.DIVIDER};
         """
         # Apply top-border via a separator approach - the toolbar itself handles this
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             InputArea {{
                 background-color: {Colors.BG_SURFACE};
                 border: none;
@@ -614,7 +732,7 @@ class InputArea(QFrame):
     def _apply_pin_style(self) -> None:
         """根据图钉状态更新按钮样式。"""
         if self._pinned:
-            self._pin_btn.setStyleSheet(f"""
+            apply_style(self._pin_btn, lambda: f"""
                 QPushButton {{
                     color: {Colors.PRIMARY};
                     background-color: {Colors.PRIMARY_GLOW};
@@ -628,7 +746,7 @@ class InputArea(QFrame):
             """)
             self._pin_btn.setToolTip("自动调整高度：已启用（点击切换为手动调整）")
         else:
-            self._pin_btn.setStyleSheet(f"""
+            apply_style(self._pin_btn, lambda: f"""
                 QPushButton {{
                     color: {Colors.TEXT_SECONDARY};
                     background-color: transparent;
@@ -749,7 +867,7 @@ class InputArea(QFrame):
         btn.setToolTip(tooltip)
         btn.setFixedSize(28, 28)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setStyleSheet(f"""
+        apply_style(btn, lambda: f"""
             QPushButton {{
                 color: {Colors.TEXT_SECONDARY};
                 background-color: transparent;
@@ -839,6 +957,13 @@ class InputArea(QFrame):
         """切换生成状态（发送 ↔ 停止）。"""
         self._generating = generating
         self._apply_send_style()
+
+    def refresh_theme(self) -> None:
+        """切主题时重绘运行时状态相关的样式（发送/图钉按钮 + 开关芯片）。"""
+        self._apply_send_style()
+        self._apply_pin_style()
+        self._thinking_chip.refresh_theme()
+        self._search_chip.refresh_theme()
 
     def clear(self) -> None:
         """清空输入框和附件。"""

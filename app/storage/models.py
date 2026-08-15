@@ -8,9 +8,14 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal, Optional, Union
+
+
+def utcnow() -> datetime:
+    """返回 naive UTC 时间戳（等价 `datetime.utcnow()`，避免 3.12+ 弃用警告）。"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ──────────────────────────────────────────────
@@ -47,7 +52,7 @@ class Message:
     role: Role
     content: str
     is_thinking: bool = False
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utcnow)
     token_count: int = 0        # 预估 token 数，由 Core 层写入
 
 
@@ -60,8 +65,8 @@ class ConversationDetail:
     id: str
     title: str = "新对话"
     messages: list[Message] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
 
 
 # ──────────────────────────────────────────────
@@ -188,8 +193,8 @@ class TreeNode:
     sort_order: int = 0
     enabled: Union[bool, Literal["some"]] = True
     title: str = ""
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
 
     # 分叉字段（仅 MessageNode / ConversationNode 有效，FolderNode 恒为默认值）：
     # 分叉点记录其下分支总数 n 与当前分支索引 m（0 起）。
@@ -274,4 +279,4 @@ class TrashEntry:
     id: str
     json_path: str
     node_data: dict
-    deleted_at: datetime = field(default_factory=datetime.utcnow)
+    deleted_at: datetime = field(default_factory=utcnow)

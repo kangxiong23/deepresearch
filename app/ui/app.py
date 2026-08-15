@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QShortcut, QKeySequence
 
-from app.ui.theme import Colors, build_global_stylesheet
+from app.ui.theme import Colors, build_global_stylesheet, get_theme_manager
 from app.ui.main_window import MainWindow
 from app.ui.widgets.chat_message import ChatMessage, ThinkingBlock
 from app.ui.widgets.search_popup import SearchPopup
@@ -109,6 +109,9 @@ class ChatApp:
         # ── 应用全局样式表 ─────────────────────
         self._apply_theme()
 
+        # ── 主题切换监听：重载树与消息，让 token 相关的渲染即时刷新 ──
+        get_theme_manager().theme_changed.connect(self._on_theme_changed)
+
         # ── 连接信号 ────────────────────────────
         self._connect_signals()
 
@@ -152,6 +155,7 @@ class ChatApp:
         sidebar.search_requested.connect(self._on_search)
         sidebar.multi_select_toggled.connect(self._on_multi_select_toggled)
         sidebar.refresh_requested.connect(self._handle_refresh)
+        sidebar.open_theme_clicked.connect(self._handle_open_theme)
 
         # ── TreePanel 信号 ────────────────────────
         tree = sidebar.tree_panel
@@ -1498,12 +1502,12 @@ class ChatApp:
     def _load_scroll_positions(self) -> None:
         """Phase 5: 从磁盘加载滚动位置记录。"""
         import json
-        import os
+        from pathlib import Path
 
-        path = os.path.join("data", "scroll_positions.json")
+        path = Path(__file__).resolve().parent.parent.parent / "data" / "scroll_positions.json"
         try:
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
+            if path.exists():
+                with path.open("r", encoding="utf-8") as f:
                     self._scroll_states = json.load(f)
         except Exception:
             self._scroll_states = {}
@@ -1511,12 +1515,12 @@ class ChatApp:
     def _save_scroll_positions(self) -> None:
         """Phase 5: 将滚动位置持久化到磁盘。"""
         import json
-        import os
+        from pathlib import Path
 
-        os.makedirs("data", exist_ok=True)
-        path = os.path.join("data", "scroll_positions.json")
+        path = Path(__file__).resolve().parent.parent.parent / "data" / "scroll_positions.json"
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as f:
                 json.dump(self._scroll_states, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
@@ -2039,6 +2043,26 @@ class ChatApp:
         """
         self._refresh_kg_panel()
         self._window.show_kg_panel()
+
+    # ── 主题风格 ────────────────────────────
+
+    def _handle_open_theme(self) -> None:
+        """Sidebar 底部"主题风格"入口：打开主题选择对话框。"""
+        from app.ui.widgets.theme_dialog import ThemeDialog
+        dialog = ThemeDialog(self._window)
+        dialog.exec()
+
+    def _on_theme_changed(self, theme_id: str) -> None:
+        """
+        主题切换后刷新依赖颜色 token 的运行时渲染：
+
+        - 重载对话树（树节点前景/背景 brush 按 Colors 构建）
+        - 重载消息列表（Markdown HTML、气泡样式、思考块按新主题重新渲染）
+        - 静态内联样式与各控件 refresh_theme() 已由 ThemeManager.apply
+          调用的 reapply_all_styles() 统一处理
+        """
+        QTimer.singleShot(0, self._load_tree)
+        QTimer.singleShot(0, lambda: self._load_all_messages(scroll_to_bottom=False))
 
     # ── 搜索操作 ────────────────────────────
 

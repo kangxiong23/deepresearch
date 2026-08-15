@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QColor
 
-from app.ui.theme import Colors, Fonts, Spacing, Radius
+from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
 
 
 # ──────────────────────────────────────────────
@@ -226,7 +226,7 @@ class ThinkingBlock(QFrame):
         self._toggle_btn = QPushButton("▾")
         self._toggle_btn.setFont(Fonts.body(Fonts.SIZE_SM))
         self._toggle_btn.setFixedSize(20, 20)
-        self._toggle_btn.setStyleSheet(f"""
+        apply_style(self._toggle_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.TEXT_SECONDARY};
                 background-color: transparent;
@@ -257,7 +257,7 @@ class ThinkingBlock(QFrame):
         self._content_browser.setOpenExternalLinks(True)
         self._content_browser.setReadOnly(True)
         self._content_browser.setFont(Fonts.mono(Fonts.SIZE_SM))
-        self._content_browser.setStyleSheet(f"""
+        apply_style(self._content_browser, lambda: f"""
             QTextBrowser {{
                 color: {Colors.TEXT_SECONDARY};
                 background-color: transparent;
@@ -286,7 +286,7 @@ class ThinkingBlock(QFrame):
         layout.addWidget(self._content_browser)
 
         # ── 底部边框 ────────────────────────────
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             ThinkingBlock {{
                 background-color: transparent;
                 border: none;
@@ -410,9 +410,7 @@ class _ForkControl(QFrame):
                 }}
             """)
         self._label.setFont(Fonts.body(Fonts.SIZE_SM))
-        self._label.setStyleSheet(
-            f"color: {Colors.TEXT_SECONDARY}; background: transparent;"
-        )
+        apply_style(self._label, lambda: f"color: {Colors.TEXT_SECONDARY}; background: transparent;")
 
         self._prev_btn.clicked.connect(lambda: self.fork_nav.emit(-1))
         self._next_btn.clicked.connect(lambda: self.fork_nav.emit(1))
@@ -509,7 +507,7 @@ class ChatMessage(QFrame):
         self._content_browser.setOpenExternalLinks(True)
         self._content_browser.setReadOnly(True)
         self._content_browser.setFont(Fonts.body(Fonts.SIZE_MD))
-        self._content_browser.setStyleSheet(f"""
+        apply_style(self._content_browser, lambda: f"""
             QTextBrowser {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: transparent;

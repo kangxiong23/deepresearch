@@ -11,10 +11,10 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime
 from pathlib import Path
 
 import config as app_config
+from app.storage.models import utcnow
 
 
 # 每个线程持有独立连接（sqlite3 连接非线程安全）
@@ -215,10 +215,13 @@ def _migrate_if_needed(conn: sqlite3.Connection) -> None:
     # ── 2. 为每个对话生成 ConversationNode ────
     nodes: list[dict] = []
     for r in old_rows:
-        conv_id = r["id"]
-        title = r["title"] if r["title"] else "未命名对话"
-        created_at = r["created_at"]
-        updated_at = r["updated_at"]
+        d = dict(r)
+        conv_id = d.get("id")
+        if not conv_id:
+            continue
+        title = d.get("title") or "未命名对话"
+        created_at = d.get("created_at") or ""
+        updated_at = d.get("updated_at") or created_at
 
         # 获取消息数量（从 messages 或 messages_old 查询）
         msg_count = conn.execute(
@@ -235,13 +238,13 @@ def _migrate_if_needed(conn: sqlite3.Connection) -> None:
             "created_at": created_at,
             "updated_at": updated_at,
             "node_type": "conversation",
-            "summary": (r["last_message_preview"] or "")[:200],
+            "summary": (d.get("last_message_preview") or "")[:200],
             "message_count": msg_count,
         }
         nodes.append(node)
 
     # ── 3. 创建树结构 ─────────────────────────
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = utcnow().isoformat()
     root_folder = {
         "id": "root",
         "parent_id": None,

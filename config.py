@@ -127,7 +127,9 @@ class ConfigScope:
         self._overrides = dict(overrides)
 
     def __enter__(self) -> "ConfigScope":
-        stack = _scope_stack.get()
+        # 拷贝后再修改：ContextVar 的默认值是跨上下文共享的同一可变对象，
+        # 直接 append 会污染其他线程/任务的默认栈。
+        stack = list(_scope_stack.get())
         stack.append(self)
         _scope_stack.set(stack)
         if "DB_PATH" in self._overrides:
@@ -135,7 +137,7 @@ class ConfigScope:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        stack = _scope_stack.get()
+        stack = list(_scope_stack.get())
         if stack:
             stack.pop()
             _scope_stack.set(stack)

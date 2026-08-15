@@ -14,11 +14,11 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import datetime
 
 import config as app_config
 from config import ConfigScope
 from app.storage.kg_store import KGStore, KGEntity, KGRelation, KGQueryResult
+from app.storage.models import utcnow
 
 
 # ── 提取用的 Prompt ────────────────────────────────────────────────
@@ -124,7 +124,7 @@ class KnowledgeService:
             return "本段对话未发现有价值的实体关系"
 
         # 写入图谱
-        now = datetime.utcnow().isoformat()
+        now = utcnow().isoformat()
         saved_entities = 0
         saved_relations = 0
 
@@ -240,7 +240,7 @@ class KnowledgeService:
         调用 LLM 执行提取，收集完整响应。
         使用 deepseek-v4-flash（不用 reasoner，节省 token）。
         """
-        from app.storage.models import LLMContext
+        from app.storage.models import LLMContext, ChunkType
 
         context = LLMContext(
             messages=messages,
@@ -253,7 +253,7 @@ class KnowledgeService:
         # 强制使用 chat 模型提取，不受当前 model_type 影响（ConfigScope 自动恢复）
         with ConfigScope(model_type="deepseek-v4-flash"):
             async for chunk in self._llm.stream_chat(context):
-                if chunk.chunk_type.value == "text" if hasattr(chunk.chunk_type, 'value') else chunk.chunk_type == "text":
+                if chunk.chunk_type == ChunkType.TEXT:
                     full_text += chunk.delta
                 if chunk.is_done:
                     break

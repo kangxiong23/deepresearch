@@ -9,7 +9,7 @@ import sys
 import faulthandler
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QPalette, QColor
+from PySide6.QtGui import QFont
 
 # 启用 faulthandler — segfault 时输出 Python 堆栈到 stderr
 faulthandler.enable()
@@ -43,6 +43,7 @@ from app.controllers.settings_controller import SettingsController
 
 # ── UI (PySide6) ──────────────────────────────
 from app.ui.app import ChatApp
+from app.ui.theme import get_theme_manager
 
 # ── 日志 ─────────────────────────────────────
 from app.utils.async_utils import get_logger
@@ -133,31 +134,13 @@ def assemble_app() -> ChatApp:
     return chat_app
 
 
-def _apply_dark_palette(app: QApplication) -> None:
-    """为 QApplication 设置深色调色板，确保原生控件（展开箭头等）在深色背景下可见。"""
-    palette = QPalette()
-    palette.setColor(QPalette.ColorRole.Window, QColor("#0D0F14"))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor("#E8EAF0"))
-    palette.setColor(QPalette.ColorRole.Base, QColor("#13161D"))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#1A1E28"))
-    palette.setColor(QPalette.ColorRole.Text, QColor("#E8EAF0"))
-    palette.setColor(QPalette.ColorRole.Button, QColor("#1A1E28"))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#E8EAF0"))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor("#4A9EFF"))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#0D0F14"))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#1A1E28"))
-    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#E8EAF0"))
-    # 禁用态颜色组 — 确保禁用文字在深色背景上也可见
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#3D4255"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor("#3D4255"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#3D4255"))
-    app.setPalette(palette)
-
-
 def main() -> int:
     """应用程序主入口。"""
     # PySide6 要求在创建任何 QWidget 之前先创建 QApplication
     app = QApplication(sys.argv)
+    # linux版本中文适配
+    font = QFont("WenQuanYi Micro Hei", 17)
+    app.setFont(font)
     app.setApplicationName("DeepResearch")
     app.setOrganizationName("DeepResearch")
 
@@ -165,8 +148,9 @@ def main() -> int:
     # 深色背景下的原生控件（树展开箭头等）需要 Fusion 风格才能正确使用调色板颜色
     app.setStyle("Fusion")
 
-    # 应用深色调色板，确保原生控件（树展开箭头等）在深色背景下可见
-    _apply_dark_palette(app)
+    # 应用持久化主题（设置 Colors + 全局样式表 + 调色板）——
+    # 必须在装配 UI 之前执行，确保控件构造时即读取到正确颜色
+    get_theme_manager().apply(get_theme_manager().current_id)
 
     # 装配依赖树并构建 UI
     chat_app = assemble_app()

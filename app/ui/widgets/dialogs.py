@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 
-from app.ui.theme import Colors, Fonts, Spacing, Radius
+from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
 from app.controllers.view_models import TrashEntryVM
 
 
@@ -130,7 +130,7 @@ def show_confirm_dialog(
 
     # 危险按钮样式
     if danger and yes_btn:
-        yes_btn.setStyleSheet(f"""
+        apply_style(yes_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.ERROR};
                 font-weight: bold;
@@ -138,7 +138,7 @@ def show_confirm_dialog(
         """)
 
     # 整体样式
-    msg_box.setStyleSheet(f"""
+    apply_style(msg_box, lambda: f"""
         QMessageBox {{
             background-color: {Colors.BG_ELEVATED};
         }}
@@ -172,7 +172,7 @@ def show_confirm_dialog(
 
 def _style_msg_box(msg_box: QMessageBox) -> None:
     """统一 QMessageBox 深色样式。"""
-    msg_box.setStyleSheet(f"""
+    apply_style(msg_box, lambda: f"""
         QMessageBox {{
             background-color: {Colors.BG_ELEVATED};
         }}
@@ -290,7 +290,7 @@ class _RecycleBinDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(f"""
+        apply_style(scroll, lambda: f"""
             QScrollArea {{
                 background-color: transparent;
                 border: 1px solid {Colors.BORDER};
@@ -307,7 +307,7 @@ class _RecycleBinDialog(QDialog):
         if not entries:
             empty_label = QLabel("回收站为空")
             empty_label.setFont(Fonts.body(Fonts.SIZE_SM))
-            empty_label.setStyleSheet(f"""
+            apply_style(empty_label, lambda: f"""
                 QLabel {{
                     color: {Colors.TEXT_DISABLED};
                     padding: {Spacing.XL}px;
@@ -332,7 +332,7 @@ class _RecycleBinDialog(QDialog):
             clear_btn = QPushButton("清空回收站")
             clear_btn.setFont(Fonts.body(Fonts.SIZE_SM))
             clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            clear_btn.setStyleSheet(f"""
+            apply_style(clear_btn, lambda: f"""
                 QPushButton {{
                     color: {Colors.ERROR};
                     background-color: transparent;
@@ -352,7 +352,7 @@ class _RecycleBinDialog(QDialog):
         close_btn = QPushButton("关闭")
         close_btn.setFont(Fonts.body(Fonts.SIZE_SM))
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setStyleSheet(f"""
+        apply_style(close_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: {Colors.BG_OVERLAY};
@@ -372,7 +372,7 @@ class _RecycleBinDialog(QDialog):
     def _make_entry_row(self, entry: TrashEntryVM) -> QFrame:
         """创建单个回收站条目行。"""
         row = QFrame()
-        row.setStyleSheet(f"""
+        apply_style(row, lambda: f"""
             QFrame {{
                 background-color: transparent;
                 border-bottom: 1px solid {Colors.DIVIDER};
@@ -393,7 +393,7 @@ class _RecycleBinDialog(QDialog):
         # 标题
         title_label = QLabel(entry.title)
         title_label.setFont(Fonts.body(Fonts.SIZE_SM))
-        title_label.setStyleSheet(f"""
+        apply_style(title_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_PRIMARY};
                 border: none;
@@ -404,7 +404,7 @@ class _RecycleBinDialog(QDialog):
         # 路径
         path_label = QLabel(entry.json_path)
         path_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        path_label.setStyleSheet(f"""
+        apply_style(path_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 border: none;
@@ -420,7 +420,7 @@ class _RecycleBinDialog(QDialog):
         # 删除时间
         time_label = QLabel(entry.deleted_at)
         time_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        time_label.setStyleSheet(f"""
+        apply_style(time_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 border: none;
@@ -433,7 +433,7 @@ class _RecycleBinDialog(QDialog):
         restore_btn.setFont(Fonts.body(Fonts.SIZE_XS))
         restore_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         restore_btn.setToolTip("恢复")
-        restore_btn.setStyleSheet(f"""
+        apply_style(restore_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.SUCCESS};
                 background: transparent;
@@ -455,7 +455,7 @@ class _RecycleBinDialog(QDialog):
         delete_btn.setFont(Fonts.body(Fonts.SIZE_XS))
         delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         delete_btn.setToolTip("彻底删除")
-        delete_btn.setStyleSheet(f"""
+        apply_style(delete_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.ERROR};
                 background: transparent;
@@ -506,7 +506,7 @@ class _RecycleBinDialog(QDialog):
 
     def _apply_style(self) -> None:
         """应用对话框整体样式。"""
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             QDialog {{
                 background-color: {Colors.BG_SURFACE};
             }}

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 
-from app.ui.theme import Colors, Fonts, Spacing, Radius
+from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
 
 
 # ──────────────────────────────────────────────
@@ -47,7 +47,7 @@ class _EntityRow(QFrame):
         # ── 类型标签 ──────────────────────────────
         type_badge = QLabel(entity_type)
         type_badge.setFont(Fonts.mono(Fonts.SIZE_XS))
-        type_badge.setStyleSheet(f"""
+        apply_style(type_badge, lambda: f"""
             QLabel {{
                 color: {Colors.ACCENT};
                 background-color: transparent;
@@ -61,7 +61,7 @@ class _EntityRow(QFrame):
         # ── 名称 ──────────────────────────────────
         name_label = QLabel(name)
         name_label.setFont(Fonts.body(Fonts.SIZE_SM, QFont.Weight.Medium))
-        name_label.setStyleSheet(f"""
+        apply_style(name_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_PRIMARY};
                 background: transparent;
@@ -72,7 +72,7 @@ class _EntityRow(QFrame):
         # ── 描述 ──────────────────────────────────
         desc_label = QLabel(description or "—")
         desc_label.setFont(Fonts.body(Fonts.SIZE_XS))
-        desc_label.setStyleSheet(f"""
+        apply_style(desc_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 background: transparent;
@@ -92,7 +92,7 @@ class _EntityRow(QFrame):
         delete_btn.setFixedSize(22, 22)
         delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         delete_btn.setToolTip("删除实体（同时删除相关关系）")
-        delete_btn.setStyleSheet(f"""
+        apply_style(delete_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.ERROR};
                 background: transparent;
@@ -114,7 +114,7 @@ class _EntityRow(QFrame):
         row_layout.addLayout(text_col, stretch=1)
         row_layout.addWidget(delete_btn)
 
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             _EntityRow {{
                 background-color: transparent;
                 border-bottom: 1px solid {Colors.DIVIDER};
@@ -151,15 +151,15 @@ class _RelationRow(QFrame):
 
         src_label = QLabel(source)
         src_label.setFont(Fonts.body(Fonts.SIZE_SM, QFont.Weight.Medium))
-        src_label.setStyleSheet(f"color: {Colors.PRIMARY}; background: transparent; border: none;")
+        apply_style(src_label, lambda: f"color: {Colors.PRIMARY}; background: transparent; border: none;")
 
         rel_label = QLabel(f"[{relation_type}]")
         rel_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        rel_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; background: transparent; border: none;")
+        apply_style(rel_label, lambda: f"color: {Colors.TEXT_SECONDARY}; background: transparent; border: none;")
 
         tgt_label = QLabel(target)
         tgt_label.setFont(Fonts.body(Fonts.SIZE_SM, QFont.Weight.Medium))
-        tgt_label.setStyleSheet(f"color: {Colors.ACCENT}; background: transparent; border: none;")
+        apply_style(tgt_label, lambda: f"color: {Colors.ACCENT}; background: transparent; border: none;")
 
         relation_row.addWidget(src_label)
         relation_row.addWidget(rel_label)
@@ -169,7 +169,7 @@ class _RelationRow(QFrame):
         # ── 描述（可选）────────────────────────────
         desc_label = QLabel(description)
         desc_label.setFont(Fonts.body(Fonts.SIZE_XS))
-        desc_label.setStyleSheet(f"color: {Colors.TEXT_DISABLED}; background: transparent; border: none;")
+        apply_style(desc_label, lambda: f"color: {Colors.TEXT_DISABLED}; background: transparent; border: none;")
         desc_label.setVisible(bool(description))
 
         # ── 文本列 ────────────────────────────────
@@ -185,7 +185,7 @@ class _RelationRow(QFrame):
         delete_btn.setFixedSize(22, 22)
         delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         delete_btn.setToolTip("删除此关系")
-        delete_btn.setStyleSheet(f"""
+        apply_style(delete_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.ERROR};
                 background: transparent;
@@ -208,7 +208,7 @@ class _RelationRow(QFrame):
         row_layout.addLayout(text_col, stretch=1)
         row_layout.addWidget(delete_btn)
 
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             _RelationRow {{
                 background-color: transparent;
                 border-bottom: 1px solid {Colors.DIVIDER};
@@ -226,7 +226,7 @@ def _empty_hint(text: str) -> QLabel:
     label = QLabel(text)
     label.setFont(Fonts.body(Fonts.SIZE_SM))
     label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    label.setStyleSheet(f"""
+    apply_style(label, lambda: f"""
         QLabel {{
             color: {Colors.TEXT_DISABLED};
             background: transparent;
@@ -314,7 +314,7 @@ class KGPanel(QWidget):
         main_layout.addWidget(self._stack, stretch=1)
 
         # ── 整体样式 ──────────────────────────────
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             KGPanel {{
                 background-color: {Colors.BG_SURFACE};
                 border-left: 1px solid {Colors.BORDER};
@@ -329,7 +329,7 @@ class KGPanel(QWidget):
     def _build_header(self) -> QWidget:
         """构建面板头部：图标 + 标题 + 统计 + 关闭按钮。"""
         header = QWidget()
-        header.setStyleSheet(f"""
+        apply_style(header, lambda: f"""
             QWidget {{
                 background-color: transparent;
                 border-bottom: 1px solid {Colors.DIVIDER};
@@ -346,7 +346,7 @@ class KGPanel(QWidget):
 
         title = QLabel("知识图谱")
         title.setFont(Fonts.mono(Fonts.SIZE_LG, QFont.Weight.DemiBold))
-        title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; background: transparent; border: none;")
+        apply_style(title, lambda: f"color: {Colors.TEXT_PRIMARY}; background: transparent; border: none;")
 
         layout.addWidget(icon)
         layout.addWidget(title)
@@ -354,7 +354,7 @@ class KGPanel(QWidget):
 
         self._stats_label = QLabel("")
         self._stats_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        self._stats_label.setStyleSheet(f"""
+        apply_style(self._stats_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_SECONDARY};
                 background: transparent;
@@ -368,7 +368,7 @@ class KGPanel(QWidget):
         close_btn.setFixedSize(28, 28)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.setToolTip("关闭")
-        close_btn.setStyleSheet(f"""
+        apply_style(close_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.TEXT_SECONDARY};
                 background: transparent;
@@ -391,7 +391,7 @@ class KGPanel(QWidget):
     def _build_tab_bar(self) -> QWidget:
         """构建自定义 Tab 切换栏（实体 | 关系）。"""
         tab_bar = QWidget()
-        tab_bar.setStyleSheet(f"""
+        apply_style(tab_bar, lambda: f"""
             QWidget {{
                 background-color: transparent;
                 border-bottom: 1px solid {Colors.DIVIDER};
@@ -444,6 +444,12 @@ class KGPanel(QWidget):
         self._active_tab = tab
         is_entity = (tab == "entity")
         self._stack.setCurrentIndex(0 if is_entity else 1)
+        self._apply_tab_style(self._entity_tab_btn, active=is_entity)
+        self._apply_tab_style(self._relation_tab_btn, active=not is_entity)
+
+    def refresh_theme(self) -> None:
+        """切主题时按当前激活 Tab 重绘 Tab 按钮样式。"""
+        is_entity = (self._active_tab == "entity")
         self._apply_tab_style(self._entity_tab_btn, active=is_entity)
         self._apply_tab_style(self._relation_tab_btn, active=not is_entity)
 

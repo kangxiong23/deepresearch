@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QProxyStyle,
     QStyle,
+    QStyleFactory,
     QStyleOptionViewItem, QStyleOption,
 )
 from PySide6.QtCore import (
@@ -49,7 +50,7 @@ from PySide6.QtGui import (
 )
 
 from app.controllers.view_models import TreeNodeVM
-from app.ui.theme import Colors, Fonts, Spacing
+from app.ui.theme import apply_style, Colors, Fonts, Spacing
 
 # ──────────────────────────────────────────────
 # 自定义数据角色（存储在 QStandardItem 中）
@@ -1398,9 +1399,12 @@ class TreePanel(QWidget):
 
         # ── Tree View ─────────────────────────────
         self._tree_view = _TreeView(self)
-        # 应用自定义风格 — 绘制白色展开/折叠箭头 + 带符号的复选框
-        base_style = QApplication.style()
-        if base_style:
+        # 应用自定义风格 — 绘制白色展开/折叠箭头 + 带符号的复选框。
+        # ⚠️ 必须用独立的 Fusion 风格实例作为 base style，而非 QApplication.style()：
+        # 直接包装全局 style 会在退出阶段因析构顺序（全局 style 先于代理销毁）
+        # 产生悬空指针，导致退出崩溃（access violation / abort）。
+        base_style = QStyleFactory.create("Fusion")
+        if base_style is not None:
             self._tree_view.setStyle(_TreeStyle(base_style))
         self._tree_view.setModel(self._model)
         self._tree_view.setHeaderHidden(True)
@@ -1461,7 +1465,7 @@ class TreePanel(QWidget):
         让 QStandardItem.setBackground() 和 _TreeStyle 自定义绘制完全控制背景色，
         避免 QSS 覆盖多选高亮 / 激活高亮 / 拖拽反馈。
         """
-        self._tree_view.setStyleSheet(f"""
+        apply_style(self._tree_view, lambda: f"""
             QTreeView {{
                 background-color: {Colors.BG_SURFACE};
                 border: none;
@@ -1472,7 +1476,7 @@ class TreePanel(QWidget):
             }}
         """)
 
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             TreePanel {{
                 background-color: {Colors.BG_SURFACE};
             }}
@@ -2186,7 +2190,7 @@ class TreePanel(QWidget):
 
         menu = QMenu(self)
         menu.setFont(Fonts.body(Fonts.SIZE_SM))
-        menu.setStyleSheet(f"""
+        apply_style(menu, lambda: f"""
             QMenu {{
                 background-color: {Colors.BG_ELEVATED};
                 color: {Colors.TEXT_PRIMARY};

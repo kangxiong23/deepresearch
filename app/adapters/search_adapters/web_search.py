@@ -75,9 +75,6 @@ class DuckDuckGoSearchAdapter:
             has_algo = "b_algo" in html
             has_result = "b_result" in html
             print(f"[Search] Bing HTML长度={len(html)} b_algo={has_algo} b_result={has_result}")
-            if not has_algo and not has_result:
-                # 打印前500字符帮助诊断
-                print(f"[Search] HTML前500: {html[:500]}")
             return _parse_bing(html, max_results)
 
     # ── DuckDuckGo ───────────────────────────

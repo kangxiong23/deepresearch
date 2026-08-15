@@ -114,7 +114,7 @@ class DeepSeekClient:
             MessageChunk — 与 stream_chat 相同；最后一块 is_done=True
         """
         self._abort_flag = False
-        url = "https://api.deepseek.com/beta" + self._API_PATH
+        url = app_config.DEEPSEEK_BASE_URL.rstrip("/") + "/beta" + self._API_PATH
         headers = {
             "Authorization": f"Bearer {app_config.DEEPSEEK_API_KEY}",
             "Content-Type": "application/json",
@@ -270,19 +270,19 @@ def _parse_sse_line(line: str) -> MessageChunk | None:
     choice = choices[0]
     delta = choice.get("delta", {})
     finish_reason = choice.get("finish_reason")
+    is_done = finish_reason is not None
 
-    # reasoning_content → THINKING 块
+    # reasoning_content → THINKING 块（若同块携带 finish_reason，同样透传结束信号）
     reasoning = delta.get("reasoning_content") or ""
     if reasoning:
         return MessageChunk(
             delta=reasoning,
-            is_done=False,
+            is_done=is_done,
             chunk_type=ChunkType.THINKING,
         )
 
     # content → TEXT 块
     content = delta.get("content") or ""
-    is_done = finish_reason is not None
     if content or is_done:
         return MessageChunk(
             delta=content,

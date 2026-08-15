@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QIcon
 
-from app.ui.theme import Colors, Fonts, Spacing, Radius
+from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
 from app.ui.widgets.tree_panel import TreePanel
 
 
@@ -59,6 +59,7 @@ class Sidebar(QWidget):
     search_requested = Signal(str)  # 携带搜索关键词（去抖后）
     multi_select_toggled = Signal(bool)  # True=进入多选, False=退出多选
     refresh_requested = Signal()    # 刷新整个对话树界面与对话界面
+    open_theme_clicked = Signal()   # 打开主题风格选择对话框
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -74,7 +75,7 @@ class Sidebar(QWidget):
         # ── 节标签 ────────────────────────────────
         section_label = QLabel("对话历史")
         section_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        section_label.setStyleSheet(f"""
+        apply_style(section_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 background-color: transparent;
@@ -109,7 +110,7 @@ class Sidebar(QWidget):
         layout.addWidget(bottom_widget)
 
         # ── 整体边框 ──────────────────────────────
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             Sidebar {{
                 background-color: {Colors.BG_SURFACE};
                 border-right: 1px solid {Colors.BORDER};
@@ -123,7 +124,7 @@ class Sidebar(QWidget):
         # DR logo
         logo_label = QLabel("DR")
         logo_label.setFont(Fonts.mono(Fonts.SIZE_MD, QFont.Weight.Bold))
-        logo_label.setStyleSheet(f"""
+        apply_style(logo_label, lambda: f"""
             QLabel {{
                 color: {Colors.PRIMARY};
                 background-color: transparent;
@@ -135,7 +136,7 @@ class Sidebar(QWidget):
 
         logo_container = QWidget()
         logo_container.setFixedSize(32, 32)
-        logo_container.setStyleSheet(f"""
+        apply_style(logo_container, lambda: f"""
             QWidget {{
                 background-color: {Colors.PRIMARY_GLOW};
                 border: 1px solid {Colors.PRIMARY};
@@ -151,7 +152,7 @@ class Sidebar(QWidget):
         # 标题
         title_label = QLabel("DeepResearch")
         title_label.setFont(Fonts.mono(Fonts.SIZE_LG, QFont.Weight.DemiBold))
-        title_label.setStyleSheet(f"""
+        apply_style(title_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: transparent;
@@ -165,7 +166,7 @@ class Sidebar(QWidget):
         refresh_btn.setFixedSize(28, 28)
         refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         refresh_btn.setToolTip("刷新对话树与对话界面")
-        refresh_btn.setStyleSheet(f"""
+        apply_style(refresh_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.TEXT_SECONDARY};
                 background-color: transparent;
@@ -190,7 +191,7 @@ class Sidebar(QWidget):
 
         header_widget = QWidget()
         header_widget.setLayout(header_row)
-        header_widget.setStyleSheet(f"""
+        apply_style(header_widget, lambda: f"""
             QWidget {{
                 background-color: transparent;
                 border-bottom: 1px solid {Colors.DIVIDER};
@@ -217,7 +218,7 @@ class Sidebar(QWidget):
         new_conv_btn = QPushButton("  ＋  对话")
         new_conv_btn.setFont(Fonts.body(Fonts.SIZE_SM, QFont.Weight.Medium))
         new_conv_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        new_conv_btn.setStyleSheet(f"""
+        apply_style(new_conv_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.BG_BASE};
                 background-color: {Colors.PRIMARY};
@@ -235,7 +236,7 @@ class Sidebar(QWidget):
         new_folder_btn = QPushButton("  📁  文件夹")
         new_folder_btn.setFont(Fonts.body(Fonts.SIZE_SM, QFont.Weight.Medium))
         new_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        new_folder_btn.setStyleSheet(f"""
+        apply_style(new_folder_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.BG_BASE};
                 background-color: {Colors.PRIMARY};
@@ -254,7 +255,7 @@ class Sidebar(QWidget):
         self._multi_select_btn.setFont(Fonts.body(Fonts.SIZE_SM, QFont.Weight.Medium))
         self._multi_select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._multi_select_btn.setCheckable(True)
-        self._multi_select_btn.setStyleSheet(f"""
+        apply_style(self._multi_select_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: {Colors.BG_ELEVATED};
@@ -336,9 +337,6 @@ class Sidebar(QWidget):
             label="回收站",
             on_click=lambda: self.open_trash_clicked.emit(),
         )
-        trash_entry.setStyleSheet(trash_entry.styleSheet() + f"""
-            border-top: 1px solid {Colors.DIVIDER};
-        """)
 
         # 上下文管理入口
         context_entry = self._make_bottom_entry(
@@ -354,9 +352,17 @@ class Sidebar(QWidget):
             on_click=lambda: self.open_kg_panel_clicked.emit(),
         )
 
+        # 主题风格入口
+        theme_entry = self._make_bottom_entry(
+            icon_text="🎨",
+            label="主题风格",
+            on_click=lambda: self.open_theme_clicked.emit(),
+        )
+
         layout.addWidget(trash_entry)
         layout.addWidget(context_entry)
         layout.addWidget(kg_entry)
+        layout.addWidget(theme_entry)
 
         return container
 
@@ -401,7 +407,7 @@ class Sidebar(QWidget):
         # 标签
         text_label = QLabel(label)
         text_label.setFont(Fonts.body(Fonts.SIZE_SM))
-        text_label.setStyleSheet(f"""
+        apply_style(text_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_SECONDARY};
                 background-color: transparent;
@@ -412,7 +418,7 @@ class Sidebar(QWidget):
         # 右箭头
         arrow_label = QLabel("›")
         arrow_label.setFont(Fonts.body(16))
-        arrow_label.setStyleSheet(f"""
+        apply_style(arrow_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 background-color: transparent;
@@ -425,7 +431,7 @@ class Sidebar(QWidget):
         row_layout.addWidget(arrow_label)
 
         # 整行样式
-        row_widget.setStyleSheet(f"""
+        apply_style(row_widget, lambda: f"""
             QWidget {{
                 background-color: transparent;
                 border-top: 1px solid {Colors.DIVIDER};
@@ -448,7 +454,7 @@ class Sidebar(QWidget):
         search.setPlaceholderText("搜索消息... (Ctrl+F)")
         search.setFont(Fonts.body(Fonts.SIZE_SM))
         search.setClearButtonEnabled(True)
-        search.setStyleSheet(f"""
+        apply_style(search, lambda: f"""
             QLineEdit {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: {Colors.BG_ELEVATED};

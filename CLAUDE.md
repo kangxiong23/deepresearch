@@ -203,8 +203,8 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 | `app/ui/widgets/context_panel.py` | ContextPanel — context block list, preview, template management |
 | `app/ui/widgets/kg_panel.py` | KGPanel — knowledge graph entity/relation viewer |
 | `app/ui/widgets/dialogs.py` | Reusable dialogs (rename, new folder, confirm, context block manager, recycle bin) |
-| `tests/test_tree_store.py` | TreeStore unit tests (25 tests) |
-| `tests/test_conversation_service.py` | ConversationService + ContextService unit tests (14 tests) |
+| `tests/test_tree_store.py` | TreeStore 单元测试 |
+| `tests/test_conversation_service.py` | ConversationService + ContextService 单元测试 |
 | `scripts/sync_db_with_tree.py` | One-time: prune orphan SQLite message rows based on tree.json/recycle_bin.json |
 | `scripts/fix_thinking_order.py` | One-time: fix tree.json message order where assistant precedes thinking |
 
