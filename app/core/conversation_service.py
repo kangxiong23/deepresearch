@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime
 from typing import AsyncGenerator
 
 import config as app_config
@@ -41,6 +40,7 @@ from app.storage.models import (
     Role,
     TreeRoot,
     TrashEntry,
+    utcnow,
 )
 
 
@@ -112,7 +112,7 @@ class ConversationService:
             新对话节点的 ID（UUID），同时也是 messages 表的 conversation_id
         """
         new_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = utcnow()
         node = ConversationNode(
             id=new_id,
             parent_id=parent_id,
@@ -944,7 +944,7 @@ class ConversationService:
         if parent_id is None:
             parent_id = "root"
 
-        now = datetime.utcnow()
+        now = utcnow()
         folder = FolderNode(
             id=str(uuid.uuid4()),
             parent_id=parent_id,
@@ -1225,7 +1225,7 @@ class ConversationService:
             conversation_id=session_id,
             role=Role.USER,
             content=text,
-            created_at=datetime.utcnow(),
+            created_at=utcnow(),
             token_count=len(text) // 4,
         )
         self._msg_repo.save_message(user_msg)
@@ -1249,40 +1249,46 @@ class ConversationService:
         full_content_parts: list[str] = []
         thinking_parts: list[str] = []
 
-        async for chunk in self._llm.stream_chat(llm_context):
-            if self._stop_event.is_set():
-                yield MessageChunk(
-                    delta="", is_done=True, message_id=assistant_msg_id
-                )
-                break
-
-            chunk.message_id = assistant_msg_id
-
-            if chunk.chunk_type == ChunkType.THINKING:
-                thinking_parts.append(chunk.delta)
-            else:
-                full_content_parts.append(chunk.delta)
-
-            if chunk.is_done:
-                full_content = "".join(full_content_parts)
-                if full_content or thinking_parts:
-                    # Phase 6: 持久化 assistant + 绑定 thinking（thinking 行存
-                    #   messages 表，树中只建 assistant 节点，通过绑定关联）
-                    asst_node = self._save_assistant_with_thinking(
-                        session_id, assistant_msg_id,
-                        full_content, "".join(thinking_parts),
+        try:
+            async for chunk in self._llm.stream_chat(llm_context):
+                if self._stop_event.is_set():
+                    yield MessageChunk(
+                        delta="", is_done=True, message_id=assistant_msg_id
                     )
-                    # 分叉感知：同步扩展当前分支记录（同 user 节点创建）
-                    self._branch_svc.extend_current_branch(session_id, [asst_node])
+                    break
 
-                # Step 9: 更新对话元数据（标题 & 摘要）
-                self._update_meta_after_reply(
-                    session_id, text, "".join(full_content_parts)
-                )
+                chunk.message_id = assistant_msg_id
+
+                if chunk.chunk_type == ChunkType.THINKING:
+                    thinking_parts.append(chunk.delta)
+                else:
+                    full_content_parts.append(chunk.delta)
+
+                if chunk.is_done:
+                    full_content = "".join(full_content_parts)
+                    if full_content or thinking_parts:
+                        # Phase 6: 持久化 assistant + 绑定 thinking（thinking 行存
+                        #   messages 表，树中只建 assistant 节点，通过绑定关联）
+                        asst_node = self._save_assistant_with_thinking(
+                            session_id, assistant_msg_id,
+                            full_content, "".join(thinking_parts),
+                        )
+                        # 分叉感知：同步扩展当前分支记录（同 user 节点创建）
+                        self._branch_svc.extend_current_branch(session_id, [asst_node])
+
+                    # Step 9: 更新对话元数据（标题 & 摘要）
+                    self._update_meta_after_reply(
+                        session_id, text, "".join(full_content_parts)
+                    )
+                    yield chunk
+                    break
+
                 yield chunk
-                break
-
-            yield chunk
+        except Exception:
+            # 网络/API 异常：本轮 user 消息已落库但无回复，标记未完成，
+            # 避免留下无回复的孤儿消息（下次启动会被 cleanup_incomplete_nodes 清理）。
+            self._tree.mark_incomplete(user_msg_node.id, True)
+            raise
 
     async def regenerate_message(
         self,
@@ -1444,7 +1450,7 @@ class ConversationService:
             conversation_id=session_id,
             role=Role.USER,
             content=text,
-            created_at=datetime.utcnow(),
+            created_at=utcnow(),
             token_count=len(text) // 4,
         )
         self._msg_repo.save_message(user_msg)
@@ -1589,7 +1595,7 @@ class ConversationService:
                     role=Role.THINKING,
                     content=complete_thinking,
                     is_thinking=True,
-                    created_at=datetime.utcnow(),
+                    created_at=utcnow(),
                     token_count=len(complete_thinking) // 4,
                 )
                 self._msg_repo.save_message(thinking_msg)
@@ -1601,7 +1607,7 @@ class ConversationService:
                 role=Role.ASSISTANT,
                 content=complete_content,
                 is_thinking=bool(complete_thinking.strip()),
-                created_at=datetime.utcnow(),
+                created_at=utcnow(),
                 token_count=len(complete_content) // 4,
             )
             self._msg_repo.save_message(assistant_msg)
@@ -1671,7 +1677,7 @@ class ConversationService:
                 role=Role.THINKING,
                 content=thinking_content,
                 is_thinking=True,
-                created_at=datetime.utcnow(),
+                created_at=utcnow(),
                 token_count=len(thinking_content) // 4,
             )
             self._msg_repo.save_message(thinking_msg)
@@ -1683,7 +1689,7 @@ class ConversationService:
             role=Role.ASSISTANT,
             content=full_content,
             is_thinking=bool(thinking_content),
-            created_at=datetime.utcnow(),
+            created_at=utcnow(),
             token_count=len(full_content) // 4,
         ))
 

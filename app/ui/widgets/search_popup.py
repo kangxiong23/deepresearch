@@ -19,7 +19,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 
 from app.controllers.view_models import SearchResultVM
-from app.ui.theme import Colors, Fonts, Spacing, Radius
+from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
 
 # 角色图标（与 tree_panel.py 保持一致）
 _ROLE_ICONS = {
@@ -46,7 +46,7 @@ class SearchPopup(QFrame):
         self.setFixedHeight(320)
 
         # ── 整体样式 ──────────────────────────────
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             SearchPopup {{
                 background-color: {Colors.BG_ELEVATED};
                 border: 1px solid {Colors.BORDER};
@@ -99,7 +99,7 @@ class SearchPopup(QFrame):
         if not results:
             empty = QLabel("  无匹配结果")
             empty.setFont(Fonts.body(Fonts.SIZE_SM))
-            empty.setStyleSheet(f"""
+            apply_style(empty, lambda: f"""
                 QLabel {{
                     color: {Colors.TEXT_DISABLED};
                     padding: {Spacing.MD}px;
@@ -121,7 +121,7 @@ class SearchPopup(QFrame):
         """创建单行可点击结果。"""
         row = QFrame()
         row.setCursor(Qt.CursorShape.PointingHandCursor)
-        row.setStyleSheet(f"""
+        apply_style(row, lambda: f"""
             QFrame {{
                 background-color: transparent;
                 border-bottom: 1px solid {Colors.DIVIDER};
@@ -148,7 +148,7 @@ class SearchPopup(QFrame):
         # 文本列：路径 + 片段
         path_label = QLabel(result.tree_path)
         path_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        path_label.setStyleSheet(f"""
+        apply_style(path_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 background: transparent;
@@ -158,7 +158,7 @@ class SearchPopup(QFrame):
 
         snippet_label = QLabel(result.snippet)
         snippet_label.setFont(Fonts.body(Fonts.SIZE_SM))
-        snippet_label.setStyleSheet(f"""
+        apply_style(snippet_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_PRIMARY};
                 background: transparent;
@@ -175,7 +175,7 @@ class SearchPopup(QFrame):
         # 时间标签
         time_label = QLabel(result.created_at)
         time_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        time_label.setStyleSheet(f"""
+        apply_style(time_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 background: transparent;

@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QMargins, QPropertyAnimation, QEasingCurve, QPoint, QTimer
 from PySide6.QtGui import QFont
 
-from app.ui.theme import Colors, Fonts, Spacing, Radius
+from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
 from app.ui.widgets.input_area import InputArea
 from app.ui.widgets.sidebar import Sidebar
 from app.ui.widgets.context_panel import ContextPanel
@@ -47,7 +47,7 @@ class EmptyHintWidget(QWidget):
         # ── "DR" logo ──────────────────────────
         logo_label = QLabel("DR")
         logo_label.setFont(Fonts.mono(Fonts.SIZE_XL, QFont.Weight.Bold))
-        logo_label.setStyleSheet(f"""
+        apply_style(logo_label, lambda: f"""
             QLabel {{
                 color: {Colors.PRIMARY};
                 background-color: transparent;
@@ -59,7 +59,7 @@ class EmptyHintWidget(QWidget):
 
         logo_container = QWidget()
         logo_container.setFixedSize(64, 64)
-        logo_container.setStyleSheet(f"""
+        apply_style(logo_container, lambda: f"""
             QWidget {{
                 background-color: {Colors.PRIMARY_GLOW};
                 border: 1px solid {Colors.PRIMARY};
@@ -76,7 +76,7 @@ class EmptyHintWidget(QWidget):
         # ── "DeepResearch" 标题 ────────────────
         title_label = QLabel("DeepResearch")
         title_label.setFont(Fonts.mono(Fonts.SIZE_XXL, QFont.Weight.DemiBold))
-        title_label.setStyleSheet(f"""
+        apply_style(title_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: transparent;
@@ -88,7 +88,7 @@ class EmptyHintWidget(QWidget):
         # ── 副标题 ──────────────────────────────
         subtitle_label = QLabel("选择或新建一个对话以开始")
         subtitle_label.setFont(Fonts.body(Fonts.SIZE_MD))
-        subtitle_label.setStyleSheet(f"""
+        apply_style(subtitle_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_SECONDARY};
                 background-color: transparent;
@@ -108,7 +108,7 @@ class EmptyHintWidget(QWidget):
         layout.addStretch()
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             EmptyHintWidget {{
                 background-color: {Colors.BG_BASE};
             }}
@@ -129,7 +129,7 @@ class _ScrollToBottomButton(QPushButton):
         self.setFixedSize(40, 40)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("滚动到底部")
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             QPushButton {{
                 background-color: rgba(26, 30, 40, 0.85);
                 color: {Colors.PRIMARY};
@@ -174,7 +174,7 @@ class MessageListView(QWidget):
         self._scroll_area.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
-        self._scroll_area.setStyleSheet(f"""
+        apply_style(self._scroll_area, lambda: f"""
             QScrollArea {{
                 background-color: {Colors.BG_BASE};
                 border: none;
@@ -232,7 +232,7 @@ class MessageListView(QWidget):
         layout.setSpacing(0)
         layout.addWidget(self._stack)
 
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             MessageListView {{
                 background-color: {Colors.BG_BASE};
             }}
@@ -703,7 +703,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(900, 600)
 
         # ── 全局背景 ────────────────────────────
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             MainWindow {{
                 background-color: {Colors.BG_BASE};
             }}
@@ -715,7 +715,7 @@ class MainWindow(QMainWindow):
         # ── 垂直分割线 ──────────────────────────
         divider = QFrame()
         divider.setFrameShape(QFrame.Shape.VLine)
-        divider.setStyleSheet(f"""
+        apply_style(divider, lambda: f"""
             QFrame {{
                 color: {Colors.BORDER};
                 border: none;
@@ -749,7 +749,7 @@ class MainWindow(QMainWindow):
         self._right_panel_stack.addWidget(self._context_panel)  # index 0
         self._right_panel_stack.addWidget(self._kg_panel)        # index 1
         self._right_panel_stack.setFixedWidth(0)  # 默认隐藏
-        self._right_panel_stack.setStyleSheet(f"""
+        apply_style(self._right_panel_stack, lambda: f"""
             QStackedWidget {{
                 background-color: {Colors.BG_SURFACE};
                 border-left: 1px solid {Colors.BORDER};

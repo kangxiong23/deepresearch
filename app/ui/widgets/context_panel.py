@@ -32,7 +32,7 @@ from PySide6.QtGui import (
     QPainter,
 )
 
-from app.ui.theme import Colors, Fonts, Spacing, Radius
+from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
 
 
 # ──────────────────────────────────────────────
@@ -68,7 +68,7 @@ class _ContextBlockRow(QFrame):
         self._switch = QCheckBox()
         self._switch.setChecked(enabled)
         self._switch.setFixedSize(36, 18)
-        self._switch.setStyleSheet(f"""
+        apply_style(self._switch, lambda: f"""
             QCheckBox::indicator {{
                 width: 36px;
                 height: 18px;
@@ -91,7 +91,7 @@ class _ContextBlockRow(QFrame):
         # Ignored 使其不再参与行最小宽度计算，只占据开关/按钮之外的剩余空间。
         label_widget = QLabel(label)
         label_widget.setFont(Fonts.body(Fonts.SIZE_SM, QFont.Weight.Medium))
-        label_widget.setStyleSheet(f"""
+        apply_style(label_widget, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_PRIMARY};
                 background: transparent;
@@ -102,7 +102,7 @@ class _ContextBlockRow(QFrame):
 
         preview_widget = QLabel(preview)
         preview_widget.setFont(Fonts.mono(Fonts.SIZE_XS))
-        preview_widget.setStyleSheet(f"""
+        apply_style(preview_widget, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 background: transparent;
@@ -125,7 +125,7 @@ class _ContextBlockRow(QFrame):
         self._remove_btn.setFixedSize(22, 22)
         self._remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._remove_btn.setToolTip("移除")
-        self._remove_btn.setStyleSheet(f"""
+        apply_style(self._remove_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.ERROR};
                 background: transparent;
@@ -147,7 +147,7 @@ class _ContextBlockRow(QFrame):
         self._edit_btn.setFixedSize(22, 22)
         self._edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._edit_btn.setToolTip("编辑")
-        self._edit_btn.setStyleSheet(f"""
+        apply_style(self._edit_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.PRIMARY};
                 background: transparent;
@@ -169,7 +169,7 @@ class _ContextBlockRow(QFrame):
         self._copy_btn.setFixedSize(22, 22)
         self._copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._copy_btn.setToolTip("复制（克隆到下一位置）")
-        self._copy_btn.setStyleSheet(f"""
+        apply_style(self._copy_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.TEXT_SECONDARY};
                 background: transparent;
@@ -203,7 +203,7 @@ class _ContextBlockRow(QFrame):
         row_layout.addLayout(btn_col)
 
         # ── 底部边框 ──────────────────────────────
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             _ContextBlockRow {{
                 background-color: transparent;
                 border-bottom: 1px solid {Colors.DIVIDER};
@@ -309,7 +309,6 @@ class _BlockListContainer(QWidget):
 
     reorder_requested = Signal(str, int)  # block_id, new_index
 
-    _INDICATOR_COLOR = Colors.PRIMARY
     _INDICATOR_HEIGHT = 2
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -320,8 +319,9 @@ class _BlockListContainer(QWidget):
         # 插入指示线（绝对定位的子控件，不参与布局）
         self._drop_indicator = QFrame(self)
         self._drop_indicator.setFixedHeight(self._INDICATOR_HEIGHT)
-        self._drop_indicator.setStyleSheet(
-            f"background-color: {self._INDICATOR_COLOR}; border: none;"
+        apply_style(
+            self._drop_indicator,
+            lambda: f"background-color: {Colors.PRIMARY}; border: none;",
         )
         self._drop_indicator.hide()
 
@@ -439,7 +439,7 @@ class _TemplateRow(QFrame):
         name_widget = QLabel(name)
         name_widget.setFont(Fonts.body(Fonts.SIZE_SM))
         name_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        name_widget.setStyleSheet(f"""
+        apply_style(name_widget, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_PRIMARY};
                 background: transparent;
@@ -450,7 +450,7 @@ class _TemplateRow(QFrame):
         desc_widget = QLabel(description)
         desc_widget.setFont(Fonts.body(Fonts.SIZE_XS))
         desc_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        desc_widget.setStyleSheet(f"""
+        apply_style(desc_widget, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 background: transparent;
@@ -469,7 +469,7 @@ class _TemplateRow(QFrame):
         apply_btn = QPushButton("应用")
         apply_btn.setFont(Fonts.mono(Fonts.SIZE_XS))
         apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        apply_btn.setStyleSheet(f"""
+        apply_style(apply_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.PRIMARY};
                 background-color: transparent;
@@ -490,7 +490,7 @@ class _TemplateRow(QFrame):
         add_btn.setFont(Fonts.mono(Fonts.SIZE_XS, QFont.Weight.Bold))
         add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         add_btn.setToolTip("增量追加（不替换现有块）")
-        add_btn.setStyleSheet(f"""
+        apply_style(add_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.ACCENT};
                 background-color: transparent;
@@ -512,7 +512,7 @@ class _TemplateRow(QFrame):
         delete_btn.setFixedSize(22, 22)
         delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         delete_btn.setToolTip("删除模板")
-        delete_btn.setStyleSheet(f"""
+        apply_style(delete_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.ERROR};
                 background: transparent;
@@ -538,7 +538,7 @@ class _TemplateRow(QFrame):
         row_layout.addWidget(add_btn)
         row_layout.addWidget(delete_btn)
 
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             _TemplateRow {{
                 background-color: transparent;
                 border-bottom: 1px solid {Colors.DIVIDER};
@@ -620,7 +620,7 @@ class ContextPanel(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(f"""
+        apply_style(scroll, lambda: f"""
             QScrollArea {{
                 background-color: transparent;
                 border: none;
@@ -647,7 +647,7 @@ class ContextPanel(QWidget):
         main_layout.addWidget(scroll)
 
         # ── 整体样式 ──────────────────────────────
-        self.setStyleSheet(f"""
+        apply_style(self, lambda: f"""
             ContextPanel {{
                 background-color: {Colors.BG_SURFACE};
                 border-left: 1px solid {Colors.BORDER};
@@ -662,7 +662,7 @@ class ContextPanel(QWidget):
     def _build_header(self) -> QWidget:
         """构建面板头部。"""
         header = QWidget()
-        header.setStyleSheet(f"""
+        apply_style(header, lambda: f"""
             QWidget {{
                 background-color: transparent;
                 border-bottom: 1px solid {Colors.DIVIDER};
@@ -679,7 +679,7 @@ class ContextPanel(QWidget):
 
         self._header_title = QLabel("上下文管理")
         self._header_title.setFont(Fonts.mono(Fonts.SIZE_LG, QFont.Weight.DemiBold))
-        self._header_title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; background: transparent; border: none;")
+        apply_style(self._header_title, lambda: f"color: {Colors.TEXT_PRIMARY}; background: transparent; border: none;")
 
         layout.addWidget(icon)
         layout.addWidget(self._header_title)
@@ -699,7 +699,7 @@ class ContextPanel(QWidget):
         close_btn.setFixedSize(28, 28)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.setToolTip("关闭")
-        close_btn.setStyleSheet(f"""
+        apply_style(close_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.TEXT_SECONDARY};
                 background: transparent;
@@ -742,7 +742,7 @@ class ContextPanel(QWidget):
 
         section_label = QLabel("已选上下文块")
         section_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        section_label.setStyleSheet(f"""
+        apply_style(section_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 background: transparent;
@@ -754,7 +754,7 @@ class ContextPanel(QWidget):
         self._template_name_input = QLineEdit()
         self._template_name_input.setPlaceholderText("输入模板名称，保存当前块为模板...")
         self._template_name_input.setFont(Fonts.body(Fonts.SIZE_XS))
-        self._template_name_input.setStyleSheet(f"""
+        apply_style(self._template_name_input, lambda: f"""
             QLineEdit {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: {Colors.BG_ELEVATED};
@@ -773,7 +773,7 @@ class ContextPanel(QWidget):
         save_btn.setFixedSize(28, 28)
         save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         save_btn.setToolTip("保存为模板")
-        save_btn.setStyleSheet(f"""
+        apply_style(save_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.ACCENT};
                 background: transparent;
@@ -804,7 +804,7 @@ class ContextPanel(QWidget):
         blocks_scroll.setWidgetResizable(True)
         blocks_scroll.setFixedHeight(200)
         blocks_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        blocks_scroll.setStyleSheet(f"""
+        apply_style(blocks_scroll, lambda: f"""
             QScrollArea {{
                 background-color: transparent;
                 border: none;
@@ -835,7 +835,7 @@ class ContextPanel(QWidget):
         编辑模式布局：输入框右侧为 [✕ 取消修改]（上） + [保存修改]（下）。
         """
         section = QWidget()
-        section.setStyleSheet(f"""
+        apply_style(section, lambda: f"""
             QWidget {{
                 background-color: transparent;
                 border-bottom: 1px solid {Colors.DIVIDER};
@@ -848,7 +848,7 @@ class ContextPanel(QWidget):
 
         self._add_block_label = QLabel("添加文本块")
         self._add_block_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        self._add_block_label.setStyleSheet(f"""
+        apply_style(self._add_block_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 background: transparent;
@@ -860,7 +860,7 @@ class ContextPanel(QWidget):
         self._block_title_input = QLineEdit()
         self._block_title_input.setPlaceholderText("标题（可选，默认取内容前15字）")
         self._block_title_input.setFont(Fonts.body(Fonts.SIZE_XS))
-        self._block_title_input.setStyleSheet(f"""
+        apply_style(self._block_title_input, lambda: f"""
             QLineEdit {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: {Colors.BG_ELEVATED};
@@ -885,7 +885,7 @@ class ContextPanel(QWidget):
         self._new_block_input = QTextEdit()
         self._new_block_input.setPlaceholderText("输入自定义上下文内容...")
         self._new_block_input.setFont(Fonts.body(Fonts.SIZE_SM))
-        self._new_block_input.setStyleSheet(f"""
+        apply_style(self._new_block_input, lambda: f"""
             QTextEdit {{
                 color: {Colors.TEXT_PRIMARY};
                 background-color: {Colors.BG_ELEVATED};
@@ -908,7 +908,7 @@ class ContextPanel(QWidget):
         self._cancel_edit_btn.setFixedSize(36, 36)
         self._cancel_edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._cancel_edit_btn.setToolTip("取消修改")
-        self._cancel_edit_btn.setStyleSheet(f"""
+        apply_style(self._cancel_edit_btn, lambda: f"""
             QPushButton {{
                 color: {Colors.ERROR};
                 background: transparent;
@@ -1076,7 +1076,7 @@ class ContextPanel(QWidget):
 
         section_label = QLabel("拼接预览")
         section_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        section_label.setStyleSheet(f"""
+        apply_style(section_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 background: transparent;
@@ -1095,7 +1095,7 @@ class ContextPanel(QWidget):
         self._preview_text.setWordWrapMode(
             QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
         )
-        self._preview_text.setStyleSheet(f"""
+        apply_style(self._preview_text, lambda: f"""
             QTextBrowser {{
                 color: {Colors.TEXT_CODE};
                 background-color: {Colors.BG_BASE};
@@ -1123,7 +1123,7 @@ class ContextPanel(QWidget):
 
         section_label = QLabel("模板库")
         section_label.setFont(Fonts.mono(Fonts.SIZE_XS))
-        section_label.setStyleSheet(f"""
+        apply_style(section_label, lambda: f"""
             QLabel {{
                 color: {Colors.TEXT_DISABLED};
                 background: transparent;
@@ -1144,7 +1144,7 @@ class ContextPanel(QWidget):
         templates_scroll.setWidgetResizable(True)
         templates_scroll.setFixedHeight(180)
         templates_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        templates_scroll.setStyleSheet(f"""
+        apply_style(templates_scroll, lambda: f"""
             QScrollArea {{
                 background-color: transparent;
                 border: none;
@@ -1229,6 +1229,11 @@ class ContextPanel(QWidget):
                 border-radius: 4px;
             }}
         """)
+
+    def refresh_theme(self) -> None:
+        """切主题时按当前状态重绘"添加/保存"与"应用"按钮样式。"""
+        self._set_add_btn_style(self._edit_block_id is not None)
+        self._set_apply_btn_color(self._dirty)
 
     def load_blocks(self, items: list[dict]) -> None:
         """

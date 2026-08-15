@@ -31,6 +31,7 @@ from app.storage.models import (
     TrashEntry,
     TreeNode,
     TreeRoot,
+    utcnow,
 )
 
 
@@ -137,7 +138,7 @@ class TreeStore:
                     node_data=d.get("node_data", {}),
                     deleted_at=(
                         datetime.fromisoformat(d["deleted_at"])
-                        if d.get("deleted_at") else datetime.utcnow()
+                        if d.get("deleted_at") else utcnow()
                     ),
                 ))
             return entries
@@ -163,7 +164,7 @@ class TreeStore:
 
     def _create_default_tree(self) -> TreeRoot:
         """创建默认树结构：仅包含一个"未分类"根目录。"""
-        now = datetime.utcnow()
+        now = utcnow()
         root_folder = FolderNode(
             id="root",
             parent_id=None,
@@ -238,14 +239,14 @@ class TreeStore:
                     break
             if target is not None:
                 target.thinking_message_id = tn.message_id
-                target.updated_at = datetime.utcnow()
+                target.updated_at = utcnow()
             else:
                 orphan_nodes.append(tn)
             remove_ids.add(tn.id)
 
         # 孤儿 thinking 节点 → 回收站（保持可恢复）
         trash_entries: list[TrashEntry] = []
-        now = datetime.utcnow()
+        now = utcnow()
         for tn in orphan_nodes:
             trash_entries.append(TrashEntry(
                 id=str(uuid.uuid4()),
@@ -443,7 +444,7 @@ class TreeStore:
             return
         if node.incomplete != value:
             node.incomplete = value
-            node.updated_at = datetime.utcnow()
+            node.updated_at = utcnow()
             self._save_tree(self._root)
             self._mark_dirty(node)
 
@@ -575,7 +576,7 @@ class TreeStore:
         }
         self._root.nodes = [n for n in self._root.nodes if n.id not in existing]
 
-        now = datetime.utcnow()
+        now = utcnow()
         for i, n in enumerate(nodes):
             n.parent_id = conversation_id
             n.sort_order = i
@@ -641,7 +642,7 @@ class TreeStore:
 
         affected_ids: list[str] = []
         node.enabled = enabled
-        node.updated_at = datetime.utcnow()
+        node.updated_at = utcnow()
         affected_ids.append(node_id)
 
         # BFS 级联到所有后代
@@ -650,7 +651,7 @@ class TreeStore:
             current = queue.pop(0)
             for child in self._find_children(current):
                 child.enabled = enabled
-                child.updated_at = datetime.utcnow()
+                child.updated_at = utcnow()
                 affected_ids.append(child.id)
                 queue.append(child.id)
 
@@ -701,7 +702,7 @@ class TreeStore:
 
             if ancestor.enabled != new_state:
                 ancestor.enabled = new_state
-                ancestor.updated_at = datetime.utcnow()
+                ancestor.updated_at = utcnow()
                 changed.append(current_id)
 
             current_id = ancestor.parent_id
@@ -730,7 +731,7 @@ class TreeStore:
         Args:
             node: 要插入的节点（FolderNode 或 ConversationNode）
         """
-        now = datetime.utcnow()
+        now = utcnow()
         node.created_at = now
         node.updated_at = now
 
@@ -773,7 +774,7 @@ class TreeStore:
             if key in allowed and hasattr(node, key):
                 setattr(node, key, value)
 
-        node.updated_at = datetime.utcnow()
+        node.updated_at = utcnow()
         self._save_tree(self._root)
         self._mark_dirty(node)
 
@@ -842,7 +843,7 @@ class TreeStore:
 
         old_parent_id = node.parent_id
         node.parent_id = new_parent_id
-        node.updated_at = datetime.utcnow()
+        node.updated_at = utcnow()
 
         # 重新排列新父级下的子节点顺序
         new_siblings = self._find_children(new_parent_id)
@@ -900,7 +901,7 @@ class TreeStore:
         old_parent_id = node.parent_id
         removed_or_promoted: list[AnyTreeNode] = []
         trash_entries: list[TrashEntry] = []
-        now = datetime.utcnow()
+        now = utcnow()
 
         if mode == "recursive":
             # 收集并移除整个子树
@@ -1039,7 +1040,7 @@ class TreeStore:
         for i, n in enumerate(siblings):
             n.sort_order = i
 
-        node.updated_at = datetime.utcnow()
+        node.updated_at = utcnow()
         self._root.nodes.append(node)
 
         # 从回收站移除
@@ -1130,11 +1131,11 @@ def _dict_to_node(d: dict) -> AnyTreeNode:
         "title": d.get("title", ""),
         "created_at": (
             datetime.fromisoformat(d["created_at"])
-            if d.get("created_at") else datetime.utcnow()
+            if d.get("created_at") else utcnow()
         ),
         "updated_at": (
             datetime.fromisoformat(d["updated_at"])
-            if d.get("updated_at") else datetime.utcnow()
+            if d.get("updated_at") else utcnow()
         ),
     }
     if node_type == "folder":

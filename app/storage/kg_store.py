@@ -12,11 +12,11 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import config as app_config
+from app.storage.models import utcnow
 
 
 # ──────────────────────────────────────────────
@@ -257,7 +257,7 @@ def _entity_to_dict(e: KGEntity) -> dict:
         "entity_type": e.entity_type,
         "description": e.description,
         "source_conversation_id": e.source_conversation_id,
-        "created_at": e.created_at or datetime.utcnow().isoformat(),
+        "created_at": e.created_at or utcnow().isoformat(),
         "properties": e.properties,
     }
 
@@ -282,7 +282,7 @@ def _relation_to_dict(r: KGRelation) -> dict:
         "relation_type": r.relation_type,
         "description": r.description,
         "source_conversation_id": r.source_conversation_id,
-        "created_at": r.created_at or datetime.utcnow().isoformat(),
+        "created_at": r.created_at or utcnow().isoformat(),
         "properties": r.properties,
     }
 
