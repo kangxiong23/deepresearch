@@ -38,13 +38,18 @@ class TestConfigScope(unittest.TestCase):
             _ = app_config.does_not_exist
 
     def test_no_cross_thread_leak(self) -> None:
-        """跨线程隔离：A 线程的 scope 覆盖不应泄漏到 B 线程。"""
+        """跨线程隔离：A 线程的 scope 覆盖不应泄漏到 B 线程。
+
+        B 线程读到的应为环境（.env）实际默认模型，而非 A 线程的覆盖值。
+        """
+        default_model = app_config.model_type
+        a_model = f"{default_model}-thread-a"
         a_entered = threading.Event()
         b_done = threading.Event()
         result: list = []
 
         def worker_a() -> None:
-            with ConfigScope(model_type="deepseek-v4-flash"):
+            with ConfigScope(model_type=a_model):
                 a_entered.set()
                 b_done.wait(5)
 
@@ -62,7 +67,8 @@ class TestConfigScope(unittest.TestCase):
         tb.join()
 
         self.assertTrue(result)
-        self.assertNotEqual(result[0], "deepseek-v4-flash")
+        self.assertNotEqual(result[0], a_model)
+        self.assertEqual(result[0], default_model)
 
 
 if __name__ == "__main__":

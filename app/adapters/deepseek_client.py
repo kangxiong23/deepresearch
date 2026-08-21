@@ -168,7 +168,8 @@ class DeepSeekClient:
               reasoning_effort（low/high/max，来自 config.reasoning_effort）。
             - thinking 未启用时：下发 thinking.type=disabled，且【不得】传
               reasoning_effort —— API 会因此报错。
-            - temperature：reasoner 场景不传（保留：非 pro 模型传 temperature）。
+            - temperature：思考模式启用时一律不传（API 不支持，flash / pro
+              均如此）；关闭时才携带。
         """
         # 从 config 读取当前模型（覆盖 context 中的值，确保用最新选择）
         model = app_config.model_type
@@ -192,21 +193,22 @@ class DeepSeekClient:
         if max_tokens:
             payload["max_tokens"] = max_tokens
 
-        # temperature（reasoner 模型不支持，跳过）
-        if model != "deepseek-v4-pro":
-            temp = context.temperature
-            if temp is None:
-                temp = app_config.temperature
-            payload["temperature"] = temp
-
+        # temperature
+        # 思考模式启用时：API 不支持 temperature，一律不传（flash / pro 均如此）
+        # 思考模式关闭时：flash / pro 均可携带 temperature
         # 思考模式 & 思考强度：flash / pro 平等对待
         if app_config.thinking_enabled:
             payload["thinking"] = {"type": "enabled"}
             effort = app_config.reasoning_effort or "high"
             payload["reasoning_effort"] = effort
+            # 思考模式下不传 temperature
         else:
             payload["thinking"] = {"type": "disabled"}
             # 不传 reasoning_effort —— API 要求 thinking 未启用时不得携带
+            temp = context.temperature
+            if temp is None:
+                temp = app_config.temperature
+            payload["temperature"] = temp
 
         return payload
 

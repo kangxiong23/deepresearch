@@ -17,9 +17,10 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QScrollBar,
+    QScrollArea,
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtCore import Qt, Signal, QPointF
+from PySide6.QtGui import QFont, QColor, QPainter, QPolygonF
 
 from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
 
@@ -196,6 +197,9 @@ def _role_badge(role: str) -> QLabel:
 # ──────────────────────────────────────────────
 
 MAX_CONTENT_HEIGHT = 2000  # 单条消息最大可见高度 (px)，超出启用内部滚动
+BUBBLE_MAX_RATIO = 4 / 5   # 气泡最大宽度 = 对话区宽度的 4/5
+MIN_BUBBLE_WIDTH = 140     # 气泡最小宽度 (px)
+_BUBBLE_H_PADDING = Spacing.MD * 2  # 气泡水平内边距（左右各 Spacing.MD）
 
 # ──────────────────────────────────────────────
 # 思考块
@@ -443,6 +447,37 @@ class _ForkControl(QFrame):
         self._next_btn.setEnabled(self._m < self._n)
 
 
+class _BubbleTail(QWidget):
+    """
+    QQ/微信风格气泡小尾巴（三角）。
+
+    放置在气泡底部外侧：assistant（左侧气泡）尾巴在左下角，
+    user（右侧气泡）尾巴在右下角。颜色与气泡底色一致。
+    """
+
+    def __init__(
+        self, side: str, bg_color: str, parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self._side = side  # "left" | "right"
+        self._bg = bg_color
+        self.setFixedSize(16, 9)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(self._bg))
+        w = self.width()
+        h = self.height()
+        if self._side == "left":
+            points = QPolygonF([QPointF(0, 0), QPointF(w, 0), QPointF(0, h)])
+        else:
+            points = QPolygonF([QPointF(0, 0), QPointF(w, 0), QPointF(w, h)])
+        p.drawPolygon(points)
+
+
 class ChatMessage(QFrame):
     """
     单条消息气泡。与原 Flet 版本 ChatMessage 视觉完全一致。
@@ -494,13 +529,18 @@ class ChatMessage(QFrame):
         self._fork_point_id: str = ""
 
         is_user = (role == "user")
+        self._is_user = is_user
 
-        # ── 角色标签行 ──────────────────────────
+        # ── 角色标签行（对齐到气泡外侧）──────────
         badge_row = QHBoxLayout()
         badge_row.setContentsMargins(0, 0, 0, 0)
         badge_row.setSpacing(Spacing.SM)
-        badge_row.addWidget(_role_badge(role))
-        badge_row.addStretch()
+        if is_user:
+            badge_row.addStretch()
+            badge_row.addWidget(_role_badge(role))
+        else:
+            badge_row.addWidget(_role_badge(role))
+            badge_row.addStretch()
 
         # ── 内容区（Markdown 渲染）───────────────
         self._content_browser = QTextBrowser()
@@ -533,10 +573,9 @@ class ChatMessage(QFrame):
 
         # ── 操作按钮行（单行；user 靠右，assistant 靠左）─────
         self._action_widget = QWidget()
-        # 控件栏背景与气泡框颜色一致
-        action_bg = Colors.USER_BG if is_user else Colors.BG_SURFACE
+        # 控件栏背景透明——气泡主体背景由 _bubble 统一绘制
         self._action_widget.setStyleSheet(
-            f"QWidget {{ background-color: {action_bg}; }}"
+            "QWidget { background-color: transparent; }"
         )
         action_layout = QHBoxLayout(self._action_widget)
         action_layout.setContentsMargins(0, 0, 0, 0)
@@ -593,46 +632,75 @@ class ChatMessage(QFrame):
 
         self._action_widget.setVisible(not is_user)
 
-        # ── 内部布局 ────────────────────────────
-        inner = QVBoxLayout()
-        inner.setContentsMargins(0, 0, 0, 0)
-        inner.setSpacing(Spacing.SM)
-        inner.addLayout(badge_row)
-        inner.addWidget(self._content_browser)
-        inner.addWidget(self._action_widget)
+        # ── 气泡主体（QQ/微信风格圆角矩形，无边框）──
+        self._bubble = QFrame()
+        self._bubble.setObjectName("chatBubble")
+        bubble_vbox = QVBoxLayout(self._bubble)
+        bubble_vbox.setContentsMargins(
+            Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM
+        )
+        bubble_vbox.setSpacing(Spacing.SM)
+        bubble_vbox.addLayout(badge_row)
+        bubble_vbox.addWidget(self._content_browser)
+        bubble_vbox.addWidget(self._action_widget)
+        # 气泡水平方向撑满 stack（stack 宽度由 _update_bubble_width 按内容设定）
+        self._bubble.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
+        )
 
-        # ── 气泡外层 ────────────────────────────
-        outer = QVBoxLayout(self)
+        # ── 气泡小尾巴（三角，位于气泡底部外侧）──
+        self._tail = _BubbleTail(
+            side="left" if not is_user else "right",
+            bg_color=Colors.BG_SURFACE if not is_user else Colors.USER_BG,
+        )
+        tail_row = QHBoxLayout()
+        tail_row.setContentsMargins(0, 0, 0, 0)
+        tail_row.setSpacing(0)
+        if is_user:
+            tail_row.addStretch()
+            tail_row.addWidget(self._tail)
+            tail_row.addSpacing(16)
+        else:
+            tail_row.addSpacing(16)
+            tail_row.addWidget(self._tail)
+            tail_row.addStretch()
+
+        # ── 气泡堆（气泡 + 尾巴）──
+        self._bubble_stack = QWidget()
+        self._bubble_stack.setStyleSheet(
+            "QWidget { background-color: transparent; }"
+        )
+        stack_vbox = QVBoxLayout(self._bubble_stack)
+        stack_vbox.setContentsMargins(0, 0, 0, 0)
+        stack_vbox.setSpacing(0)
+        stack_vbox.addWidget(self._bubble)
+        stack_vbox.addLayout(tail_row)
+
+        # ── 外层布局（user 靠右，assistant 靠左）──
+        outer = QHBoxLayout(self)
         outer.setContentsMargins(
             Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD
         )
         outer.setSpacing(0)
-        outer.addLayout(inner)
+        if is_user:
+            outer.addStretch()
+            outer.addWidget(self._bubble_stack)
+        else:
+            outer.addWidget(self._bubble_stack)
+            outer.addStretch()
 
         # ── 气泡样式 ────────────────────────────
-        self._is_user = is_user
-        bg_color = Colors.USER_BG if is_user else Colors.BG_SURFACE
-        if is_user:
-            self._normal_border = f"""
-                border: 1px solid {Colors.BORDER};
-                border-left: 1px solid {Colors.ROLE_USER}55;
-                border-top-left-radius: {Radius.LG}px;
-                border-top-right-radius: {Radius.LG}px;
-                border-bottom-left-radius: {Radius.LG}px;
-                border-bottom-right-radius: {2}px;
-            """
-        else:
-            self._normal_border = f"""
-                border: 1px solid {Colors.BORDER};
-                border-left: 2px solid {Colors.ROLE_ASSISTANT};
-                border-top-left-radius: {Radius.LG}px;
-                border-top-right-radius: {Radius.LG}px;
-                border-bottom-left-radius: {2}px;
-                border-bottom-right-radius: {Radius.LG}px;
-            """
+        self._bubble_bg = Colors.USER_BG if is_user else Colors.BG_SURFACE
+        self._apply_bubble_style(highlighted=False)
 
-        self._bg_color = bg_color
-        self._apply_stylesheet(highlighted=False)
+        # 外层容器透明（不画边框/背景）
+        apply_style(self, lambda: f"""
+            ChatMessage {{
+                background-color: transparent;
+                border: none;
+            }}
+        """)
 
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -668,33 +736,28 @@ class ChatMessage(QFrame):
 
     # ── 高亮效果 ──────────────────────────────
 
-    def _apply_stylesheet(self, highlighted: bool = False) -> None:
-        """根据高亮状态重新应用样式表。"""
+    def _apply_bubble_style(self, highlighted: bool = False) -> None:
+        """根据高亮状态为气泡主体应用样式。"""
         if highlighted:
-            border = f"""
-                border: 2px solid {Colors.ACCENT};
-                border-left: 3px solid {Colors.ACCENT};
-                border-top-left-radius: {Radius.LG}px;
-                border-top-right-radius: {Radius.LG}px;
-                border-bottom-left-radius: {2 if not self._is_user else Radius.LG}px;
-                border-bottom-right-radius: {Radius.LG if not self._is_user else 2}px;
-            """
-            bg = f"{Colors.ACCENT}18"
+            self._bubble.setStyleSheet(f"""
+                QFrame#chatBubble {{
+                    background-color: {Colors.ACCENT}22;
+                    border: 2px solid {Colors.ACCENT};
+                    border-radius: {Radius.LG}px;
+                }}
+            """)
         else:
-            border = self._normal_border
-            bg = self._bg_color
-
-        self.setStyleSheet(f"""
-            ChatMessage {{
-                background-color: {bg};
-                {border}
-                margin: {Spacing.XS}px 0px;
-            }}
-        """)
+            self._bubble.setStyleSheet(f"""
+                QFrame#chatBubble {{
+                    background-color: {self._bubble_bg};
+                    border: none;
+                    border-radius: {Radius.LG}px;
+                }}
+            """)
 
     def set_highlighted(self, highlighted: bool) -> None:
         """应用或移除高亮发光效果。"""
-        self._apply_stylesheet(highlighted=highlighted)
+        self._apply_bubble_style(highlighted=highlighted)
 
     # ── 高度自适应 ──────────────────────────
 
@@ -715,6 +778,52 @@ class ChatMessage(QFrame):
         if event.size().width() != event.oldSize().width():
             self._update_content_height()
 
+    def _conversation_area_width(self) -> int:
+        """对话区（消息滚动区域）当前宽度。
+
+        沿父链找到 QScrollArea（MessageListView 内部的消息滚动区），
+        取其 viewport 宽度；尚未挂载到滚动区时回退到自身宽度。
+        """
+        p = self.parent()
+        while p is not None:
+            if isinstance(p, QScrollArea):
+                return p.viewport().width()
+            p = p.parent()
+        return self.width()
+
+    def _update_bubble_width(self) -> None:
+        """按内容理想宽度设置气泡宽度（QQ/微信式：短消息窄、长消息宽）。
+
+        将文档 textWidth 置 -1（按自然宽度排版）后读取 doc.size() 得到
+        内容理想宽度，再夹取到 [MIN_BUBBLE_WIDTH, 对话区宽度*4/5]，并受
+        容器可用宽度约束。窗口最大化 / 取消最大化 / 拖拽改宽时会经
+        resizeEvent 重新计算。
+        """
+        doc = self._content_browser.document()
+        doc.setTextWidth(-1)
+        ideal = int(doc.size().width())
+        available = self.width() - 2 * Spacing.LG  # 外层 HBox 左右边距
+        max_w = max(
+            int(self._conversation_area_width() * BUBBLE_MAX_RATIO),
+            MIN_BUBBLE_WIDTH,
+        )
+        target = min(
+            max(ideal + _BUBBLE_H_PADDING, MIN_BUBBLE_WIDTH),
+            max_w,
+            max(available, MIN_BUBBLE_WIDTH),
+        )
+        if (
+            self._bubble_stack.minimumWidth() != target
+            or self._bubble_stack.maximumWidth() != target
+        ):
+            self._bubble_stack.setMinimumWidth(target)
+            self._bubble_stack.setMaximumWidth(target)
+            # 立即同步布局，让 viewport 宽度在下一次高度计算前更新
+            self._bubble.updateGeometry()
+            self._bubble_stack.updateGeometry()
+            self.updateGeometry()
+            self.layout().activate()
+
     def _update_content_height(self) -> None:
         """
         根据文档内容在可用宽度下的自然高度设置 QTextBrowser 高度。
@@ -727,11 +836,14 @@ class ChatMessage(QFrame):
             return
         self._updating_height = True
         try:
+            # 先按内容理想宽度定宽，再以该宽度计算换行后的自然高度
+            self._update_bubble_width()
             viewport = self._content_browser.viewport()
             if viewport is None:
                 return
             available_width = viewport.width()
             if available_width <= 0:
+                # 尚无布局（等待 showEvent / resizeEvent 时重算）
                 return
 
             doc = self._content_browser.document()

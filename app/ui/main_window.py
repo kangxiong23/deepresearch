@@ -593,6 +593,26 @@ class MessageListView(QWidget):
         """是否处于自动跟随底部模式。"""
         return self._auto_follow
 
+    def resizeEvent(self, event) -> None:
+        """
+        对话区宽度变化时重绘所有消息（最大化 / 取消最大化 / 拖拽调宽）。
+
+        气泡最大宽度按对话区宽度的 4/5 计算，窗口改宽后需重新计算
+        每条消息的宽度与高度；消息自身的 resizeEvent 也会触发，此处
+        统一重算以覆盖未注册控件等边界情况。
+        """
+        super().resizeEvent(event)
+        if event.size().width() == event.oldSize().width():
+            return
+        for widget in list(self._message_widget_map.values()):
+            update = getattr(widget, "_update_content_height", None)
+            if update is None:
+                continue
+            try:
+                update()
+            except RuntimeError:
+                pass  # C++ 对象已销毁
+
     def clear_messages(self) -> None:
         """清空所有消息控件和映射表（保留末尾 stretch）。"""
         self._clear_highlight()

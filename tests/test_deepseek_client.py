@@ -22,21 +22,36 @@ def _context() -> LLMContext:
 
 
 class TestBuildPayload(unittest.TestCase):
-    def test_thinking_enabled(self) -> None:
-        with ConfigScope(
-            thinking_enabled=True, reasoning_effort="high", temperature=0.8
-        ):
-            payload = DeepSeekClient._build_payload(_context())
-        self.assertEqual(payload["thinking"], {"type": "enabled"})
-        self.assertEqual(payload["reasoning_effort"], "high")
-        self.assertNotIn("temperature", payload)
+    def test_thinking_enabled_no_temperature(self) -> None:
+        """思考模式启用：flash / pro 均不得携带 temperature。"""
+        for model in ("deepseek-v4-pro", "deepseek-v4-flash"):
+            with self.subTest(model=model):
+                with ConfigScope(
+                    model_type=model,
+                    thinking_enabled=True,
+                    reasoning_effort="high",
+                    temperature=0.8,
+                ):
+                    payload = DeepSeekClient._build_payload(_context())
+                self.assertEqual(payload["model"], model)
+                self.assertEqual(payload["thinking"], {"type": "enabled"})
+                self.assertEqual(payload["reasoning_effort"], "high")
+                self.assertNotIn("temperature", payload)
 
-    def test_thinking_disabled(self) -> None:
-        with ConfigScope(thinking_enabled=False, temperature=0.8):
-            payload = DeepSeekClient._build_payload(_context())
-        self.assertEqual(payload["thinking"], {"type": "disabled"})
-        self.assertNotIn("reasoning_effort", payload)
-        self.assertEqual(payload["temperature"], 0.8)
+    def test_thinking_disabled_sends_temperature(self) -> None:
+        """思考模式关闭：flash / pro 均携带 temperature。"""
+        for model in ("deepseek-v4-pro", "deepseek-v4-flash"):
+            with self.subTest(model=model):
+                with ConfigScope(
+                    model_type=model,
+                    thinking_enabled=False,
+                    temperature=0.8,
+                ):
+                    payload = DeepSeekClient._build_payload(_context())
+                self.assertEqual(payload["model"], model)
+                self.assertEqual(payload["thinking"], {"type": "disabled"})
+                self.assertNotIn("reasoning_effort", payload)
+                self.assertEqual(payload["temperature"], 0.8)
 
     def test_system_prompt_and_stream(self) -> None:
         with ConfigScope(thinking_enabled=False):
