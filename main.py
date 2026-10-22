@@ -9,6 +9,7 @@ import sys
 import faulthandler
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QFont
 
 # 启用 faulthandler — segfault 时输出 Python 堆栈到 stderr
@@ -47,6 +48,7 @@ from app.ui.theme import get_theme_manager
 
 # ── 日志 ─────────────────────────────────────
 from app.utils.async_utils import get_logger
+from app.utils.run_marker import RunMarker, describe
 
 logger = get_logger("MAIN", "main")
 
@@ -143,6 +145,17 @@ def main() -> int:
     app.setFont(font)
     app.setApplicationName("DeepResearch")
     app.setOrganizationName("DeepResearch")
+
+    # 会话标记：识别"上次是否异常退出"，并记录每次运行的存活时长。
+    # 只写日志，不弹窗——误报会训练用户忽略提示。
+    marker = RunMarker()
+    for stale in marker.start():
+        print(describe(stale))
+    app.aboutToQuit.connect(marker.finish)
+    heartbeat = QTimer(app)
+    heartbeat.setInterval(30_000)
+    heartbeat.timeout.connect(marker.beat)
+    heartbeat.start()
 
     # [临时] 崩溃/卡死观测（app/utils/_tmp_diag.py）：全线程栈 + 事件时间线 +
     # [临时] 心跳看门狗。只观测不改逻辑，删除含 "[临时]" 的行即可移除。

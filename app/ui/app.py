@@ -27,6 +27,7 @@ from app.ui.async_bridge import (
     StreamRelay,
     run_async_in_thread,
 )
+from app.utils.draft_store import DraftStore
 
 
 class ChatApp:
@@ -45,6 +46,14 @@ class ChatApp:
 
         # ── 状态（与 Flet 版本 ChatApp 字段一一对应）──
         self._current_session_id: str = ""
+
+        # 输入草稿（单槽 B1）：防抖 800ms 落盘，避免每键都 fsync
+        self._draft_store = DraftStore()
+        self._pending_draft: tuple[str, str] | None = None
+        self._draft_timer = QTimer()
+        self._draft_timer.setSingleShot(True)
+        self._draft_timer.setInterval(800)
+        self._draft_timer.timeout.connect(self._save_draft_now)
         self._streaming_message: ChatMessage | None = None
         # 流式期间收到消息列表重建请求（删除/启用切换等）时置 True，
         # 流结束后统一重建，避免流式控件被销毁导致输出效果丢失
@@ -132,6 +141,7 @@ class ChatApp:
         input_area.send_requested.connect(self._handle_send)
         input_area.stop_requested.connect(self._handle_stop)
         input_area.edit_cancel_requested.connect(self._handle_edit_cancel)
+        input_area.draft_changed.connect(self._on_draft_changed)
         input_area.model_changed.connect(
             lambda m: self._settings_ctrl.on_change_model(m)
         )
@@ -220,6 +230,8 @@ class ChatApp:
         self._window.show()
         # 窗口显示后加载消息 — 此时布局有效，scrollbar 能返回正确的 maximum
         QTimer.singleShot(0, lambda: self._load_all_messages(scroll_to_bottom=True))
+        # 恢复上次未发送的草稿（单槽 B1，按对话 id 匹配）
+        QTimer.singleShot(0, self._restore_draft_on_startup)
         # 应用关闭时持久化滚动位置
         app = QApplication.instance()
         if app:
@@ -231,6 +243,59 @@ class ChatApp:
             self._window.message_list.save_scroll_state()
         )
         self._save_scroll_positions()
+
+    # ── 输入草稿（单槽，B1）──────────────────
+
+    def _on_draft_changed(self, text: str) -> None:
+        """
+        输入内容变化 → 记下"文本 + 当前对话"，防抖后落盘。
+
+        在变化发生时就锁定对话 id（而不是等定时器触发再取）：
+        否则"输入后立刻切换对话"会把草稿记到新对话名下。
+        """
+        self._pending_draft = (self._current_session_id, text)
+        self._draft_timer.start()
+
+    def _save_draft_now(self) -> None:
+        self._draft_timer.stop()
+        if self._pending_draft is None:
+            return
+        conv_id, text = self._pending_draft
+        self._pending_draft = None
+        try:
+            self._draft_store.save(conv_id, text)
+        except OSError as exc:
+            print(f"[UI] 草稿保存失败: {exc}")
+
+    def _consume_draft(self) -> None:
+        """发送成功后调用：丢弃待写入并清除草稿，避免重启后复活已发内容。"""
+        self._draft_timer.stop()
+        self._pending_draft = None
+        self._draft_store.clear()
+
+    def _restore_draft(self, conv_id: str) -> None:
+        """若草稿属于该对话则填回输入框，否则保持输入框不动。"""
+        draft = self._draft_store.load()
+        if draft is not None and draft.conv_id == conv_id:
+            self._window.input_area.set_text(draft.text)
+
+    def _restore_draft_on_startup(self) -> None:
+        """
+        启动时恢复草稿。
+
+        草稿带对话 id：树上还能找到就把发送目标切回该对话；
+        找不到（已删除）就丢弃，避免把文字填进错误的对话。
+        """
+        draft = self._draft_store.load()
+        if draft is None:
+            return
+        if draft.conv_id:
+            if not self._ctrl.is_conversation_usable(draft.conv_id):
+                self._draft_store.clear()
+                return
+            self._current_session_id = draft.conv_id
+            self._window.sidebar.set_active(draft.conv_id)
+        self._window.input_area.set_text(draft.text)
 
     # ── 树数据加载 ──────────────────────────
 
@@ -674,8 +739,9 @@ class ChatApp:
         self._connect_message_signals(user_msg)
         self._append_message(user_msg)
 
-        # 输入区状态
+        # 输入区状态（发送即消费草稿）
         self._window.input_area.clear()
+        self._consume_draft()
         self._window.input_area.set_generating(True)
 
         # 启动流式线程
@@ -1593,6 +1659,7 @@ class ChatApp:
         # 预分支/修改状态下禁止切换对话（3.1.3/5.2）
         if not self._can_mutate_tree():
             return
+        previous_session = self._current_session_id
         print(f"[UI] Tree switch to node: {node_id}")
 
         # 查找节点信息，确定 _current_session_id 和滚动目标
@@ -1617,6 +1684,10 @@ class ChatApp:
         if target_message_id:
             self._pending_scroll_target = target_message_id
             QTimer.singleShot(0, lambda: self._do_scroll_to_target(target_message_id))
+
+        # 切到另一个对话时，按对话 id 恢复草稿（无匹配则不动输入框）
+        if self._current_session_id != previous_session:
+            self._restore_draft(self._current_session_id)
 
     def _on_tree_new_conversation(self, parent_id: str) -> None:
         """

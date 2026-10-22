@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QFont, QFontMetrics, QKeyEvent, QTextOption
+from PySide6.QtGui import QFont, QFontMetrics, QKeyEvent, QTextCursor, QTextOption
 
 import config as app_config
 from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
@@ -528,6 +528,7 @@ class InputArea(QFrame):
     search_toggled = Signal(bool)
     reasoning_effort_changed = Signal(str)
     edit_cancel_requested = Signal()   # 修改状态下点击 ✕ 退出修改（5.2）
+    draft_changed = Signal(str)        # 输入内容变化（用于草稿持久化）
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -583,6 +584,8 @@ class InputArea(QFrame):
         self._text_edit.setMaximumHeight(self._max_text_height)
         # 文本变化时自动调整高度（仅图钉模式生效）
         self._text_edit.textChanged.connect(self._on_text_changed_for_resize)
+        # 文本变化时上报草稿（修改状态下不上报，见 _emit_draft_changed）
+        self._text_edit.textChanged.connect(self._emit_draft_changed)
 
         # ── 拖拽把手（手动调整高度模式可见）────
         self._resize_handle = QFrame()
@@ -964,6 +967,28 @@ class InputArea(QFrame):
         self._apply_pin_style()
         self._thinking_chip.refresh_theme()
         self._search_chip.refresh_theme()
+
+    # ── 输入内容 / 草稿上报 ──────────────────
+
+    def text(self) -> str:
+        """当前输入内容。"""
+        return self._text_edit.toPlainText()
+
+    def set_text(self, text: str) -> None:
+        """填充输入内容（光标置于末尾，便于继续输入）。"""
+        self._text_edit.setPlainText(text or "")
+        self._text_edit.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _emit_draft_changed(self) -> None:
+        """
+        文本变化 → 上报草稿。
+
+        修改状态（edit_mode）下不上报：此时框内是某条旧消息的全文，
+        若当成草稿存下来，下次启动会莫名其妙冒出来。
+        """
+        if self._edit_mode:
+            return
+        self.draft_changed.emit(self._text_edit.toPlainText())
 
     def clear(self) -> None:
         """清空输入框和附件。"""
