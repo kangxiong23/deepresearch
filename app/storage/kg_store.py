@@ -9,13 +9,13 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import config as app_config
+from app.storage.json_io import read_json_list, write_json_atomic
 from app.storage.models import utcnow
 
 
@@ -230,20 +230,13 @@ class KGStore:
 
     @staticmethod
     def _read_json(path: Path) -> list[dict]:
-        if not path.exists():
-            return []
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, list) else []
-        except (json.JSONDecodeError, OSError):
-            return []
+        """读取列表 JSON；损坏文件会被隔离保留，不会静默丢数据。"""
+        return read_json_list(path)
 
     @staticmethod
     def _write_json(path: Path, data: list[dict]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        """原子写入：崩溃时目标文件保持旧内容，不会出现半截文件。"""
+        write_json_atomic(path, data)
 
 
 # ──────────────────────────────────────────────

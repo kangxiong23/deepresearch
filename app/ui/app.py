@@ -962,7 +962,9 @@ class ChatApp:
             box.setStandardButtons(
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-            if box.exec() != QMessageBox.StandardButton.Yes:
+            result = box.exec()
+            box.deleteLater()  # exec() 后显式销毁，避免被父窗口收养而泄漏
+            if result != QMessageBox.StandardButton.Yes:
                 return
         # 找到消息 widget 并置半透明（5.1.3）
         content = ""
@@ -1789,7 +1791,9 @@ class ChatApp:
             box.setStandardButtons(
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-            if box.exec() != QMessageBox.StandardButton.Yes:
+            result = box.exec()
+            box.deleteLater()  # exec() 后显式销毁，避免被父窗口收养而泄漏
+            if result != QMessageBox.StandardButton.Yes:
                 return
 
         ok = self._ctrl.on_move_node_branch_aware(
@@ -2051,6 +2055,9 @@ class ChatApp:
         from app.ui.widgets.theme_dialog import ThemeDialog
         dialog = ThemeDialog(self._window)
         dialog.exec()
+        # exec() 后显式销毁：否则 C++ 对象被 MainWindow 收养，每次打开泄漏
+        # 整套主题卡片（含全部子控件与全局样式注册），反复开关会拖慢主线程
+        dialog.deleteLater()
 
     def _on_theme_changed(self, theme_id: str) -> None:
         """
@@ -2190,6 +2197,11 @@ class ChatApp:
         self._ctx_node_ids = list(node_ids)
         self._ctx_node_staged = blocks
 
+        # [临时] 观测：进入节点上下文模式的边界 + 即将重建的行数
+        from app.utils import _tmp_diag
+        _tmp_diag.mutation_enter("open_node_context_mode")
+        _tmp_diag.mark("OPEN_NODE_CTX", nodes=len(node_ids), blocks=len(blocks))
+
         panel.enter_node_mode(title, blocks)
         panel.set_preview(self._assemble_node_blocks())
         templates = self._ctrl.on_get_templates()
@@ -2198,6 +2210,13 @@ class ChatApp:
         # 高亮节点
         self._window.sidebar.tree_panel.set_node_context_highlight(first_id)
         self._window.show_context_panel()
+
+        # [临时] 观测：节点模式入口完成 + 嵌套调用深度（>1 说明处于菜单嵌套循环内）
+        _tmp_diag.mark(
+            "OPEN_NODE_CTX_DONE", depth=_tmp_diag._stats["mutation_depth"]
+        )
+        _tmp_diag.audit_widgets("after_open_node_ctx")
+        _tmp_diag.mutation_exit("open_node_context_mode")
 
     def _assemble_node_blocks(self) -> str:
         """把节点模式下暂存且启用的块拼成预览文本。"""

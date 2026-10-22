@@ -213,6 +213,11 @@ class _ContextBlockRow(QFrame):
         # 文字区可拖拽提示（开关/移除按钮等子控件有各自的 cursor）
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
+        # [临时] 观测：登记新建行（C++ 指针用于追踪同一对象后续的销毁时点）
+        from app.utils import _tmp_diag
+        _tmp_diag._stats["rows_new"] += 1
+        _tmp_diag.mark("ROW_NEW", block_id=block_id, cpp=_tmp_diag.cpp_ptr(self))
+
     # ──────────────────────────────────────────
     # 拖拽排序（参考对话树 _TreeView 但大幅简化）
     # ──────────────────────────────────────────
@@ -273,12 +278,40 @@ class _ContextBlockRow(QFrame):
 
     def _set_source_dimmed(self, on: bool) -> None:
         """拖拽期间把源行变半透明。"""
+        # [临时] 观测：graphicsEffect 的建/毁（销毁前先记录 C++ 指针与有效性）
+        from app.utils import _tmp_diag
         if on:
             effect = QGraphicsOpacityEffect(self)
             effect.setOpacity(0.35)
+            _tmp_diag._stats["effect_set"] += 1
+            _tmp_diag.mark(
+                "EFFECT_SET", where="source_dimmed",
+                row_cpp=_tmp_diag.cpp_ptr(self),
+                eff_cpp=_tmp_diag.cpp_ptr(effect),
+            )
             self.setGraphicsEffect(effect)
         else:
+            prev = self.graphicsEffect()
+            _tmp_diag._stats["effect_clear"] += 1
+            prev_cpp = _tmp_diag.cpp_ptr(prev) if prev is not None else "-"
+            prev_valid = _tmp_diag.is_alive(prev) if prev is not None else "-"
             self.setGraphicsEffect(None)
+            # [临时] 销毁之后再确认一次：此时 prev 的 C++ 对象应已失效
+            still_valid = _tmp_diag.is_alive(prev) if prev is not None else "-"
+            try:
+                prev_raises = bool(prev is not None and prev.opacity())
+            except RuntimeError:
+                prev_raises = True
+            if prev is not None and still_valid:
+                _tmp_diag._stats["effect_clear_still_valid"] += 1
+            _tmp_diag.mark(
+                "EFFECT_CLEAR", where="source_dimmed",
+                row_cpp=_tmp_diag.cpp_ptr(self),
+                prev_cpp=prev_cpp,
+                prev_valid_before=prev_valid,
+                prev_valid_after=still_valid,
+                prev_access_raises=prev_raises,
+            )
 
     def set_edited(self, edited: bool) -> None:
         """编辑模式下：隐藏移除/编辑/复制按钮并让整行半透明。"""
@@ -288,9 +321,39 @@ class _ContextBlockRow(QFrame):
         if edited:
             effect = QGraphicsOpacityEffect(self)
             effect.setOpacity(0.4)
+            # [临时] 观测
+            from app.utils import _tmp_diag
+            _tmp_diag._stats["effect_set"] += 1
+            _tmp_diag.mark(
+                "EFFECT_SET", where="set_edited",
+                row_cpp=_tmp_diag.cpp_ptr(self),
+                eff_cpp=_tmp_diag.cpp_ptr(effect),
+            )
             self.setGraphicsEffect(effect)
         else:
+            # [临时] 观测
+            from app.utils import _tmp_diag
+            _prev = self.graphicsEffect()
+            _tmp_diag._stats["effect_clear"] += 1
+            _prev_cpp = _tmp_diag.cpp_ptr(_prev) if _prev is not None else "-"
+            _prev_valid = _tmp_diag.is_alive(_prev) if _prev is not None else "-"
             self.setGraphicsEffect(None)
+            # [临时] 销毁之后再确认一次：此时 _prev 的 C++ 对象应已失效
+            _still_valid = _tmp_diag.is_alive(_prev) if _prev is not None else "-"
+            try:
+                _raises = bool(_prev is not None and _prev.opacity())
+            except RuntimeError:
+                _raises = True
+            if _prev is not None and _still_valid:
+                _tmp_diag._stats["effect_clear_still_valid"] += 1
+            _tmp_diag.mark(
+                "EFFECT_CLEAR", where="set_edited",
+                row_cpp=_tmp_diag.cpp_ptr(self),
+                prev_cpp=_prev_cpp,
+                prev_valid_before=_prev_valid,
+                prev_valid_after=_still_valid,
+                prev_access_raises=_raises,
+            )
 
 
 # ──────────────────────────────────────────────
@@ -1242,6 +1305,12 @@ class ContextPanel(QWidget):
         Args:
             items: dict 列表，每项含 id, label, preview, enabled
         """
+        # [临时] 观测：记录重建入口 + 控件健康度（判断包装器是否泄漏）
+        from app.utils import _tmp_diag
+        _tmp_diag._stats["load_blocks_calls"] += 1
+        _tmp_diag.mark("LOAD_BLOCKS_ENTER", n=len(items), panel=id(self))
+        _tmp_diag.audit_widgets("before_load_blocks")
+
         # 清除旧条目
         self._clear_layout(self._blocks_layout)
 
@@ -1264,6 +1333,10 @@ class ContextPanel(QWidget):
             self._blocks_layout.addWidget(row)
 
         self._blocks_layout.addStretch()
+
+        # [临时] 观测：重建完成 + 控件健康度
+        _tmp_diag.mark("LOAD_BLOCKS_EXIT", n=len(items))
+        _tmp_diag.audit_widgets("after_load_blocks")
 
         # 被编辑的块已不存在（如被删除）→ 退出编辑模式
         if edit_id and not any(b.get("id") == edit_id for b in items):
@@ -1307,10 +1380,23 @@ class ContextPanel(QWidget):
         """清空布局中的所有子控件。"""
         if layout is None:
             return
+        # [临时] 观测：清空动作 + 被 deleteLater 的控件（记录 C++ 指针与存活标记）
+        from app.utils import _tmp_diag
+        _tmp_diag._stats["clear_layout_calls"] += 1
+        _tmp_diag.mark("CLEAR_LAYOUT_ENTER", count=layout.count(), panel=id(layout.parentWidget()))
         while layout.count():
             item = layout.takeAt(0)
             if item.widget():
-                item.widget().deleteLater()
+                w = item.widget()
+                # [临时] 记录：投递 deleteLater 的那一刻 C++ 对象是否还有效
+                _tmp_diag._stats["rows_destroyed"] += 1
+                _tmp_diag.mark(
+                    "DELETE_LATER_POSTED",
+                    cls=type(w).__name__,
+                    cpp=_tmp_diag.cpp_ptr(w),
+                    valid=_tmp_diag.is_alive(w),
+                )
+                w.deleteLater()
             # 如果还有子布局，递归清除
             sub_layout = item.layout()
             if sub_layout:

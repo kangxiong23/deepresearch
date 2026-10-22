@@ -425,9 +425,16 @@ def build_palette() -> QPalette:
 # 样式注册 / 重应用机制
 # ──────────────────────────────────────────────
 
-# (weakref(widget), style_fn) —— style_fn 返回该控件当前的样式表字符串，
-# 只依赖主题 token（不捕获控件自身），切主题时统一重新求值。
-_STYLE_REGISTRY: list[tuple[weakref.ref, object]] = []
+# id(widget) -> (weakref(widget), style_fn) —— style_fn 返回该控件当前的样式表
+# 字符串，只依赖主题 token（不捕获控件自身），切主题时统一重新求值。
+#
+# 用 dict 而不是 list：旧实现对每次 apply_style 都重建整个列表（O(n)），存活
+# 控件一多，构造界面的开销就随控件总数线性上升（实测 3200 个控件时单次
+# apply_style 从 0.15ms 涨到 6.3ms）。dict 覆盖是 O(1)。
+#
+# 失效条目靠 weakref 回调即时摘除（O(1)），不做周期性全表扫描——扫描本身
+# 就是 O(n)，等于把省下的开销又加回来。
+_STYLE_REGISTRY: dict[int, tuple[weakref.ref, object]] = {}
 
 
 def apply_style(widget: QWidget, style_fn) -> QWidget:
@@ -438,15 +445,22 @@ def apply_style(widget: QWidget, style_fn) -> QWidget:
     否则会造成引用环导致内存泄漏）。返回 widget 以便链式调用。
     """
     widget.setStyleSheet(style_fn())
-    # 每个控件同一时刻只有一个当前样式：替换掉该控件旧注册，并顺带清理已销毁的控件
-    alive: list[tuple[weakref.ref, object]] = []
-    for ref, fn in _STYLE_REGISTRY:
-        existing = ref()
-        if existing is None or existing is widget:
-            continue
-        alive.append((ref, fn))
-    _STYLE_REGISTRY[:] = alive
-    _STYLE_REGISTRY.append((weakref.ref(widget), style_fn))
+
+    key = id(widget)
+    # 控件销毁时自动摘除注册项。注意不能捕获 widget 本身（否则控件永不回收），
+    # 只能捕获 id；id 可能被复用，所以回调里再比对一次 ref 是否是当前登记的那个。
+    cell: dict = {}
+
+    def _on_dead(_dead_ref) -> None:
+        entry = _STYLE_REGISTRY.get(key)
+        if entry is not None and entry[0] is cell.get("ref"):
+            del _STYLE_REGISTRY[key]
+
+    ref = weakref.ref(widget, _on_dead)
+    cell["ref"] = ref
+
+    # 每个控件同一时刻只有一个当前样式：同一控件覆盖旧注册即可
+    _STYLE_REGISTRY[key] = (ref, style_fn)
     return widget
 
 
@@ -472,26 +486,34 @@ def reapply_all_styles() -> None:
     app = QApplication.instance()
     if app is None:
         return
+    # [临时] 观测：这是主线程上唯一会随控件数线性变慢的全量操作
+    from app.utils import _tmp_diag
+    _tmp_diag.mark("REAPPLY_STYLES_ENTER", registry=len(_STYLE_REGISTRY))
     app.setStyleSheet(build_global_stylesheet())
     app.setPalette(build_palette())
 
-    alive: list[tuple[weakref.ref, object]] = []
-    for ref, fn in _STYLE_REGISTRY:
+    alive: dict[int, tuple[weakref.ref, object]] = {}
+    # 快照迭代：setStyleSheet 期间可能有控件销毁并触发 weakref 回调改字典
+    for key, (ref, fn) in list(_STYLE_REGISTRY.items()):
         widget = ref()
         if widget is None:
             continue
         try:
             widget.setStyleSheet(fn())
-            alive.append((ref, fn))
+            alive[key] = (ref, fn)
         except RuntimeError:
             continue
-    _STYLE_REGISTRY[:] = alive
+    _STYLE_REGISTRY.clear()
+    _STYLE_REGISTRY.update(alive)
 
     for top in app.topLevelWidgets():
         try:
             _walk_theme_refresh(top)
         except RuntimeError:
             continue
+
+    # [临时] 观测：全量重设样式结束（耗时可从时间线上首尾两行相减得到）
+    _tmp_diag.mark("REAPPLY_STYLES_EXIT", registry=len(_STYLE_REGISTRY))
 
 
 # ──────────────────────────────────────────────

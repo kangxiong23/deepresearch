@@ -161,6 +161,8 @@ def show_confirm_dialog(
     """)
 
     result = msg_box.exec()
+    # 同上：exec() 后显式销毁，避免被 parent 收养后永久存活
+    msg_box.deleteLater()
     if result == QMessageBox.StandardButton.Yes:
         on_confirm()
 
@@ -217,6 +219,8 @@ def show_template_overwrite_confirm_dialog(parent: QWidget, name: str) -> str:
     _style_msg_box(msg_box)
     msg_box.exec()
     clicked = msg_box.clickedButton()
+    # 先读 clickedButton() 再销毁：exec() 后不显式 deleteLater 会被 parent 收养而泄漏
+    msg_box.deleteLater()
     if clicked is overwrite_btn:
         return "overwrite"
     if clicked is no_btn:
@@ -246,6 +250,8 @@ def show_node_apply_confirm_dialog(parent: QWidget, node_name: str) -> str:
     _style_msg_box(msg_box)
     msg_box.exec()
     clicked = msg_box.clickedButton()
+    # 同上：先读 clickedButton() 再销毁
+    msg_box.deleteLater()
     if clicked is apply_btn:
         return "apply"
     if clicked is discard_btn:
@@ -533,6 +539,10 @@ def show_recycle_bin_dialog(
     dlg = _RecycleBinDialog(
         parent, trash_entries, on_restore, on_permanent_delete, on_clear_all
     )
+    # 对话框以 parent 为父对象：exec() 返回后若只在 Python 侧丢引用，
+    # C++ 对象会被 parent 收养而永不释放（每次打开泄漏整套子控件 +
+    # 全局样式注册），反复开关后主线程全量操作越来越慢。显式 deleteLater()。
     dlg.exec()
+    dlg.deleteLater()
 
 

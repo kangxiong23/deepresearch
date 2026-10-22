@@ -867,6 +867,7 @@ class _TreeView(QTreeView):
             "· 文件夹/对话不能被移入消息或对话内部。"
         )
         box.exec()
+        box.deleteLater()  # exec() 后显式销毁，避免被父控件收养而泄漏
 
     def _drop_sibling_context(
         self, parent_id: str, position: object
@@ -2245,7 +2246,15 @@ class TreePanel(QWidget):
 
         # ── 管理上下文块 ──
         if "manage_context" in available_ops:
-            menu.addAction("📚 管理上下文块", lambda: self.batch_operation.emit("manage_context", batch_ids))
+            # [临时] 观测：菜单项 lambda 的执行边界（是否仍在 menu.exec 的嵌套循环内）
+            def _tmp_manage_context(bids=batch_ids):
+                from app.utils import _tmp_diag
+                _tmp_diag.mutation_enter("menu:manage_context")
+                try:
+                    self.batch_operation.emit("manage_context", bids)
+                finally:
+                    _tmp_diag.mutation_exit("menu:manage_context")
+            menu.addAction("📚 管理上下文块", _tmp_manage_context)
 
         # ── 添加附件 ──
         if "attach_file" in available_ops:
@@ -2269,7 +2278,12 @@ class TreePanel(QWidget):
             menu.addAction("🗑️ 删除", lambda: self.batch_operation.emit("delete", batch_ids))
 
         # 弹出菜单
+        # [临时] 观测：QMenu.exec 的嵌套事件循环边界 + 退出后控件健康度
+        from app.utils import _tmp_diag
+        _tmp_diag.mark("MENU_EXEC_ENTER")
         menu.exec(self._tree_view.viewport().mapToGlobal(pos))
+        _tmp_diag.mark("MENU_EXEC_EXIT")
+        _tmp_diag.audit_widgets("after_menu_exec")
 
     def _compute_intersection_ops(self, selected_ids: set[str]) -> set[str]:
         """

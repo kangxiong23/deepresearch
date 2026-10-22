@@ -144,6 +144,12 @@ def main() -> int:
     app.setApplicationName("DeepResearch")
     app.setOrganizationName("DeepResearch")
 
+    # [临时] 崩溃/卡死观测（app/utils/_tmp_diag.py）：全线程栈 + 事件时间线 +
+    # [临时] 心跳看门狗。只观测不改逻辑，删除含 "[临时]" 的行即可移除。
+    from app.utils import _tmp_diag
+    _tmp_diag.start()
+    _tmp_diag.install_qt(app)
+
     # 使用 Fusion 风格获得跨平台一致的渲染效果，
     # 深色背景下的原生控件（树展开箭头等）需要 Fusion 风格才能正确使用调色板颜色
     app.setStyle("Fusion")

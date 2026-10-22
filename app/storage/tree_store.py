@@ -11,9 +11,7 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
-import time
 import uuid
 from copy import deepcopy
 from datetime import datetime
@@ -21,6 +19,7 @@ from pathlib import Path
 from typing import Literal
 
 import config as app_config
+from app.storage.json_io import write_json_atomic
 from app.storage.models import (
     AnyTreeNode,
     ConversationNode,
@@ -33,23 +32,6 @@ from app.storage.models import (
     TreeRoot,
     utcnow,
 )
-
-
-def _atomic_replace(src: Path, dst: Path, retries: int = 5, delay: float = 0.05) -> None:
-    """
-    原子替换文件（os.replace），Windows 上带重试。
-
-    Windows 上 os.replace 可能因杀毒/索引器对源或目标文件的瞬时锁定而报
-    PermissionError（WinError 5）。重试几次通常即可通过（瞬态锁自动释放）。
-    """
-    for attempt in range(retries):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if attempt == retries - 1:
-                raise
-            time.sleep(delay)
 
 
 class TreeStore:
@@ -114,11 +96,7 @@ class TreeStore:
             "nodes": [_node_to_dict(n) for n in root.nodes],
         }
         with self._lock:
-            self._tree_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self._tree_path.with_suffix(".tmp")
-            with tmp_path.open("w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            _atomic_replace(tmp_path, self._tree_path)
+            write_json_atomic(self._tree_path, data)
         # 写入后重建缓存（仅在 _root 已初始化后；__init__ 期间暂不重建）
         if hasattr(self, "_root") and self._root is not None:
             self._rebuild_cache()
@@ -156,11 +134,7 @@ class TreeStore:
                 "deleted_at": e.deleted_at.isoformat(),
             })
         with self._lock:
-            self._trash_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self._trash_path.with_suffix(".tmp")
-            with tmp_path.open("w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            _atomic_replace(tmp_path, self._trash_path)
+            write_json_atomic(self._trash_path, data)
 
     def _create_default_tree(self) -> TreeRoot:
         """创建默认树结构：仅包含一个"未分类"根目录。"""

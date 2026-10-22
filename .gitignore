@@ -34,6 +34,9 @@ data/context/
 data/knowledge_graph/
 data/tree/
 
+# ── [临时] 崩溃观测日志（crash_probe）─────────
+logs/
+
 # ── Test ─────────────────────────────────
 tests/
 
