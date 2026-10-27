@@ -290,6 +290,104 @@ class TestDocxHeaderFooter(_DocxFixture):
         self.assertNotIn("第 1 页", text)
 
 
+class TestDocxNotesAndVariants(_DocxFixture):
+    """② 覆盖补全：脚注/尾注、页眉页脚的多节变体与表格。"""
+
+    def _inject_part(self, path, part_name, xml):
+        """把额外的 XML 部件塞进已保存的 docx（python-docx 没有脚注 API）。"""
+        import zipfile
+
+        with zipfile.ZipFile(path) as archive:
+            entries = {name: archive.read(name) for name in archive.namelist()}
+        entries[part_name] = xml.encode("utf-8")
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, data in entries.items():
+                archive.writestr(name, data)
+
+    def _notes_xml(self, wrapper, tag, entries):
+        body = "".join(
+            '<w:%s w:id="%s"><w:p><w:r><w:t>%s</w:t></w:r></w:p></w:%s>'
+            % (tag, note_id, text, tag)
+            for note_id, text in entries
+        )
+        return (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:%s xmlns:w="%s">'
+            '<w:%s w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:%s>'
+            '<w:%s w:type="continuationSeparator" w:id="0">'
+            '<w:p><w:r><w:continuationSeparator/></w:r></w:p></w:%s>'
+            '%s</w:%s>' % (wrapper, _W, tag, tag, tag, tag, body, wrapper)
+        )
+
+    def _reference_run(self, reference_tag, note_id):
+        return self._xml(
+            '<w:r xmlns:w="%s"><w:%s w:id="%s"/></w:r>' % (_W, reference_tag, note_id)
+        )
+
+    def test_footnotes_marked_inline_and_listed(self):
+        document = Document()
+        paragraph = document.add_paragraph("正文带脚注")
+        paragraph._p.append(self._reference_run("footnoteReference", "1"))
+        path = self._save(document)
+        self._inject_part(path, "word/footnotes.xml", self._notes_xml(
+            "footnotes", "footnote", [("1", "第一条脚注"), ("2", "第二条脚注")]))
+
+        text = self.parser.extract_text_sync(path)
+
+        self.assertIn("正文带脚注[脚注 1]", text)
+        self.assertIn("[脚注 1] 第一条脚注", text)
+        self.assertIn("[脚注 2] 第二条脚注", text)
+        self.assertNotIn("separator", text)
+
+    def test_endnotes_listed(self):
+        document = Document()
+        paragraph = document.add_paragraph("正文带尾注")
+        paragraph._p.append(self._reference_run("endnoteReference", "3"))
+        path = self._save(document)
+        self._inject_part(path, "word/endnotes.xml", self._notes_xml(
+            "endnotes", "endnote", [("3", "一条尾注")]))
+
+        text = self.parser.extract_text_sync(path)
+
+        self.assertIn("[尾注 3]", text)
+        self.assertIn("[尾注 3] 一条尾注", text)
+
+    def test_missing_notes_part_is_harmless(self):
+        document = Document()
+        document.add_paragraph("没有脚注的普通文档")
+
+        text = self.parser.extract_text_sync(self._save(document))
+
+        self.assertNotIn("[脚注", text)
+        self.assertIn("没有脚注的普通文档", text)
+
+    def test_header_table_captured(self):
+        document = Document()
+        document.add_paragraph("正文")
+        header = document.sections[0].header
+        table = header.add_table(rows=1, cols=2, width=Inches(6))
+        table.cell(0, 0).text = "项目"
+        table.cell(0, 1).text = "编号"
+
+        text = self.parser.extract_text_sync(self._save(document))
+
+        self.assertIn("[页眉]", text)
+        self.assertIn("| 项目 | 编号 |", text)
+
+    def test_first_page_header_captured(self):
+        document = Document()
+        document.add_paragraph("正文")
+        section = document.sections[0]
+        section.header.paragraphs[0].text = "普通页眉"
+        section.different_first_page_header_footer = True
+        section.first_page_header.paragraphs[0].text = "首页专用页眉"
+
+        text = self.parser.extract_text_sync(self._save(document))
+
+        self.assertIn("[页眉] 普通页眉", text)
+        self.assertIn("[首页页眉] 首页专用页眉", text)
+
+
 class TestDocxFailureVisibility(_DocxFixture):
     """③ 失败可见：坏文件、空文档、不支持的格式都不再返回空串。"""
 

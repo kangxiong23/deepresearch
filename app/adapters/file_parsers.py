@@ -148,6 +148,10 @@ class DocxParser:
             "images": 0,
             # numId → {ilvl: numFmt}：决定项目符号还是编号（见 _load_numbering）
             "numbering": _load_numbering(file_path),
+            # 脚注/尾注正文单独存在 footnotes.xml / endnotes.xml 里，
+            # 正文只会留下一个 w:footnoteReference 空标记，必须二次拼回来
+            "footnotes": _load_note_entries(file_path, "word/footnotes.xml", "footnote"),
+            "endnotes": _load_note_entries(file_path, "word/endnotes.xml", "endnote"),
         }
 
         for kind, block in self._iter_blocks(document.element.body, document):
@@ -157,6 +161,8 @@ class DocxParser:
                 chunks.extend(self._table_chunks(block, 0))
 
         chunks.extend(self._header_footer_notes(document))
+        chunks.extend(_note_chunks(state["footnotes"], "脚注"))
+        chunks.extend(_note_chunks(state["endnotes"], "尾注"))
 
         media = _count_media(file_path)
         if media:
@@ -267,8 +273,11 @@ class DocxParser:
     # 页眉 / 页脚
     # ──────────────────────────────────────────
 
-    @staticmethod
-    def _header_footer_notes(document) -> list[str]:
+    def _header_footer_notes(self, document) -> list[str]:
+        """
+        页眉/页脚文本。三种变体都收：普通、首页、偶数页（Word 的"首页不同"
+        /"奇偶页不同"），按文本去重——变体没定义时会回落到普通页眉。
+        """
         notes: list[str] = []
         seen: set[str] = set()
         try:
@@ -276,20 +285,35 @@ class DocxParser:
         except Exception:
             return notes
 
+        variants = (
+            ("页眉", "header"),
+            ("页脚", "footer"),
+            ("首页页眉", "first_page_header"),
+            ("首页页脚", "first_page_footer"),
+            ("偶数页页眉", "even_page_header"),
+            ("偶数页页脚", "even_page_footer"),
+        )
+
         for section in sections:
-            for label, part in (("页眉", section.header), ("页脚", section.footer)):
+            for label, attr in variants:
                 try:
-                    if part.is_linked_to_previous:
+                    part = getattr(section, attr)
+                    if part is None or part.is_linked_to_previous:
                         continue
                     texts = [_squash(_para_text(p._p)) for p in part.paragraphs]
+                    tables = []
+                    for table in part.tables:
+                        tables.extend(self._table_chunks(table, 0))
                 except Exception:
                     continue
 
                 joined = " ".join(t for t in texts if t)
+                if tables:
+                    joined = " ".join(x for x in [joined, *tables] if x)
                 if not joined or joined in seen:
                     continue
                 # 纯页码页脚没有信息量，丢掉
-                if label == "页脚" and any(ch.isdigit() for ch in joined) \
+                if "页脚" in label and any(ch.isdigit() for ch in joined) \
                         and _PAGE_NUMBER_ONLY.match(joined):
                     continue
                 seen.add(joined)
@@ -403,6 +427,11 @@ def _walk_text(element, out: list[str]) -> None:
             out.append("\t")
         elif tag in ("br", "cr"):
             out.append("\n")
+        elif tag == "footnoteReference":
+            # 正文里只有一个空引用，脚注正文在 footnotes.xml 里，末尾统一附上
+            out.append(f"[脚注 {child.get(_W + 'id') or '?'}]")
+        elif tag == "endnoteReference":
+            out.append(f"[尾注 {child.get(_W + 'id') or '?'}]")
         else:
             _walk_text(child, out)
 
@@ -534,17 +563,8 @@ def _load_numbering(file_path: str) -> dict:
     序号值要处理重启编号、多级联动、%1.%2 模板，收益远小于成本。
     失败一律返回空字典（文档没有编号部分、老格式、解析异常都走这条路）。
     """
-    try:
-        import zipfile
-
-        from lxml import etree
-
-        with zipfile.ZipFile(file_path) as archive:
-            if "word/numbering.xml" not in archive.namelist():
-                return {}
-            root = etree.fromstring(archive.read("word/numbering.xml"))
-    except Exception as e:
-        print(f"[FileParser] 读取 numbering.xml 失败: {e}")
+    root = _read_xml_part(file_path, "word/numbering.xml")
+    if root is None:
         return {}
 
     abstract: dict[str, dict[str, str]] = {}
@@ -564,6 +584,68 @@ def _load_numbering(file_path: str) -> dict:
         if num_id and ref is not None:
             mapping[num_id] = abstract.get(ref.get(_W + "val") or "", {})
     return mapping
+
+
+def _read_xml_part(file_path: str, part_name: str):
+    """
+    从 docx 包里读一个原样的 XML 部件（numbering / footnotes / endnotes）。
+
+    python-docx 不暴露这些部件，只能自己解包；任何失败都返回 None，
+    调用方按"没有这个部件"处理，不让次要信息把整篇解析拖垮。
+    """
+    try:
+        import zipfile
+
+        from lxml import etree
+
+        with zipfile.ZipFile(file_path) as archive:
+            if part_name not in archive.namelist():
+                return None
+            return etree.fromstring(archive.read(part_name))
+    except Exception as e:
+        print(f"[FileParser] 读取 {part_name} 失败: {e}")
+        return None
+
+
+def _load_note_entries(file_path: str, part_name: str, tag: str) -> dict[str, str]:
+    """
+    读脚注/尾注正文：{id: 文本}。
+
+    Word 会在同一个部件里塞几条 w:type="separator" / "continuationSeparator"
+    的分隔线条目（id 为 -1 和 0），它们没有正文，必须跳过。
+    """
+    root = _read_xml_part(file_path, part_name)
+    if root is None:
+        return {}
+
+    entries: dict[str, str] = {}
+    for node in root.findall(_W + tag):
+        note_type = node.get(_W + "type") or ""
+        if note_type and note_type != "normal":
+            continue
+        note_id = node.get(_W + "id")
+        if note_id is None:
+            continue
+        texts = [_squash(_para_text(p)) for p in node.findall(_W + "p")]
+        joined = " ".join(t for t in texts if t)
+        if joined:
+            entries[note_id] = joined
+    return entries
+
+
+def _note_chunks(entries: dict[str, str], label: str) -> list[str]:
+    """把脚注/尾注按 id 排好附在正文后面，与正文里的 [脚注 N] 标记对得上。"""
+    if not entries:
+        return []
+
+    def key(item: tuple[str, str]) -> tuple[int, str]:
+        raw = item[0]
+        try:
+            return (int(raw), raw)
+        except (TypeError, ValueError):
+            return (10 ** 9, raw)
+
+    return [f"[{label} {nid}] {text}" for nid, text in sorted(entries.items(), key=key)]
 
 
 def _count_drawings(element) -> int:
