@@ -33,6 +33,7 @@ Thumbs.db
 data/context/
 data/knowledge_graph/
 data/tree/
+data/files/
 
 # ── [临时] 崩溃观测日志（crash_probe）─────────
 logs/
