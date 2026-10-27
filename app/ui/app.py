@@ -24,6 +24,7 @@ from app.ui.widgets.chat_message import ChatMessage, ThinkingBlock
 from app.ui.widgets.search_popup import SearchPopup
 from app.ui.widgets.sidebar import Sidebar
 from app.ui.widgets.file_access_dialog import show_file_access_dialog
+from app.ui.widgets.attachment_dialog import show_attachment_dialog
 from app.ui.async_bridge import (
     AsyncStreamWorker,
     StreamRelay,
@@ -182,6 +183,7 @@ class ChatApp:
         tree.move_node.connect(self._on_tree_move)
         tree.manage_context.connect(self._on_tree_manage_context)
         tree.attach_file.connect(self._on_tree_attach_file)
+        tree.manage_attachments.connect(self._on_tree_manage_attachments)
         tree.toggle_context_blocks.connect(self._on_tree_toggle_context_blocks)
         # 多选批量操作
         tree.batch_operation.connect(self._on_batch_operation)
@@ -2085,6 +2087,30 @@ class ChatApp:
                     failures.append(err)
             self._report_attach_failures(failures)
             QTimer.singleShot(0, self._load_tree)
+
+    def _on_tree_manage_attachments(self, node_id: str) -> None:
+        """
+        右键 → 管理附件：列出该节点实际会注入的文件（含从上级继承的），
+        支持添加、移除、旧式路径附件就地转快照。
+
+        继承项在面板里只读 —— 移除会影响所有兄弟对话，必须去源节点删。
+        """
+        if not self._can_mutate_tree():
+            return
+        try:
+            show_attachment_dialog(
+                self._window,
+                node_id,
+                fetch=self._ctrl.on_get_node_attachments,
+                on_add=self._ctrl.on_attach_file,
+                on_remove=self._ctrl.on_detach_file,
+                on_convert=self._ctrl.on_convert_legacy_attachment,
+            )
+        except Exception as exc:
+            print(f"[UI] 附件面板打开失败: {exc}")
+            QMessageBox.warning(self._window, "附件面板", f"打开失败：{exc}")
+            return
+        QTimer.singleShot(0, self._load_tree)
 
     def _report_attach_failures(self, failures: list[str]) -> None:
         """

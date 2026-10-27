@@ -1171,6 +1171,120 @@ class ConversationService:
         )
         return ""
 
+    def get_attachments_view(self, node_id: str) -> dict:
+        """
+        返回该节点**实际生效**的附件视图（管理面板用）。
+
+        与 _collect_context_resources 的可见范围一致（祖先链继承、按 blob 去重、
+        近的覆盖远的），但额外标注归属，因为界面必须区分"自己的"和"继承来的"：
+        继承项不能在这里移除 —— 移除它会影响所有兄弟对话。
+
+        Args:
+            node_id: 目录或对话节点 ID
+
+        Returns:
+            {"mounts": [...], "legacy": [...]}
+            mounts 每项 = 原挂载记录 + owner_id / owner_title / inherited / enabled
+            legacy 每项 = {"path", "name", owner_id, owner_title, inherited, enabled}
+        """
+        node = self._tree.get_node(node_id)
+        if node is None:
+            return {"mounts": [], "legacy": []}
+
+        chain = self._ancestor_chain(node)
+        mounts: list[dict] = []
+        seen_blobs: set[str] = set()
+        legacy: list[dict] = []
+        seen_paths: set[str] = set()
+
+        for owner in chain:
+            if not isinstance(owner, (FolderNode, ConversationNode)):
+                continue
+            inherited = owner.id != node_id
+            enabled = self._node_enabled(owner.id)
+            for mount in getattr(owner, "mounts", []) or []:
+                blob_id = str((mount or {}).get("blob_id") or "")
+                if not blob_id or blob_id in seen_blobs:
+                    continue
+                seen_blobs.add(blob_id)
+                entry = dict(mount)
+                entry.update({
+                    "owner_id": owner.id,
+                    "owner_title": owner.title or "未命名",
+                    "inherited": inherited,
+                    "enabled": enabled,
+                })
+                mounts.append(entry)
+            for path in getattr(owner, "attachment_paths", []) or []:
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                legacy.append({
+                    "path": path,
+                    "name": os.path.basename(path) or path,
+                    "owner_id": owner.id,
+                    "owner_title": owner.title or "未命名",
+                    "inherited": inherited,
+                    "enabled": enabled,
+                })
+
+        return {"mounts": mounts, "legacy": legacy}
+
+    def _ancestor_chain(self, node) -> list:
+        """从节点自身向上的资源链（近 → 远），只含目录与对话。"""
+        chain: list = []
+        if isinstance(node, (FolderNode, ConversationNode)):
+            chain.append(node)
+        current = node.parent_id
+        while current is not None:
+            parent = self._tree.get_node(current)
+            if parent is None:
+                break
+            if isinstance(parent, (FolderNode, ConversationNode)):
+                chain.append(parent)
+            current = parent.parent_id
+        return chain
+
+    def _node_enabled(self, node_id: str) -> bool:
+        """节点的 effective enabled（级联规则由 ContextService 持有）。"""
+        try:
+            return bool(self._context_svc.is_node_effectively_enabled(node_id))
+        except Exception:
+            node = self._tree.get_node(node_id)
+            return bool(getattr(node, "enabled", True) is not False)
+
+    def convert_legacy_attachment(self, owner_id: str, path: str) -> str:
+        """
+        把一条旧式路径附件就地转成快照挂载。
+
+        以前只能跑维护脚本批量转；挂载管理面板里给单个文件留一个按钮更顺手。
+
+        Returns:
+            空串 = 成功；非空 = 失败原因
+        """
+        node = self._tree.get_node(owner_id)
+        if node is None:
+            return "节点不存在"
+        if not isinstance(node, (FolderNode, ConversationNode)):
+            return "只有目录和对话可以挂载文件"
+        if self._blobs is None:
+            return "未装配文件仓库，无法转换"
+
+        mounts: list[dict] = list(getattr(node, "mounts", []) or [])
+        try:
+            record = self._blobs.put(path)
+        except BlobTooLarge as e:
+            return str(e)
+        except OSError as e:
+            return f"无法读取文件：{e}"
+
+        if not any(m.get("blob_id") == record["blob_id"] for m in mounts):
+            mounts.append(record)
+        paths = [p for p in (node.attachment_paths or []) if p != path]
+        self._tree.update_node(owner_id, mounts=mounts, attachment_paths=paths)
+        print(f"[TREE] 旧式附件已转快照: {record['name']} → {owner_id}")
+        return ""
+
     def detach_file(self, folder_id: str, file_path: str) -> str:
         """
         从节点（目录或对话）移除挂载。

@@ -1355,6 +1355,7 @@ class TreePanel(QWidget):
         move_node(str, str, object) — 拖拽完成（node_id, target_parent_id, position）
         manage_context(str)      — 右键：管理上下文块（仅目录）
         attach_file(str)         — 右键：添加附件（仅目录）
+        manage_attachments(str)  — 右键：管理附件面板（单节点）
     """
 
     switch_conversation = Signal(str)
@@ -1368,6 +1369,7 @@ class TreePanel(QWidget):
     #       空串表示无;供分支感知拖拽判定"分叉点与被修改节点之间"等场景,3.6）
     manage_context = Signal(str)
     attach_file = Signal(str)
+    manage_attachments = Signal(str)   # 右键：管理附件面板（列出/添加/移除/转快照）
     toggle_context_blocks = Signal(str)   # 启用/禁用节点上下文块（右键菜单）
 
     # ── 多选模式批量操作信号 ──
@@ -2256,9 +2258,17 @@ class TreePanel(QWidget):
                     _tmp_diag.mutation_exit("menu:manage_context")
             menu.addAction("📚 管理上下文块", _tmp_manage_context)
 
-        # ── 添加附件 ──
+        # ── 附件：单节点给管理面板，批量时只保留"添加"（避免逐节点弹窗）──
         if "attach_file" in available_ops:
-            menu.addAction("📎 添加附件", lambda: self.batch_operation.emit("attach_file", batch_ids))
+            if is_batch:
+                menu.addAction(
+                    "📎 添加附件",
+                    lambda: self.batch_operation.emit("attach_file", batch_ids),
+                )
+            else:
+                menu.addAction(
+                    "📎 管理附件…", lambda: self.manage_attachments.emit(nid)
+                )
 
         # ── 启用/禁用上下文块（仅该节点有上下文块时，单节点）──
         if node_type in ("folder", "conversation") and not is_batch:
@@ -2351,8 +2361,19 @@ def _build_tooltip(node: TreeNodeVM) -> str:
             parts.append(f"上下文块: {node.context_block_count}")
             if not getattr(node, "context_blocks_enabled", True):
                 parts.append("上下文块: 已禁用")
-        if node.attachment_count > 0:
-            parts.append(f"附件: {node.attachment_count}")
+        own = node.attachment_count
+        inherited = getattr(node, "inherited_attachment_count", 0)
+        if own > 0:
+            names = list(getattr(node, "attachment_names", []) or [])
+            if names:
+                shown = "、".join(names[:5])
+                if len(names) > 5:
+                    shown += f" 等 {own} 个"
+                parts.append(f"附件: {shown}")
+            else:
+                parts.append(f"附件: {own}")
+        if inherited > 0:
+            parts.append(f"另继承: {inherited} 个（来自上级目录）")
     if node.updated_at:
         parts.append(f"更新: {node.updated_at}")
 

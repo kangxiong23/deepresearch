@@ -860,6 +860,10 @@ class AppController:
                     context_block_count=len(getattr(node, "context_block_ids", [])),
                     context_blocks_enabled=bool(getattr(node, "context_blocks_enabled", True)),
                     attachment_count=_attachment_count(node),
+                    attachment_names=_attachment_names(node),
+                    inherited_attachment_count=_inherited_attachment_count(
+                        self._conversation_svc, node.id
+                    ),
                 )
             else:  # ConversationNode
                 vm = TreeNodeVM(
@@ -877,6 +881,10 @@ class AppController:
                     context_block_count=len(getattr(node, "context_block_ids", [])),
                     context_blocks_enabled=bool(getattr(node, "context_blocks_enabled", True)),
                     attachment_count=_attachment_count(node),
+                    attachment_names=_attachment_names(node),
+                    inherited_attachment_count=_inherited_attachment_count(
+                        self._conversation_svc, node.id
+                    ),
                 )
             result.append(vm)
 
@@ -1067,6 +1075,55 @@ class AppController:
         """UI 调用：从目录移除附件（路径 / 展示名 / blob_id 均可）。"""
         return self._conversation_svc.detach_file(folder_id, file_path)
 
+    def on_get_node_attachments(self, node_id: str) -> dict:
+        """
+        UI 调用：取节点实际生效的附件（含继承项），供挂载管理面板渲染。
+
+        Returns:
+            {
+              "title": 节点标题,
+              "mounts": [{blob_id, name, size_text, added_text, inherited,
+                          owner_id, owner_title, enabled}],
+              "legacy": [{path, name, inherited, owner_id, owner_title, enabled}],
+            }
+        """
+        node = self._conversation_svc.get_node(node_id)
+        view = self._conversation_svc.get_attachments_view(node_id)
+
+        mounts = []
+        for item in view.get("mounts", []):
+            mounts.append({
+                "blob_id": item.get("blob_id", ""),
+                "name": item.get("name") or "附件",
+                "size_text": _format_size(item.get("size")),
+                "added_text": str(item.get("added_at") or "")[:16].replace("T", " "),
+                "inherited": bool(item.get("inherited")),
+                "owner_id": item.get("owner_id", ""),
+                "owner_title": item.get("owner_title", ""),
+                "enabled": bool(item.get("enabled", True)),
+            })
+
+        legacy = []
+        for item in view.get("legacy", []):
+            legacy.append({
+                "path": item.get("path", ""),
+                "name": item.get("name", ""),
+                "inherited": bool(item.get("inherited")),
+                "owner_id": item.get("owner_id", ""),
+                "owner_title": item.get("owner_title", ""),
+                "enabled": bool(item.get("enabled", True)),
+            })
+
+        return {
+            "title": getattr(node, "title", "") if node is not None else "",
+            "mounts": mounts,
+            "legacy": legacy,
+        }
+
+    def on_convert_legacy_attachment(self, owner_id: str, path: str) -> str:
+        """UI 调用：把旧式路径附件就地转成快照挂载（空串 = 成功）。"""
+        return self._conversation_svc.convert_legacy_attachment(owner_id, path)
+
     def on_list_trash(self) -> list[TrashEntryVM]:
         """UI 调用：列出回收站所有条目。"""
         entries = self._conversation_svc.get_trash_entries()
@@ -1113,6 +1170,49 @@ def _attachment_count(node) -> int:
     blob_ids = {str((m or {}).get("blob_id") or "") for m in mounts}
     blob_ids.discard("")
     return len(blob_ids) + len(paths)
+
+
+def _attachment_names(node) -> list[str]:
+    """节点自己的附件名（挂载优先，旧式路径按 basename），供树 tooltip 展示。"""
+    names: list[str] = []
+    seen: set[str] = set()
+    for mount in (getattr(node, "mounts", None) or []):
+        name = str((mount or {}).get("name") or "")
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    for path in (getattr(node, "attachment_paths", None) or []):
+        name = path.replace("/", "\\").rsplit("\\", 1)[-1] or path
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _inherited_attachment_count(svc, node_id: str) -> int:
+    """从祖先链继承来的附件数（不含自己的）。取不到就当 0。"""
+    try:
+        view = svc.get_attachments_view(node_id)
+    except Exception:
+        return 0
+    total = sum(1 for m in view.get("mounts", []) if m.get("inherited"))
+    total += sum(1 for p in view.get("legacy", []) if p.get("inherited"))
+    return total
+
+
+def _format_size(size) -> str:
+    """字节数 → 人类可读（12.3 KB / 4.1 MB）。"""
+    try:
+        value = float(size or 0)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    if value < 1024:
+        return f"{value:.0f} B"
+    if value < 1024 * 1024:
+        return f"{value / 1024:.1f} KB"
+    return f"{value / 1024 / 1024:.1f} MB"
 
 
 def _format_datetime(dt) -> str:

@@ -121,6 +121,8 @@ class TreeNodeVM:
     context_block_count: int = 0             # 仅目录/对话
     context_blocks_enabled: bool = True      # 节点上下文块是否启用（仅目录/对话）
     attachment_count: int = 0                # 仅目录
+    attachment_names: list[str] = field(default_factory=list)  # 仅目录：本节点自己的附件名
+    inherited_attachment_count: int = 0       # 仅目录：从祖先继承来的附件数
     role: str = ""                           # 仅消息节点: "user" | "assistant" | "thinking"
     fork_display: str = ""                   # 分叉点标题前缀 "<m/n> "（仅信息展示，3.5.2）
     is_modified: bool = False                # 仅消息节点: 被修改节点（分叉点后继，拖拽判定用 3.6）

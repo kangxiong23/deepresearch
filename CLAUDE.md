@@ -203,6 +203,13 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 `attachment_paths` 仍可读（现在也走解析器，且文件缺失会留下可见占位而不是静默消失），
 批量迁移用 `scripts/migrate_attachments_to_mounts.py`（默认 dry-run）。
 
+**挂载的界面**。树行的悬停提示列出本节点自己的文件名（最多 5 个，超出写"等 N 个"），
+并另起一行报告"另继承 N 个（来自上级目录）"——只报自己的会让用户以为父目录挂的东西不存在。
+右键「📎 管理附件…」（单节点）打开 app/ui/widgets/attachment_dialog.py：列出实际会注入的
+全部文件（含继承）、大小、挂载时间、所属节点；可添加、移除、把旧式路径附件就地转快照。
+**继承项在该面板里只读**——移除会影响所有兄弟对话，必须去源节点删。批量选中多个节点时
+右键仍只给「添加附件」（逐节点弹窗太吵）。
+
 **工具读取记录 (D3)**。工具读取是实时的，不产生挂载；`FileToolService.audit()` 的
 `read_file` 条目由 `ConversationService._remember_reads` 写进 SQLite `file_reads`
 表（每对话保留 50 条，`ReadLogStore`），下一轮面包屑 `_breadcrumb_for` 从这份持久化
@@ -230,6 +237,7 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 | `app/storage/read_log_store.py` | `file_reads` 表读写（工具读取记录） |
 | `app/core/file_tool_service.py` | 本地文件只读工具（search_files / read_file） |
 | `app/ui/widgets/file_access_dialog.py` | 本地文件访问授权对话框 |
+| `app/ui/widgets/attachment_dialog.py` | 节点附件管理面板（列出/添加/移除/旧式转快照，继承项只读） |
 | `app/core/search_service.py` | Search adapter orchestration |
 | `app/storage/tree_store.py` | Tree JSON persistence + recycle bin (`tree.json`, `recycle_bin.json`) |
 | `app/storage/message_repo.py` | SQLite message persistence (`messages` table) |

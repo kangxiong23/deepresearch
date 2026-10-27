@@ -533,6 +533,114 @@ class TestAttachFileMounts(TempDataCase):
         self.assertTrue(svc.attach_file("f-1", "x"))
 
 
+class _StubTreeMap:
+    """多节点树桩：支持祖先链查询，记录 update_node 调用。"""
+
+    def __init__(self, nodes: list) -> None:
+        self._nodes = {n.id: n for n in nodes}
+        self.updated: list = []
+
+    def get_node(self, node_id):
+        return self._nodes.get(node_id)
+
+    def update_node(self, node_id, **updates) -> None:
+        self.updated.append((node_id, updates))
+        node = self._nodes[node_id]
+        for key, value in updates.items():
+            setattr(node, key, value)
+
+
+class _StubContextSvc:
+    def __init__(self, disabled: set | None = None) -> None:
+        self._disabled = disabled or set()
+
+    def is_node_effectively_enabled(self, node_id: str) -> bool:
+        return node_id not in self._disabled
+
+
+class TestAttachmentsView(TempDataCase):
+    """管理面板的数据来源：自己的 / 继承来的 / 旧式路径，各自带归属。"""
+
+    def make(self, nodes, disabled=None):
+        svc = ConversationService.__new__(ConversationService)
+        svc._tree = _StubTreeMap(nodes)
+        svc._blobs = FileBlobStore()
+        svc._context_svc = _StubContextSvc(disabled)
+        return svc
+
+    def build(self, disabled=None):
+        folder = FolderNode(id="f-1", parent_id=None, title="项目A")
+        conv = ConversationNode(id="c-1", parent_id="f-1", title="预算对话")
+        return folder, conv, self.make([folder, conv], disabled)
+
+    def test_own_mount_is_not_inherited(self) -> None:
+        folder, conv, svc = self.build()
+        conv.mounts = [{"blob_id": "a" * 64, "name": "自己的.md", "size": 10}]
+        view = svc.get_attachments_view("c-1")
+        self.assertEqual(len(view["mounts"]), 1)
+        entry = view["mounts"][0]
+        self.assertFalse(entry["inherited"])
+        self.assertEqual(entry["owner_id"], "c-1")
+
+    def test_parent_mount_is_marked_inherited(self) -> None:
+        folder, conv, svc = self.build()
+        folder.mounts = [{"blob_id": "b" * 64, "name": "父级的.md", "size": 10}]
+        view = svc.get_attachments_view("c-1")
+        self.assertEqual(len(view["mounts"]), 1)
+        entry = view["mounts"][0]
+        self.assertTrue(entry["inherited"])
+        self.assertEqual(entry["owner_id"], "f-1")
+        self.assertEqual(entry["owner_title"], "项目A")
+
+    def test_nearest_owner_wins_for_same_blob(self) -> None:
+        folder, conv, svc = self.build()
+        rec = {"blob_id": "c" * 64, "name": "同一份.md", "size": 10}
+        folder.mounts = [dict(rec)]
+        conv.mounts = [dict(rec)]
+        view = svc.get_attachments_view("c-1")
+        self.assertEqual(len(view["mounts"]), 1)
+        self.assertFalse(view["mounts"][0]["inherited"], "近的那份应胜出")
+
+    def test_disabled_owner_is_flagged(self) -> None:
+        folder, conv, svc = self.build(disabled={"f-1"})
+        folder.mounts = [{"blob_id": "d" * 64, "name": "父级.md", "size": 1}]
+        entry = svc.get_attachments_view("c-1")["mounts"][0]
+        self.assertFalse(entry["enabled"])
+
+    def test_legacy_paths_listed_with_owner(self) -> None:
+        folder, conv, svc = self.build()
+        folder.attachment_paths = [r"D:\旧\合同.md"]
+        conv.attachment_paths = [r"D:\旧\补充.md"]
+        legacy = svc.get_attachments_view("c-1")["legacy"]
+        # 近 → 远：自己的在前，继承的在后
+        self.assertEqual([e["name"] for e in legacy], ["补充.md", "合同.md"])
+        self.assertEqual([e["inherited"] for e in legacy], [False, True])
+
+    def test_convert_legacy_attachment_becomes_mount(self) -> None:
+        folder, conv, svc = self.build()
+        path = self.write("合同.md", "合同正文")
+        conv.attachment_paths = [path]
+
+        self.assertEqual(svc.convert_legacy_attachment("c-1", path), "")
+        self.assertEqual(conv.attachment_paths, [])
+        self.assertEqual(len(conv.mounts), 1)
+        self.assertEqual(conv.mounts[0]["name"], "合同.md")
+        self.assertEqual(svc.get_attachments_view("c-1")["legacy"], [])
+
+    def test_convert_missing_file_reports_reason(self) -> None:
+        folder, conv, svc = self.build()
+        path = os.path.join(self.root, "不存在.md")
+        conv.attachment_paths = [path]
+        msg = svc.convert_legacy_attachment("c-1", path)
+        self.assertTrue(msg)
+        self.assertEqual(conv.attachment_paths, [path], "失败不该动原数据")
+
+    def test_unknown_node_returns_empty(self) -> None:
+        folder, conv, svc = self.build()
+        self.assertEqual(svc.get_attachments_view("nope"),
+                         {"mounts": [], "legacy": []})
+
+
 # ──────────────────────────────────────────────
 # 挂载 → system prompt（定界 + 预算）
 # ──────────────────────────────────────────────
