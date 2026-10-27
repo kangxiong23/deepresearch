@@ -26,7 +26,7 @@ from app.storage.blob_store import FileBlobStore
 
 # ── 适配器 ────────────────────────────────────
 from app.adapters.deepseek_client import DeepSeekClient
-from app.adapters.file_parsers import default_parsers
+from app.adapters.file_parsers import default_parsers, unsupported_hints
 from app.adapters.search_adapters import DuckDuckGoSearchAdapter, ArxivSearchAdapter
 
 # ── Core 服务 ─────────────────────────────────
@@ -114,6 +114,8 @@ def assemble_app() -> ChatApp:
     )
     file_service = FileService(
         parsers=file_parsers,
+        # 没有解析器时的处置建议（.doc → 另存为 .docx 等）；格式知识在适配器层
+        unsupported_hints=unsupported_hints(),
     )
     context_service.set_file_service(file_service)
     # 本地文件只读访问（工具调用）。默认关闭：config.file_access_enabled=False

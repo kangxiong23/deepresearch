@@ -1419,6 +1419,9 @@ class ConversationService:
         统一走 FileService 的解析器（docx / pdf / json 都能取出文本），
         不再用裸 UTF-8 读取——那是历史遗留的乱码来源。
         超限由 message_attachments 截断并给出可读提示，绝不静默丢内容。
+
+        解析失败的文件也会带着一句 "[无法解析…]" 说明进入附件列表
+        （FileService 保证一个文件都不丢）——用户看得见，模型也读得到。
         """
         if not files:
             return []

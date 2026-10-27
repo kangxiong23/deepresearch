@@ -219,6 +219,28 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 **彻底删除**时清理（软删除保留，恢复后记录还在）；磁盘文件消失 → 快照不受影响。
 分支切换会保留旧链的消息行，所以挂载的存活判据是"节点还在不在"，不是"在不在当前链上"。
 
+**docx 解析**。三条硬约束，每条都对应一次实测丢内容（`app/adapters/file_parsers.py`）：
+1. **顺序** —— `doc.paragraphs` 与 `doc.tables` 分两趟跑会把所有表格挤到文末。
+   必须单趟遍历 `body.iterchildren()`，在原位发段落/表格。
+2. **文字** —— `Paragraph.text` 只认段落的直接子 `w:r`，于是修订插入（`w:ins`）、
+   行内内容控件（`w:sdt`）、块级内容控件里的整段全都读不到（实测一份边角文档只剩
+   37% 文字）；它还慢，3000 段 377 ms，自己遍历 `w:t` 只要 25 ms。段落取字一律走
+   `_para_text()`（递归收集 `w:t`/`w:tab`/`w:br`，整棵跳过 `w:del`/`w:txbxContent`/`w:instrText`）。
+   注意 `Document.iter_inner_content()` 同样跳过块级 `w:sdt`，不能直接用。
+3. **可见** —— 损坏/加密/空文档返回「[无法解析「x」：原因]」，不返回空串。`FileService`
+   对"没有解析器 / 解析异常 / 结果为空"也各给一句人话（`unsupported_hints` 提供
+   ".doc → 请另存为 .docx" 这类处置建议，格式知识留在适配器层、由 `main.py` 注入）。
+   **一个文件都不丢** —— 静默丢弃会让用户看到"传了文件但模型没反应"，界面上毫无痕迹。
+
+判据细节：标题层级同时看 `style.style_id`、`style.name` 与 `pPr/outlineLvl` —— Word 会把
+内置样式 id 存成 "2"/"3" 这种数字（实测真实文档就是这样），只认 styleId 会漏掉全部标题。
+列表类型按 `word/numbering.xml` 的 `numFmt` 分类（bullet → "- "，其余 → 计数器 "1. "），
+**序号值不还原**（多级联动、重启编号、"%1.%2" 模板的收益远小于成本），中文文档里的
+"一、二、"会显示成 "1. 2."。表格渲染成 Markdown 管道表：合并单元格按 `tc` 去重（`row.cells`
+按网格重复返回同一个 tc），嵌套表格递归成独立块，首行只有带 `w:tblHeader` 才补分隔行。
+页眉/页脚追加在文末并丢掉纯页码行；文本框单独成 "[文本框]" 段；图片只留 "[图片 N]" 占位
+并在结尾声明"未做文字识别"。挂载缓存**不写失败结果**，否则一次偶发失败会被永久固定。
+
 ### Key files
 
 | File | Role |
@@ -247,7 +269,7 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 | `app/storage/models.py` | Domain data classes shared across all layers |
 | `app/adapters/deepseek_client.py` | DeepSeek API HTTP client with SSE streaming |
 | `app/adapters/search_adapters/` | Web search (DuckDuckGo) + Arxiv adapters |
-| `app/adapters/file_parsers.py` | File parsers (txt, md, json, docx, pdf) |
+| `app/adapters/file_parsers.py` | File parsers (txt, md, json, docx, pdf)；docx 保序 / 保留修订与内容控件 / 失败可见；`unsupported_hints()` |
 | `app/controllers/app_controller.py` | Main controller — maps UI events → Core calls → ViewModels |
 | `app/controllers/view_models.py` | ViewModel dataclasses (`TreeNodeVM`, `MessageVM`, `StreamChunkVM`, etc.) |
 | `app/controllers/settings_controller.py` | Settings controller (model, thinking, search toggles) |
