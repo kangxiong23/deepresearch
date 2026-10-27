@@ -227,7 +227,7 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
    37% 文字）；它还慢，3000 段 377 ms，自己遍历 `w:t` 只要 25 ms。段落取字一律走
    `_para_text()`（递归收集 `w:t`/`w:tab`/`w:br`，整棵跳过 `w:del`/`w:txbxContent`/`w:instrText`）。
    注意 `Document.iter_inner_content()` 同样跳过块级 `w:sdt`，不能直接用。
-3. **可见** —— 损坏/加密/空文档返回「[无法解析「x」：原因]」，不返回空串。`FileService`
+3. **可见** —— 损坏/加密/空文档/文件缺失返回「[无法解析「x」：原因]」，不返回空串。`FileService`
    对"没有解析器 / 解析异常 / 结果为空"也各给一句人话（`unsupported_hints` 提供
    ".doc → 请另存为 .docx" 这类处置建议，格式知识留在适配器层、由 `main.py` 注入）。
    **一个文件都不丢** —— 静默丢弃会让用户看到"传了文件但模型没反应"，界面上毫无痕迹。

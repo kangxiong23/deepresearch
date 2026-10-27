@@ -29,7 +29,7 @@ class PlainTextParser:
         """同步版本：供上下文构建等同步路径复用，语义与 extract_text 相同。"""
         if not file_path or not os.path.exists(file_path):
             print(f"[FileParser] 文件不存在或路径为空: {repr(file_path)}")
-            return ""
+            return f"[无法读取「{_basename(file_path) or file_path}」：文件不存在]"
         try:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 return f.read()
@@ -56,8 +56,8 @@ class JsonParser:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
             return json.dumps(data, ensure_ascii=False, indent=2)
-        except OSError:
-            return ""
+        except OSError as e:
+            return f"[无法读取「{_basename(file_path)}」：{e.strerror or '未知错误'}]"
         except json.JSONDecodeError as e:
             return f"[无法解析「{_basename(file_path)}」：JSON 格式错误（第 {e.lineno} 行 {e.msg}）]"
 

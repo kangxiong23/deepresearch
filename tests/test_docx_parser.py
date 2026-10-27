@@ -17,7 +17,7 @@ from docx import Document
 from docx.oxml import parse_xml
 from docx.shared import Inches
 
-from app.adapters.file_parsers import DocxParser, unsupported_hints
+from app.adapters.file_parsers import DocxParser, PlainTextParser, unsupported_hints
 from app.core.file_service import FileService
 
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -351,6 +351,13 @@ class TestDocxFailureVisibility(_DocxFixture):
         results = asyncio.run(service.extract_files(["whatever.txt"]))
 
         self.assertIn("解析过程出错", results[0][1])
+
+    def test_missing_file_reported_as_missing(self):
+        service = FileService(parsers=[PlainTextParser()])
+
+        results = asyncio.run(service.extract_files([os.path.join(self.dir, "nope.txt")]))
+
+        self.assertIn("文件不存在", results[0][1])
 
     def test_no_file_is_ever_dropped(self):
         path = self._path("old.doc")
