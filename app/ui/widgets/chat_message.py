@@ -523,6 +523,8 @@ class ChatMessage(QFrame):
         self._opacity_effect = None        # 半透明效果对象（QGraphicsOpacityEffect）
         self._show_abandon: bool = False   # 修改重发送暂停态："放弃本次修改"按钮
         self._stream_buffer: str = content
+        # 流式期间的临时状态行（工具调用等）。只参与渲染，不进正文、不落库。
+        self._status_line: str = ""
         self._updating_height: bool = False  # 防重入
         self._fork_m: int = 0              # 分叉展示信息（0 = 非被修改节点）
         self._fork_n: int = 0
@@ -947,11 +949,29 @@ class ChatMessage(QFrame):
         self._stream_buffer = ""
         self._update_action_visibility()
 
+    def set_status(self, text: str) -> None:
+        """在正文上方显示一行临时状态（工具调用进度）。
+
+        状态行只存在于流式渲染里：不进 _stream_buffer、不落库、重建后自然消失。
+        """
+        if text == self._status_line:
+            return
+        self._status_line = text
+        self._render_stream(repaint=True)
+
+    def _render_stream(self, repaint: bool = False) -> None:
+        body = self._stream_buffer
+        if self._status_line:
+            body = "**" + self._status_line + "**\n\n" + body
+        self._content_browser.setHtml(_render_markdown(body))
+        self._update_content_height()
+        if repaint:
+            self._content_browser.viewport().repaint()
+
     def append_stream(self, delta: str) -> None:
         """追加流式文本块，自动渲染 Markdown 并更新高度。"""
         self._stream_buffer += delta
-        self._content_browser.setHtml(_render_markdown(self._stream_buffer))
-        self._update_content_height()
+        self._render_stream()
         # 流式输出期间自动滚动到文本底部
         vsb = self._content_browser.verticalScrollBar()
         if vsb.isVisible():
@@ -962,15 +982,21 @@ class ChatMessage(QFrame):
         self._content_browser.viewport().repaint()
 
     def finalize_stream(self) -> None:
-        """结束流式接收（正常完成）。"""
+        """结束流式接收（正常完成）。状态行在此清除，正文不含它。"""
         self._is_streaming = False
         self._is_incomplete = False
+        if self._status_line:
+            self._status_line = ""
+            self._render_stream()
         self._update_action_visibility()
 
     def mark_incomplete(self) -> None:
         """标记消息为未完成状态（用户停止生成），显示重新生成 + 继续按钮。"""
         self._is_streaming = False
         self._is_incomplete = True
+        if self._status_line:
+            self._status_line = ""
+            self._render_stream()
         self._update_action_visibility()
 
     def restart_stream_from(self, content: str) -> None:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from typing import AsyncGenerator
@@ -48,6 +49,29 @@ from app.storage.models import (
 
 # 单轮工具调用的最大子请求次数。超过后提示模型收尾，避免无限循环。
 MAX_TOOL_ROUNDS = 5
+
+
+def _describe_tool_call(call: dict) -> str:
+    """把一次工具调用翻成一行给用户看的文字（只用于展示，不进入正文）。"""
+    fn = call.get("function") or {}
+    name = fn.get("name") or ""
+    try:
+        args = json.loads(fn.get("arguments") or "{}")
+        if not isinstance(args, dict):
+            args = {}
+    except (json.JSONDecodeError, ValueError):
+        args = {}
+
+    if name == "search_files":
+        query = str(args.get("query") or "").strip()
+        text = f"🔍 检索「{query}」" if query else "🔍 浏览文件列表"
+        if args.get("in_content"):
+            text += "（含内容）"
+        return text
+    if name == "read_file":
+        path = str(args.get("path") or "")
+        return f"📄 读取 {os.path.basename(path)}" if path else "📄 读取文件"
+    return f"🔧 {name or '工具调用'}"
 
 
 @dataclass
@@ -1304,6 +1328,14 @@ class ConversationService:
                     "content": "工具调用次数已达上限，请基于已获得的信息直接作答。",
                 })
                 continue
+
+            # 先透出"要做什么"，再执行 —— 检索可能耗时数秒，否则界面干等
+            for call in pending_calls:
+                yield MessageChunk(
+                    delta=_describe_tool_call(call),
+                    chunk_type=ChunkType.TOOL_CALL,
+                    message_id=assistant_msg_id,
+                )
 
             self._append_tool_round(
                 llm_context, pending_calls, round_content, round_thinking

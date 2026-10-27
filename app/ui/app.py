@@ -925,6 +925,10 @@ class ChatApp:
                     self._insert_before_last(thinking_ref[0])
                 thinking_ref[0].append_text(delta)
                 thinking_ref[0].repaint()
+            elif chunk_type == "tool_call":
+                # 工具进度：只在气泡顶部显示临时状态行，不进入正文
+                if self._streaming_message:
+                    self._streaming_message.set_status(delta)
             else:
                 if self._streaming_message:
                     self._streaming_message.append_stream(delta)
@@ -1352,6 +1356,10 @@ class ChatApp:
                     self._insert_before_last(thinking_ref[0])
                 thinking_ref[0].append_text(delta)
                 thinking_ref[0].repaint()  # 强制立即重绘，实现流式效果
+            elif chunk_type == "tool_call":
+                # 工具进度：只在气泡顶部显示临时状态行，不进入正文
+                if self._streaming_message:
+                    self._streaming_message.set_status(delta)
             else:
                 if self._streaming_message:
                     self._streaming_message.append_stream(delta)
@@ -1495,6 +1503,10 @@ class ChatApp:
                     self._insert_before_last(thinking_ref[0])
                 thinking_ref[0].append_text(delta)
                 thinking_ref[0].repaint()
+            elif chunk_type == "tool_call":
+                # 工具进度：只在气泡顶部显示临时状态行，不进入正文
+                if self._streaming_message:
+                    self._streaming_message.set_status(delta)
             else:
                 if self._streaming_message:
                     self._streaming_message.append_stream(delta)

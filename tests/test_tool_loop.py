@@ -357,5 +357,49 @@ class TestSendMessageWiring(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text_out.count("f"), 6)
 
 
+class TestToolStatusChunks(unittest.IsolatedAsyncioTestCase):
+    """工具状态行：先告诉用户"要做什么"，再执行。"""
+
+    async def test_search_status_emitted(self) -> None:
+        llm = FakeLLM([
+            [tool_call("call_a", "search_files", {"query": "预算"})],
+            [text("好了", done=True)],
+        ])
+        svc = make_service(llm, FakeTools())
+        buf = _TurnBuffer()
+        chunks = await drain(svc, ctx([{"type": "function"}]), buf)
+
+        status = [c for c in chunks if c.chunk_type == ChunkType.TOOL_CALL]
+        self.assertEqual(len(status), 1)
+        self.assertIn("预算", status[0].delta)
+        self.assertFalse(status[0].is_done)
+
+    async def test_read_status_uses_basename_only(self) -> None:
+        llm = FakeLLM([
+            [tool_call("call_a", "read_file",
+                       {"path": "D:\\secret\\dir\\2026预算.md"})],
+            [text("好了", done=True)],
+        ])
+        svc = make_service(llm, FakeTools())
+        buf = _TurnBuffer()
+        chunks = await drain(svc, ctx([{"type": "function"}]), buf)
+
+        status = [c for c in chunks if c.chunk_type == ChunkType.TOOL_CALL][0]
+        self.assertIn("2026预算.md", status.delta)
+        self.assertNotIn("secret", status.delta, "状态行不得暴露完整目录")
+
+    async def test_status_not_emitted_for_dropped_calls(self) -> None:
+        """超过轮次上限、调用被丢弃时，不应再显示状态。"""
+        llm = FakeLLM([
+            [tool_call(f"c{i}", "search_files", {"query": "x"})]
+            for i in range(MAX_TOOL_ROUNDS + 4)
+        ])
+        svc = make_service(llm, FakeTools())
+        buf = _TurnBuffer()
+        chunks = await drain(svc, ctx([{"type": "function"}]), buf)
+        status = [c for c in chunks if c.chunk_type == ChunkType.TOOL_CALL]
+        self.assertEqual(len(status), MAX_TOOL_ROUNDS)
+
+
 if __name__ == "__main__":
     unittest.main()
