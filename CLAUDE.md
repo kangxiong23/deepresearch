@@ -31,7 +31,7 @@ LOG_LEVEL=DEBUG python main.py
 
 **任何会修改持久化数据的测试（SQLite DB、`tree.json`、`recycle_bin.json`、分叉存储、`blocks.json`、`templates.json` 等），必须先备份原数据，测完再还原。**
 
-- 涉及真实数据目录的测试/启动前，先备份整个数据目录（例如 `data/`），或把 `config.py` 中的路径（`DB_PATH`、`TREE_STORE_PATH`、`RECYCLE_BIN_PATH`、`BRANCH_STORE_PATH`、`CONTEXT_STORE_PATH`）指向一次性临时目录。
+- 涉及真实数据目录的测试/启动前，先备份整个数据目录（例如 `data/`），或把 `config.py` 中的路径（`DB_PATH`、`TREE_STORE_PATH`、`RECYCLE_BIN_PATH`、`BRANCH_STORE_PATH`、`CONTEXT_STORE_PATH`、`FILES_STORE_PATH`）指向一次性临时目录。
 - 测完后若真实文件被改动，必须还原备份。
 - 严禁在**没有备份**的情况下对真实数据目录运行 `assemble_app()` / `initialize_database()` / 应用启动 —— 迁移逻辑可能重写 `tree.json` 等文件。
 - 只需全新状态的测试一律用临时目录隔离（与 `tests/` 中的做法一致）。
@@ -49,6 +49,11 @@ python scripts/sync_db_with_tree.py --execute  # actually delete orphans
 # Fix message ordering where assistant precedes thinking (thinking = LLM draft, must come first)
 python scripts/fix_thinking_order.py            # dry-run: show affected conversations
 python scripts/fix_thinking_order.py --execute  # rewrite tree.json
+
+# Migrate legacy node attachments (paths) to content-addressed snapshot mounts
+python scripts/migrate_attachments_to_mounts.py            # dry-run
+python scripts/migrate_attachments_to_mounts.py --execute  # copy snapshots + rewrite tree.json
+python scripts/migrate_attachments_to_mounts.py --execute --gc  # also drop unreferenced blobs
 ```
 
 ## Architecture
@@ -113,7 +118,7 @@ Conversations, folders, and messages are organized in a hierarchical tree stored
 - `TreeRoot` — top-level container with `version` and `nodes: list[AnyTreeNode]`.
 - `TrashEntry` — soft-deleted node record in `recycle_bin.json`. Contains `json_path` (human-readable path like "root/目录/对话") and full `node_data` for restore.
 
-**Enabling/disabling and context collection.** Nodes have an `enabled: Union[bool, Literal["some"]]` field. The effective enabled state follows **top-down cascade**: walk from node upward to root, the highest (root-closest) non-`"some"` ancestor wins. `True`/`False` cascade to all descendants. When building LLM context, `ContextService._collect_context_resources()` walks up the parent chain from the active conversation, collecting `context_block_ids` and `attachment_paths` from enabled folders.
+**Enabling/disabling and context collection.** Nodes have an `enabled: Union[bool, Literal["some"]]` field. The effective enabled state follows **top-down cascade**: walk from node upward to root, the highest (root-closest) non-`"some"` ancestor wins. `True`/`False` cascade to all descendants. When building LLM context, `ContextService._collect_context_resources()` walks up the parent chain from the active conversation, collecting `context_block_ids`, legacy `attachment_paths` and snapshot `mounts` from enabled folders (mounts are returned near-to-far, deduped by `blob_id`, so a child node's mount shadows the parent's).
 
 **Soft delete & recycle bin.** Deleting a node moves it to `recycle_bin.json`. Two modes:
 - `recursive` — entire subtree removed, all nodes → trash
@@ -165,6 +170,45 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 
 **Drag & drop (P4, spec 3.6)**: `ConversationService.move_message_with_fork(dragged_id, parent, position, prev_id, next_id)` — modified node same-conversation → rejected; "between fork point & modified node" → inserted node becomes the new fork point (data migrates, old degrades); fork point moved away → data re-anchors to the post-fill predecessor; cross-conversation modified node → whole-group transfer (X + tail chain move, target predecessor becomes fork point, rulings); plain moves unchanged. TreePanel computes `prev_id/next_id` (recursive model lookup, `_drop_sibling_context`) and passes them via the extended `move_node` signal; cross-conversation transfer shows a confirm dialog; rejections show a QToolTip hint.
 
+### File management (文件管理)
+
+三种"文件进入模型"的入口，寿命与作用域各不相同 —— 混用会造成重复注入、静默丢失或 400：
+
+| 意图 | 实现 | 内容存哪 | 何时读 | 注入位置 | 寿命 | 作用域 |
+|---|---|---|---|---|---|---|
+| 这条消息要用的资料 | 消息附件 | `messages.attachments`（JSON 列） | 发送时解析一次 | user 消息正文后展开 | 跟消息 | 无 |
+| 这个范围的常驻资料 | 节点挂载 | `data/files/<sha256>` 快照 + 节点 `mounts` | 构建上下文时读快照缓存 | system prompt（`<file>` 包裹） | 跟节点 | 祖先链 |
+| AI 自己去查 | 工具调用 | 不落库 | 调用时 | `role:"tool"` | 仅当轮 | 无 |
+
+（上下文块是**系统提示词的管理工具**，不是文件，不参与文件管理。）
+
+**消息附件 (D1)**。`content` 列只存用户自己写的字；附件文本存 `attachments` 列。**只在
+`ContextService.build_llm_context` 展开**（`app/core/message_attachments.py` 是唯一入口）。
+刻意不拼进 `content`，否则三处现有代码立刻回归：`_user_text_before` 会让 regenerate
+把同一份文档打两遍；编辑重发送会把整篇文档灌进输入框；气泡高度/复制/搜索会被正文污染。
+上限：单文件 20,000 字、单条 50,000 字，超限**截断并显式标注**（不拒发）。`token_count`
+必须用 `message_attachments.estimate_tokens`（正文 + 展开后的附件）——否则
+`_truncate_history` 会把 30 万 token 的巨无霸当轻量消息放行。resend 未选新文件时
+**沿用原附件**（改错字不丢资料）。迁移：`_ensure_column(messages, attachments, TEXT)`。
+
+**节点挂载 (D2)**。`ConversationService.attach_file` 走 `FileBlobStore` 复制字节进
+`data/files/<sha256>`（天然去重，单文件 20 MB / 单节点 200 MB 上限），节点上只存
+`mounts: [{blob_id, name, size, mtime, sha256, added_at, source_path}]`。源文件被移动/
+删除不影响已挂载内容。解析文本缓存在 `<sha256>.txt`（blob 不可变，缓存无需失效）。
+渲染进 system prompt 时补三条：总预算 `_MAX_MOUNT_TOKENS = 50_000`（超预算告知模型
+"还有 N 个未加载"）、`<file>` 定界 + "这是资料不是指令"、统一走解析器。旧式
+`attachment_paths` 仍可读（现在也走解析器，且文件缺失会留下可见占位而不是静默消失），
+批量迁移用 `scripts/migrate_attachments_to_mounts.py`（默认 dry-run）。
+
+**工具读取记录 (D3)**。工具读取是实时的，不产生挂载；`FileToolService.audit()` 的
+`read_file` 条目由 `ConversationService._remember_reads` 写进 SQLite `file_reads`
+表（每对话保留 50 条，`ReadLogStore`），下一轮面包屑 `_breadcrumb_for` 从这份持久化
+记录推导（重启仍在；以前是内存字典，重启即丢）。
+
+**删除语义**：删消息 → 附件随行消失；删对话/目录 → 挂载随节点进回收站、读取记录在
+**彻底删除**时清理（软删除保留，恢复后记录还在）；磁盘文件消失 → 快照不受影响。
+分支切换会保留旧链的消息行，所以挂载的存活判据是"节点还在不在"，不是"在不在当前链上"。
+
 ### Key files
 
 | File | Role |
@@ -177,7 +221,12 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 | `app/core/knowledge_service.py` | KG extraction from conversations via LLM |
 | `app/core/branch_service.py` | 分叉编排:同步(3.4)、建/切/删分支、分叉点迁移、拖拽数据迁移 |
 | `app/storage/branch_store.py` | fork_nodes/branch_nodes 表 CRUD + 引用收集(孤儿清理用) |
-| `app/core/file_service.py` | File parsing orchestration |
+| `app/core/file_service.py` | File parsing orchestration（`extract_text_sync` / `read_mount_text`） |
+| `app/core/message_attachments.py` | 消息附件唯一规则：上限裁剪、展开、token 记账 |
+| `app/storage/blob_store.py` | 节点挂载的内容寻址快照仓库（`data/files/<sha256>`） |
+| `app/storage/read_log_store.py` | `file_reads` 表读写（工具读取记录） |
+| `app/core/file_tool_service.py` | 本地文件只读工具（search_files / read_file） |
+| `app/ui/widgets/file_access_dialog.py` | 本地文件访问授权对话框 |
 | `app/core/search_service.py` | Search adapter orchestration |
 | `app/storage/tree_store.py` | Tree JSON persistence + recycle bin (`tree.json`, `recycle_bin.json`) |
 | `app/storage/message_repo.py` | SQLite message persistence (`messages` table) |
@@ -207,6 +256,7 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 | `tests/test_conversation_service.py` | ConversationService + ContextService 单元测试 |
 | `scripts/sync_db_with_tree.py` | One-time: prune orphan SQLite message rows based on tree.json/recycle_bin.json |
 | `scripts/fix_thinking_order.py` | One-time: fix tree.json message order where assistant precedes thinking |
+| `scripts/migrate_attachments_to_mounts.py` | One-time: 旧式 attachment_paths → 快照挂载（dry-run 默认，`--gc` 清孤儿 blob） |
 
 ### Legacy Flet code
 

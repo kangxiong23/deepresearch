@@ -739,7 +739,7 @@ class TreeStore:
         allowed = {
             "title", "enabled", "summary", "message_count",
             "context_block_ids", "context_blocks_enabled",
-            "attachment_paths", "preview", "role",
+            "attachment_paths", "mounts", "preview", "role",
             "incomplete", "thinking_message_id",
             # 分叉字段（分叉点计数/当前索引，由 BranchService 维护）
             "is_fork_point", "fork_branch_count", "fork_current_index",
@@ -1073,6 +1073,7 @@ def _node_to_dict(node: AnyTreeNode) -> dict:
         d["context_block_ids"] = node.context_block_ids
         d["context_blocks_enabled"] = node.context_blocks_enabled
         d["attachment_paths"] = node.attachment_paths
+        d["mounts"] = node.mounts
     elif isinstance(node, MessageNode):
         d["message_id"] = node.message_id
         d["role"] = node.role
@@ -1088,6 +1089,7 @@ def _node_to_dict(node: AnyTreeNode) -> dict:
         d["context_block_ids"] = node.context_block_ids
         d["context_blocks_enabled"] = node.context_blocks_enabled
         d["attachment_paths"] = node.attachment_paths
+        d["mounts"] = node.mounts
         d["is_fork_point"] = node.is_fork_point
         d["fork_branch_count"] = node.fork_branch_count
         d["fork_current_index"] = node.fork_current_index
@@ -1118,6 +1120,7 @@ def _dict_to_node(d: dict) -> AnyTreeNode:
             context_block_ids=d.get("context_block_ids", []),
             context_blocks_enabled=d.get("context_blocks_enabled", True),
             attachment_paths=d.get("attachment_paths", []),
+            mounts=d.get("mounts", []),
         )
     elif node_type == "message":
         return MessageNode(
@@ -1139,6 +1142,7 @@ def _dict_to_node(d: dict) -> AnyTreeNode:
             context_block_ids=d.get("context_block_ids", []),
             context_blocks_enabled=d.get("context_blocks_enabled", True),
             attachment_paths=d.get("attachment_paths", []),
+            mounts=d.get("mounts", []),
             is_fork_point=d.get("is_fork_point", False),
             fork_branch_count=d.get("fork_branch_count", 0),
             fork_current_index=d.get("fork_current_index", 0),

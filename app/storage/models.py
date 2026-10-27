@@ -55,6 +55,11 @@ class Message:
     is_thinking: bool = False
     created_at: datetime = field(default_factory=utcnow)
     token_count: int = 0        # 预估 token 数，由 Core 层写入
+    # 消息附件（仅 user 消息）：[{"name": str, "text": str}, ...]。
+    # 文本直接存在消息行里，寿命跟随消息——删消息即删附件，不需要 GC、
+    # 不需要挂载表。content 只放用户自己写的字，附件在 build_llm_context
+    # 时展开，绝不拼回 content（否则 regenerate 会重复注入）。
+    attachments: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -224,7 +229,12 @@ class FolderNode(TreeNode):
     """
     context_block_ids: list[str] = field(default_factory=list)
     context_blocks_enabled: bool = True   # 节点上下文块是否启用（禁用后"+"变半透明、不注入）
+    # 旧式附件：只记路径、每次从磁盘重读。新挂载一律走 mounts（快照）。
     attachment_paths: list[str] = field(default_factory=list)
+    # 文件快照挂载（D2）：[{"blob_id", "name", "size", "mtime", "sha256",
+    # "added_at", "source_path"}]。内容存在 data/files/<sha256>，
+    # 祖先链继承；文件被删被移都不影响已挂载内容。
+    mounts: list[dict] = field(default_factory=list)
     node_type: NodeType = field(default=NodeType.FOLDER, init=False)
 
 
@@ -240,7 +250,8 @@ class ConversationNode(TreeNode):
     message_count: int = 0
     context_block_ids: list[str] = field(default_factory=list)
     context_blocks_enabled: bool = True   # 节点上下文块是否启用
-    attachment_paths: list[str] = field(default_factory=list)
+    attachment_paths: list[str] = field(default_factory=list)   # 旧式附件（路径）
+    mounts: list[dict] = field(default_factory=list)            # 文件快照挂载（D2）
     node_type: NodeType = field(default=NodeType.CONVERSATION, init=False)
 
 

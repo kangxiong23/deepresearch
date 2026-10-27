@@ -71,6 +71,8 @@ def initialize_database() -> None:
         conn.executescript(_DDL)
         # 旧版 fork_nodes（无 role 列）补列 —— SQLite 不支持 ADD COLUMN IF NOT EXISTS
         _ensure_column(conn, "fork_nodes", "role", "TEXT NOT NULL DEFAULT ''")
+        # 消息附件列（老库没有）。NULL = 无附件，代码里用 or [] 兜底。
+        _ensure_column(conn, "messages", "attachments", "TEXT")
 
     # 检测是否需要迁移
     _migrate_if_needed(conn)
@@ -91,11 +93,25 @@ CREATE TABLE IF NOT EXISTS messages (
     content         TEXT NOT NULL DEFAULT '',
     is_thinking     INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL,
-    token_count     INTEGER NOT NULL DEFAULT 0
+    token_count     INTEGER NOT NULL DEFAULT 0,
+    attachments     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation
     ON messages (conversation_id, created_at);
+
+-- 工具读取记录（D3）：只追加、按对话裁剪。不塞 tree.json ——
+-- tree 每次改动全量重写，而这是只追加的日志，形状不对。
+CREATE TABLE IF NOT EXISTS file_reads (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    path            TEXT NOT NULL,
+    start_line      INTEGER NOT NULL DEFAULT 0,
+    end_line        INTEGER NOT NULL DEFAULT 0,
+    at              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_reads_conv
+    ON file_reads (conversation_id, id);
 
 -- 分叉功能（tree.json = 工作副本，fork_nodes/branch_nodes = 归档库）
 CREATE TABLE IF NOT EXISTS fork_nodes (

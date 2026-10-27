@@ -79,6 +79,9 @@ def make_service(llm, tools=None) -> ConversationService:
     svc._llm = llm
     svc._stop_event = asyncio.Event()
     svc._file_tools = tools
+    svc._read_log = None
+    svc._memory_reads = {}
+    svc._blobs = None
     return svc
 
 
@@ -292,7 +295,9 @@ class TestSendMessageWiring(unittest.IsolatedAsyncioTestCase):
         svc._llm = llm
         svc._stop_event = asyncio.Event()
         svc._file_tools = FileToolService()
-        svc._last_reads = {}
+        svc._read_log = None
+        svc._memory_reads = {}
+        svc._blobs = None
         svc._tree = StubTree(node)
         svc._msg_repo = StubRepo()
         svc._branch_svc = StubBranch()
@@ -330,7 +335,7 @@ class TestSendMessageWiring(unittest.IsolatedAsyncioTestCase):
 
     async def test_breadcrumb_prepended_to_user_message(self) -> None:
         svc = self.make(FakeLLM([[text("hi", done=True)]]))
-        svc._last_reads["conv-1"] = [
+        svc._memory_reads["conv-1"] = [
             {"tool": "read_file", "path": r"D:\x\预算.md", "lines": [1, 40]}
         ]
         with ConfigScope(file_access_enabled=False, file_access_roots=[]):
@@ -348,7 +353,7 @@ class TestSendMessageWiring(unittest.IsolatedAsyncioTestCase):
 
     async def test_breadcrumb_dedupes_and_caps(self) -> None:
         svc = self.make(FakeLLM([[text("hi", done=True)]]))
-        svc._last_reads["conv-1"] = [
+        svc._memory_reads["conv-1"] = [
             {"tool": "read_file", "path": f"D:\\x\\f{i}.md", "lines": [1, 2]}
             for i in range(20)
         ]
@@ -449,7 +454,9 @@ class TestRegenerateWithTools(unittest.IsolatedAsyncioTestCase):
         if stop:
             svc._stop_event.set()
         svc._file_tools = FileToolService()
-        svc._last_reads = {}
+        svc._read_log = None
+        svc._memory_reads = {}
+        svc._blobs = None
         svc._tree = StubTreeMap({"conv-1": conv, "asst-1": asst})
         svc._branch_svc = StubBranchLog()
         svc._context_svc = StubContext()
@@ -478,7 +485,7 @@ class TestRegenerateWithTools(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(shutil.rmtree, root, True)
 
         svc = self.make(FakeLLM([[text("好", done=True)]]))
-        svc._last_reads["conv-1"] = [
+        svc._memory_reads["conv-1"] = [
             {"tool": "read_file", "path": r"D:\x\a.md", "lines": [1, 2]}
         ]
         with ConfigScope(file_access_enabled=True, file_access_roots=[root]):
@@ -546,9 +553,12 @@ class TestResendWithTools(unittest.IsolatedAsyncioTestCase):
         svc._llm = FakeLLM([[text("好", done=True)]])
         svc._stop_event = asyncio.Event()
         svc._file_tools = FileToolService()
-        svc._last_reads = {"conv-1": [
+        svc._read_log = None
+        # 内存态读取记录（与 audit 条目同形）：面包屑应由它推导
+        svc._memory_reads = {"conv-1": [
             {"tool": "read_file", "path": r"D:\x\预算.md", "lines": [1, 9]}
         ]}
+        svc._blobs = None
         svc._tree = StubTreeMap({"conv-1": conv, "u-1": orig})
         svc._branch_svc = StubBranchLog()
         svc._context_svc = StubContext()

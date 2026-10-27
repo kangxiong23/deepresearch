@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import (
@@ -516,6 +517,9 @@ class ChatApp:
                 message_id=vm.id,
                 is_thinking=getattr(vm, "is_thinking", False),
             )
+            # 附件 chip：只显示文件名与字数，正文不进气泡
+            if getattr(vm, "attachments", None):
+                msg.set_attachments(vm.attachments)
             self._connect_message_signals(msg)
             # 分叉功能：被修改消息气泡下方显示 <m/n> 切换控件（3.5.1）
             if getattr(vm, "fork_n", 0) > 0:
@@ -736,8 +740,13 @@ class ChatApp:
         self._remove_incomplete_widgets()
         self._incomplete_message = None
 
-        # 追加用户消息
+        # 追加用户消息（附件在发送时已选好，先按文件名给出 chip；
+        # 解析失败的文件不会算作附件，下一次树刷新会以落库结果为准）
         user_msg = ChatMessage(role="user", content=text)
+        if files:
+            user_msg.set_attachments(
+                [{"name": os.path.basename(p) or p} for p in files]
+            )
         user_msg.message_id = ""  # 用户消息在流完成后由 tree refresh 更新
         self._connect_message_signals(user_msg)
         self._append_message(user_msg)
@@ -1108,6 +1117,11 @@ class ChatApp:
             if isinstance(w, ChatMessage) and w.message_id == original_user_id:
                 w.set_content(text)
                 w.set_translucent(False)
+                # 只有本次真的换了文件才刷新 chip；否则沿用原附件（后端同样保留）
+                if files:
+                    w.set_attachments(
+                        [{"name": os.path.basename(p) or p} for p in files]
+                    )
                 target_widget = w
                 target_idx = i
                 break
@@ -1994,12 +2008,17 @@ class ChatApp:
                 "支持的文件 (*.txt *.md *.json *.docx *.pdf);;所有文件 (*.*)",
             )
             if paths:
+                failures: list[str] = []
                 for nid in node_ids:
                     for p in paths:
                         try:
-                            self._ctrl.on_attach_file(nid, p)
+                            err = self._ctrl.on_attach_file(nid, p)
+                            if err:
+                                failures.append(err)
                         except Exception as exc:
                             print(f"[UI] Batch attach error for {nid}: {exc}")
+                            failures.append(str(exc))
+                self._report_attach_failures(failures)
                 QTimer.singleShot(0, self._load_tree)
 
     def _on_batch_move_nodes(self, dragged_ids_str: str, target_parent_id: str, position: object) -> None:
@@ -2053,9 +2072,33 @@ class ChatApp:
             "支持的文件 (*.txt *.md *.json *.docx *.pdf);;所有文件 (*.*)",
         )
         if paths:
+            failures: list[str] = []
             for p in paths:
-                self._ctrl.on_attach_file(folder_id, p)
+                err = self._ctrl.on_attach_file(folder_id, p)
+                if err:
+                    failures.append(err)
+            self._report_attach_failures(failures)
             QTimer.singleShot(0, self._load_tree)
+
+    def _report_attach_failures(self, failures: list[str]) -> None:
+        """
+        挂载失败要说出来（超限/不可读）。
+
+        以前"附件缺文件"是静默消失的，用户既不知道没挂上，也不知道为什么。
+        这里统一用一次性对话框列出原因，不逐条弹窗打断操作。
+        """
+        if not failures:
+            return
+        for msg in failures:
+            print(f"[UI] 挂载失败: {msg}")
+        unique = list(dict.fromkeys(failures))
+        QMessageBox.warning(
+            self._window,
+            "部分文件未挂载",
+            "\n".join(unique[:10])
+            + ("\n…" if len(unique) > 10 else "")
+            + "\n\n文件超过上限时建议先拆分，或改用消息附件发送。",
+        )
 
     # ── Sidebar 顶部按钮 ─────────────────────
 

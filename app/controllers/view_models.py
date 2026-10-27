@@ -37,6 +37,9 @@ class MessageVM:
     fork_m: int = 0             # 当前分支展示编号（1 起；0 = 非被修改节点）
     fork_n: int = 0             # 分叉点下分支总数
     fork_point_id: str = ""     # 分叉点 ID（<m/n> 控件切换目标）
+    # 消息附件（仅名字 + 字符数）：[{"name": str, "chars": int}]。
+    # 附件正文不上界面，只用于气泡上的 chip 展示。
+    attachments: list[dict] = field(default_factory=list)
 
 
 # ──────────────────────────────────────────────

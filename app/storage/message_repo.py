@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 
@@ -59,12 +60,15 @@ class MessageRepo:
             conn.execute(
                 """
                 INSERT INTO messages
-                    (id, conversation_id, role, content, is_thinking, created_at, token_count)
+                    (id, conversation_id, role, content, is_thinking, created_at,
+                     token_count, attachments)
                 VALUES
-                    (:id, :conv_id, :role, :content, :is_thinking, :created_at, :token_count)
+                    (:id, :conv_id, :role, :content, :is_thinking, :created_at,
+                     :token_count, :attachments)
                 ON CONFLICT(id) DO UPDATE SET
                     content     = excluded.content,
-                    token_count = excluded.token_count
+                    token_count = excluded.token_count,
+                    attachments = excluded.attachments
                 """,
                 {
                     "id":          message.id,
@@ -74,6 +78,7 @@ class MessageRepo:
                     "is_thinking": int(message.is_thinking),
                     "created_at":  _dt_to_str(message.created_at),
                     "token_count": message.token_count,
+                    "attachments": _dump_attachments(message.attachments),
                 },
             )
 
@@ -196,7 +201,37 @@ class MessageRepo:
 # Row → 领域对象映射（模块私有）
 # ──────────────────────────────────────────────
 
+def _dump_attachments(attachments: list[dict] | None) -> str | None:
+    """把附件列表序列化为 JSON 列（空列表存 NULL，保持老库形态一致）。"""
+    if not attachments:
+        return None
+    return json.dumps(attachments, ensure_ascii=False)
+
+
+def _load_attachments(raw) -> list[dict]:
+    """把 JSON 列还原为附件列表；脏数据一律降级为空列表，不让它拖垮历史加载。"""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    result: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        text = item.get("text")
+        if isinstance(name, str) and isinstance(text, str):
+            result.append({"name": name, "text": text})
+    return result
+
+
 def _row_to_message(row: sqlite3.Row) -> Message:
+    # attachments 列是后加的：未迁移的老库/老测试建的表里可能没有它。
+    keys = row.keys()
     return Message(
         id=row["id"],
         conversation_id=row["conversation_id"],
@@ -205,4 +240,5 @@ def _row_to_message(row: sqlite3.Row) -> Message:
         is_thinking=bool(row["is_thinking"]),
         created_at=_str_to_dt(row["created_at"]),
         token_count=row["token_count"],
+        attachments=_load_attachments(row["attachments"] if "attachments" in keys else None),
     )

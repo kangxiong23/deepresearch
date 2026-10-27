@@ -23,7 +23,8 @@ class PlainTextParser:
     def can_parse(self, filename: str) -> bool:
         return _ext(filename) in self._EXTENSIONS
 
-    async def extract_text(self, file_path: str) -> str:
+    def extract_text_sync(self, file_path: str) -> str:
+        """同步版本：供上下文构建等同步路径复用，语义与 extract_text 相同。"""
         import os
         if not file_path or not os.path.exists(file_path):
             print(f"[FileParser] 文件不存在或路径为空: {repr(file_path)}")
@@ -34,6 +35,9 @@ class PlainTextParser:
         except OSError as e:
             print(f"[FileParser] 读取失败: {file_path} -> {e}")
             return ""
+
+    async def extract_text(self, file_path: str) -> str:
+        return self.extract_text_sync(file_path)
 
 
 # ──────────────────────────────────────────────
@@ -46,13 +50,16 @@ class JsonParser:
     def can_parse(self, filename: str) -> bool:
         return _ext(filename) == ".json"
 
-    async def extract_text(self, file_path: str) -> str:
+    def extract_text_sync(self, file_path: str) -> str:
         try:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
             return json.dumps(data, ensure_ascii=False, indent=2)
         except (OSError, json.JSONDecodeError):
             return ""
+
+    async def extract_text(self, file_path: str) -> str:
+        return self.extract_text_sync(file_path)
 
 
 # ──────────────────────────────────────────────
@@ -65,7 +72,7 @@ class DocxParser:
     def can_parse(self, filename: str) -> bool:
         return _ext(filename) == ".docx"
 
-    async def extract_text(self, file_path: str) -> str:
+    def extract_text_sync(self, file_path: str) -> str:
         try:
             import docx  # python-docx
         except ImportError:
@@ -93,6 +100,9 @@ class DocxParser:
         except Exception:
             return ""
 
+    async def extract_text(self, file_path: str) -> str:
+        return self.extract_text_sync(file_path)
+
 
 # ──────────────────────────────────────────────
 # PDF
@@ -104,7 +114,7 @@ class PdfParser:
     def can_parse(self, filename: str) -> bool:
         return _ext(filename) == ".pdf"
 
-    async def extract_text(self, file_path: str) -> str:
+    def extract_text_sync(self, file_path: str) -> str:
         try:
             import pdfplumber
         except ImportError:
@@ -120,6 +130,9 @@ class PdfParser:
             return "\n\n".join(pages)
         except Exception:
             return ""
+
+    async def extract_text(self, file_path: str) -> str:
+        return self.extract_text_sync(file_path)
 
 
 # ──────────────────────────────────────────────

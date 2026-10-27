@@ -182,6 +182,36 @@ class MessageRepoProtocol(Protocol):
 
 
 # ──────────────────────────────────────────────
+# 工具读取记录接口（D3）
+# ──────────────────────────────────────────────
+
+@runtime_checkable
+class FileReadLogProtocol(Protocol):
+    """
+    工具读取记录抽象（只追加、按对话裁剪）。
+    实现者：app/storage/read_log_store.py
+    """
+
+    def append(
+        self,
+        conversation_id: str,
+        path: str,
+        start_line: int = 0,
+        end_line: int = 0,
+    ) -> None:
+        """追加一条读取记录。"""
+        ...
+
+    def recent(self, conversation_id: str, limit: int = 0) -> list[dict]:
+        """返回最近读取记录（新的在前）。"""
+        ...
+
+    def delete_by_conversation(self, conversation_id: str) -> int:
+        """删除某对话的全部读取记录。"""
+        ...
+
+
+# ──────────────────────────────────────────────
 # 上下文存储接口
 # ──────────────────────────────────────────────
 

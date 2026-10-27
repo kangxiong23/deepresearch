@@ -61,6 +61,11 @@ _defaults: dict = {
         "KG_STORE_PATH",
         str(Path(__file__).parent / "data" / "knowledge_graph"),
     ),
+    # 节点挂载的文件快照目录（内容寻址：<sha256> 原始字节 + <sha256>.txt 解析缓存）
+    "FILES_STORE_PATH": os.getenv(
+        "FILES_STORE_PATH",
+        str(Path(__file__).parent / "data" / "files"),
+    ),
     # 当前使用的模型 ID
     # UI 写入：app_config.model_type = "deepseek-v4-pro"
     # 后端读取：model = app_config.model_type

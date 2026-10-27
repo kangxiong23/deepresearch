@@ -28,6 +28,7 @@ class TempConfigTestCase(unittest.TestCase):
             TREE_STORE_PATH=os.path.join(self._tmpdir, "tree"),
             CONTEXT_STORE_PATH=os.path.join(self._tmpdir, "context"),
             KG_STORE_PATH=os.path.join(self._tmpdir, "kg"),
+            FILES_STORE_PATH=os.path.join(self._tmpdir, "files"),
         )
         self._scope.__enter__()
         initialize_database()

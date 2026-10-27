@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import os
+
 import markdown as _md_lib
 
 from PySide6.QtWidgets import (
@@ -478,6 +480,69 @@ class _BubbleTail(QWidget):
         p.drawPolygon(points)
 
 
+
+# ──────────────────────────────────────────────
+# 附件 chip（消息附件的外显）
+# ──────────────────────────────────────────────
+
+
+class _AttachmentChip(QFrame):
+    """
+    单个附件标签：📎 文件名。
+
+    正文不渲染进气泡——附件文本只进模型上下文（messages.attachments 列），
+    界面上只给一个"这条消息带了哪些资料"的凭据。
+    """
+
+    def __init__(
+        self,
+        name: str,
+        chars: int = 0,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        apply_style(self, lambda: f"""
+            QFrame {{
+                background-color: {Colors.BG_OVERLAY};
+                border: 1px solid {Colors.BORDER};
+                border-radius: {Radius.SM}px;
+            }}
+        """)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 2, 6, 2)
+        layout.setSpacing(4)
+
+        text = "📎 " + _elide_name(name)
+        label = QLabel(text)
+        label.setFont(Fonts.body(Fonts.SIZE_XS))
+        apply_style(label, lambda: f"""
+            QLabel {{
+                color: {Colors.TEXT_SECONDARY};
+                background-color: transparent;
+                border: none;
+            }}
+        """)
+        layout.addWidget(label)
+
+        tip = name
+        if chars > 0:
+            tip += "\n约 " + f"{chars:,}" + " 字（已随消息保存）"
+        else:
+            tip += "\n（已随消息保存）"
+        self.setToolTip(tip)
+
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+
+
+def _elide_name(name: str, limit: int = 28) -> str:
+    """文件名过长时中间保留扩展名地截断，避免撑破气泡。"""
+    if len(name) <= limit:
+        return name
+    keep_head = limit - 10
+    return name[:keep_head] + "…" + name[-8:]
+
+
 class ChatMessage(QFrame):
     """
     单条消息气泡。与原 Flet 版本 ChatMessage 视觉完全一致。
@@ -509,6 +574,7 @@ class ChatMessage(QFrame):
         message_id: str = "",
         is_thinking: bool = False,
         parent: QWidget | None = None,
+        attachments: list[dict] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("chatMessage")
@@ -572,6 +638,24 @@ class ChatMessage(QFrame):
         # （此时 viewport().width() 为 0，计算出的高度无效）
         if content:
             self._content_browser.setHtml(_render_markdown(content))
+
+        # ── 附件标签行（仅带附件的 user 消息显示）─────
+        self._attachments_widget = QWidget()
+        self._attachments_widget.setStyleSheet(
+            "QWidget { background-color: transparent; }"
+        )
+        self._attachments_layout = QHBoxLayout(self._attachments_widget)
+        self._attachments_layout.setContentsMargins(0, 0, 0, 0)
+        self._attachments_layout.setSpacing(Spacing.XS)
+        self._attachments_layout.addStretch()
+        self._attachments_widget.setVisible(False)
+
+        self._basenames: list[str] = [
+            os.path.basename(p) or p for p in (attachments or [])
+        ]
+        self._attachment_details: list[dict] = []
+        if self._basenames:
+            self.set_attachments([{"name": n} for n in self._basenames])
 
         # ── 操作按钮行（单行；user 靠右，assistant 靠左）─────
         self._action_widget = QWidget()
@@ -644,6 +728,7 @@ class ChatMessage(QFrame):
         bubble_vbox.setSpacing(Spacing.SM)
         bubble_vbox.addLayout(badge_row)
         bubble_vbox.addWidget(self._content_browser)
+        bubble_vbox.addWidget(self._attachments_widget)
         bubble_vbox.addWidget(self._action_widget)
         # 气泡水平方向撑满 stack（stack 宽度由 _update_bubble_width 按内容设定）
         self._bubble.setSizePolicy(
@@ -948,6 +1033,44 @@ class ChatMessage(QFrame):
         self._is_incomplete = False
         self._stream_buffer = ""
         self._update_action_visibility()
+
+    def set_attachments(self, attachments: list[dict] | None) -> None:
+        """
+        设置/刷新附件 chip（仅名字 + 字符数）。
+
+        只展示"这条消息带了哪些资料"，绝不渲染正文：附件文本在
+        messages.attachments 里，只有构建 LLM 上下文时才展开。
+        复制按钮因此只复制用户自己写的字。
+        """
+        items: list[dict] = []
+        for att in (attachments or []):
+            name = str((att or {}).get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                chars = int((att or {}).get("chars") or 0)
+            except (TypeError, ValueError):
+                chars = 0
+            items.append({"name": name, "chars": chars})
+
+        self._attachment_details = items
+
+        # 清空旧 chip（保留末尾 stretch）
+        while self._attachments_layout.count() > 1:
+            item = self._attachments_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for att in items:
+            chip = _AttachmentChip(att["name"], att["chars"])
+            self._attachments_layout.insertWidget(
+                self._attachments_layout.count() - 1, chip
+            )
+
+        self._attachments_widget.setVisible(bool(items))
+        # 构造期（__init__ 里首次设置）气泡堆尚未建好，高度在 showEvent 后重算
+        if getattr(self, "_bubble_stack", None) is not None:
+            self._update_content_height()
 
     def set_status(self, text: str) -> None:
         """在正文上方显示一行临时状态（工具调用进度）。

@@ -443,6 +443,11 @@ class AppController:
             content=domain_obj.content,
             is_thinking=getattr(domain_obj, "is_thinking", False),
             created_at=_format_datetime(getattr(domain_obj, "created_at", None)),
+            attachments=[
+                {"name": str(a.get("name") or ""), "chars": len(a.get("text") or "")}
+                for a in (getattr(domain_obj, "attachments", None) or [])
+                if str(a.get("name") or "")
+            ],
         )
 
     @staticmethod
@@ -854,7 +859,7 @@ class AppController:
                     depth=depth,
                     context_block_count=len(getattr(node, "context_block_ids", [])),
                     context_blocks_enabled=bool(getattr(node, "context_blocks_enabled", True)),
-                    attachment_count=len(getattr(node, "attachment_paths", [])),
+                    attachment_count=_attachment_count(node),
                 )
             else:  # ConversationNode
                 vm = TreeNodeVM(
@@ -871,7 +876,7 @@ class AppController:
                     message_count=getattr(node, "message_count", 0),
                     context_block_count=len(getattr(node, "context_block_ids", [])),
                     context_blocks_enabled=bool(getattr(node, "context_blocks_enabled", True)),
-                    attachment_count=len(getattr(node, "attachment_paths", [])),
+                    attachment_count=_attachment_count(node),
                 )
             result.append(vm)
 
@@ -1049,13 +1054,18 @@ class AppController:
             "context_block_ids": list(getattr(node, "context_block_ids", [])),
         }
 
-    def on_attach_file(self, folder_id: str, file_path: str) -> None:
-        """UI 调用：挂载附件到目录。"""
-        self._conversation_svc.attach_file(folder_id, file_path)
+    def on_attach_file(self, folder_id: str, file_path: str) -> str:
+        """
+        UI 调用：挂载附件到目录（快照）。
 
-    def on_detach_file(self, folder_id: str, file_path: str) -> None:
-        """UI 调用：从目录移除附件。"""
-        self._conversation_svc.detach_file(folder_id, file_path)
+        Returns:
+            空串 = 成功；非空 = 给用户看的失败原因（超限/不可读）
+        """
+        return self._conversation_svc.attach_file(folder_id, file_path)
+
+    def on_detach_file(self, folder_id: str, file_path: str) -> str:
+        """UI 调用：从目录移除附件（路径 / 展示名 / blob_id 均可）。"""
+        return self._conversation_svc.detach_file(folder_id, file_path)
 
     def on_list_trash(self) -> list[TrashEntryVM]:
         """UI 调用：列出回收站所有条目。"""
@@ -1095,6 +1105,15 @@ class AppController:
 # ──────────────────────────────────────────────
 # 模块级辅助（不含业务知识，仅格式化）
 # ──────────────────────────────────────────────
+
+def _attachment_count(node) -> int:
+    """节点的附件总数：新式快照挂载 + 旧式路径附件（去重按 blob_id）。"""
+    mounts = getattr(node, "mounts", None) or []
+    paths = getattr(node, "attachment_paths", None) or []
+    blob_ids = {str((m or {}).get("blob_id") or "") for m in mounts}
+    blob_ids.discard("")
+    return len(blob_ids) + len(paths)
+
 
 def _format_datetime(dt) -> str:
     """将 datetime 对象格式化为展示字符串，dt 为 None 时返回空串。"""

@@ -21,6 +21,8 @@ from app.storage.message_repo import MessageRepo
 from app.storage.tree_store import TreeStore
 from app.storage.branch_store import BranchStore
 from app.storage.context_store import ContextStore
+from app.storage.read_log_store import ReadLogStore
+from app.storage.blob_store import FileBlobStore
 
 # ── 适配器 ────────────────────────────────────
 from app.adapters.deepseek_client import DeepSeekClient
@@ -87,6 +89,8 @@ def assemble_app() -> ChatApp:
     branch_store  = BranchStore()
     context_store = ContextStore()
     kg_store      = KGStore()
+    read_log      = ReadLogStore()
+    blob_store    = FileBlobStore()
 
     # ── 3. Adapter 层 ─────────────────────────
     llm_client      = DeepSeekClient()
@@ -97,10 +101,13 @@ def assemble_app() -> ChatApp:
     ]
 
     # ── 4. Core 服务层 ────────────────────────
+    # file_service 与 blob_store 在下面构造，先组装再回填到 ContextService
+    # （ContextService 需要解析器读挂载快照、需要仓库定位字节）
     context_service = ContextService(
         message_repo=message_repo,
         context_store=context_store,
         tree_store=tree_store,
+        blob_store=blob_store,
     )
     search_service = SearchService(
         adapters=search_adapters,
@@ -108,6 +115,7 @@ def assemble_app() -> ChatApp:
     file_service = FileService(
         parsers=file_parsers,
     )
+    context_service.set_file_service(file_service)
     # 本地文件只读访问（工具调用）。默认关闭：config.file_access_enabled=False
     # 与空授权目录共同保证"未启用时请求体里不出现 tools"。
     file_tool_service = FileToolService()
@@ -125,6 +133,8 @@ def assemble_app() -> ChatApp:
         file_service=file_service,
         branch_service=branch_service,
         file_tools=file_tool_service,
+        read_log=read_log,
+        blob_store=blob_store,
     )
 
     # ── 4b. 知识图谱服务 ──────────────────────

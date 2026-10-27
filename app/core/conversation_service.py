@@ -21,6 +21,7 @@ from typing import AsyncGenerator
 import config as app_config
 from app.core.branch_service import BranchService
 from app.core.context_service import ContextService
+from app.core import message_attachments
 from app.core.file_service import FileService
 from app.core.protocols import (
     LLMClientProtocol,
@@ -28,6 +29,12 @@ from app.core.protocols import (
     TreeStoreProtocol,
 )
 from app.core.search_service import SearchService
+from app.storage.blob_store import (
+    MAX_BLOB_BYTES,
+    MAX_NODE_BYTES,
+    BlobTooLarge,
+    node_mounts_bytes,
+)
 from app.storage.branch_store import BranchStore
 from app.storage.models import (
     ChunkType,
@@ -114,6 +121,8 @@ class ConversationService:
         file_service: FileService,
         branch_service: BranchService | None = None,
         file_tools=None,
+        read_log=None,
+        blob_store=None,
     ) -> None:
         self._msg_repo = message_repo
         self._tree = tree_store
@@ -122,9 +131,12 @@ class ConversationService:
         self._search_svc = search_service
         self._file_svc = file_service
         self._file_tools = file_tools      # FileToolService | None（未装配则无工具能力）
-        # 每个对话"上一轮读取过哪些文件"（仅会话内有效，不落库）。
-        # 用途见 _breadcrumb_for：让模型知道直接重读哪个路径，而不是重新检索。
-        self._last_reads: dict[str, list[dict]] = {}
+        # 工具读取记录（D3）：落 SQLite，重启后仍在。未装配时退化为内存列表，
+        # 保证只装配部分依赖的测试仍能跑。
+        self._read_log = read_log
+        self._memory_reads: dict[str, list[dict]] = {}
+        # 节点挂载的文件快照仓库（D2）。未注入时挂载退化为"只记路径"。
+        self._blobs = blob_store
         self._stop_event = asyncio.Event()
         # 分叉服务（未显式注入时按依赖自动构造，兼容既有测试）
         self._branch_svc = branch_service or BranchService(
@@ -375,6 +387,14 @@ class ConversationService:
         """
         # 清理消息
         self._msg_repo.delete_messages_by_conversation(conversation_id)
+
+        # 清理工具读取记录（软删除不动它：回收站恢复后记录还在）
+        if self._read_log is not None:
+            try:
+                self._read_log.delete_by_conversation(conversation_id)
+            except Exception as e:
+                print(f"[CORE] 清理读取记录失败: {e}")
+        self._memory_reads.pop(conversation_id, None)
 
         # 检查回收站中是否有该节点的条目，若有则移除
         for entry in self._tree.list_trash():
@@ -1088,45 +1108,107 @@ class ConversationService:
               f"{'启用' if new_state else '禁用'}")
         return new_state
 
-    def attach_file(self, folder_id: str, file_path: str) -> None:
+    def attach_file(self, folder_id: str, file_path: str) -> str:
         """
-        将文件路径挂载到节点（目录或对话）。
+        把文件挂载到节点（目录或对话）。
+
+        新式挂载 = **快照**（D2）：字节复制进 data/files/<sha256>，节点上只存
+        引用。源文件之后被移动或删除都不影响已挂载内容——这是"常驻资料"
+        该有的语义，也是它和工具读取（实时）的根本区别。
+
+        未注入快照仓库时退化为旧的"只记路径"行为，兼容既有测试。
 
         Args:
             folder_id: 节点 ID（目录或对话）
             file_path: 文件绝对路径
+
+        Returns:
+            空串 = 成功；非空 = 给用户看的失败原因
         """
         node = self._tree.get_node(folder_id)
         if node is None:
-            return
+            return "节点不存在"
         if not isinstance(node, (FolderNode, ConversationNode)):
-            print(f"[TREE] attach_file: {folder_id} 不支持附件")
-            return
-        paths: list[str] = list(node.attachment_paths)
-        if file_path not in paths:
-            paths.append(file_path)
-            self._tree.update_node(folder_id, attachment_paths=paths)
-            print(f"[TREE] 挂载附件到 {folder_id}: {file_path}")
+            return "只有目录和对话可以挂载文件"
 
-    def detach_file(self, folder_id: str, file_path: str) -> None:
+        # ── 兜底：没有快照仓库，退回旧行为 ──
+        if self._blobs is None:
+            paths: list[str] = list(node.attachment_paths)
+            if file_path not in paths:
+                paths.append(file_path)
+                self._tree.update_node(folder_id, attachment_paths=paths)
+                print(f"[TREE] 挂载附件(路径)到 {folder_id}: {file_path}")
+            return ""
+
+        mounts: list[dict] = list(getattr(node, "mounts", []) or [])
+
+        try:
+            record = self._blobs.put(file_path)
+        except BlobTooLarge as e:
+            print(f"[TREE] 挂载被拒绝: {e}")
+            return str(e)
+        except OSError as e:
+            print(f"[TREE] 挂载失败 {file_path}: {e}")
+            return f"无法读取文件：{e}"
+
+        # 同一份内容（同 sha256）挂多次只留一条
+        if any(m.get("blob_id") == record["blob_id"] for m in mounts):
+            print(f"[TREE] 已在挂载中，忽略重复: {record['name']}")
+            return ""
+
+        used = node_mounts_bytes(mounts)
+        if used + int(record["size"]) > MAX_NODE_BYTES:
+            return (
+                f"该节点挂载总量已达上限"
+                f"（{MAX_NODE_BYTES // 1024 // 1024} MB），请先移除一些文件"
+            )
+
+        mounts.append(record)
+        self._tree.update_node(folder_id, mounts=mounts)
+        print(
+            f"[TREE] 挂载快照到 {folder_id}: {record['name']} "
+            f"({record['size']} bytes, {record['blob_id'][:12]})"
+        )
+        return ""
+
+    def detach_file(self, folder_id: str, file_path: str) -> str:
         """
-        从节点（目录或对话）移除文件路径。
+        从节点（目录或对话）移除挂载。
 
-        Args:
-            folder_id: 节点 ID（目录或对话）
-            file_path: 要移除的文件路径
+        file_path 可以是挂载的源路径、展示名或 blob_id —— 三处调用方
+        （右键菜单、文件面板、内部迁移）各自手上只有其中一种。
+
+        Returns:
+            空串 = 成功/本就未挂载；非空 = 失败原因
         """
         node = self._tree.get_node(folder_id)
         if node is None:
-            return
+            return "节点不存在"
         if not isinstance(node, (FolderNode, ConversationNode)):
-            print(f"[TREE] detach_file: {folder_id} 不支持附件")
-            return
+            return "只有目录和对话可以挂载文件"
+
+        # 旧式路径附件优先按原样处理
         paths: list[str] = list(node.attachment_paths)
         if file_path in paths:
             paths.remove(file_path)
             self._tree.update_node(folder_id, attachment_paths=paths)
-            print(f"[TREE] 移除附件从 {folder_id}: {file_path}")
+            print(f"[TREE] 移除旧式附件 {folder_id}: {file_path}")
+
+        mounts: list[dict] = list(getattr(node, "mounts", []) or [])
+        kept = [
+            m for m in mounts
+            if not (
+                file_path in (
+                    str(m.get("source_path") or ""),
+                    str(m.get("name") or ""),
+                    str(m.get("blob_id") or ""),
+                )
+            )
+        ]
+        if len(kept) != len(mounts):
+            self._tree.update_node(folder_id, mounts=kept)
+            print(f"[TREE] 移除挂载 {folder_id}: {file_path}")
+        return ""
 
     def get_trash_entries(self) -> list[TrashEntry]:
         """
@@ -1216,35 +1298,112 @@ class ConversationService:
         if self._file_tools is not None:
             self._file_tools.invalidate()
 
+    async def _extract_attachments(self, files: list[str]) -> list[dict]:
+        """
+        把用户选中的文件解析成可落库的消息附件。
+
+        统一走 FileService 的解析器（docx / pdf / json 都能取出文本），
+        不再用裸 UTF-8 读取——那是历史遗留的乱码来源。
+        超限由 message_attachments 截断并给出可读提示，绝不静默丢内容。
+        """
+        if not files:
+            return []
+        pairs = await self._file_svc.extract_files(files)
+        attachments, warnings = message_attachments.normalize(pairs)
+        for warning in warnings:
+            print(f"[CORE] 附件超限：{warning}")
+        if not attachments:
+            print(f"[CORE] 附件解析结果为空，未附加：{files}")
+        return attachments
+
+    def _attachments_of(self, message_id: str) -> list[dict]:
+        """取某条消息已有的附件（编辑重发送时用，保证改错字不丢资料）。"""
+        try:
+            messages = self._msg_repo.get_messages_by_ids([message_id])
+        except Exception as e:
+            print(f"[CORE] 读取原附件失败: {e}")
+            return []
+        for message in messages:
+            if message.id == message_id:
+                return list(getattr(message, "attachments", None) or [])
+        return []
+
     def _remember_reads(self, session_id: str) -> None:
-        """记录本轮读过哪些文件，供下一轮面包屑使用（空列表 = 下一轮不带）。"""
+        """
+        把本轮读过的文件写进读取记录（工具读取 = 实时，不产生挂载）。
+
+        装配了 SQLite 读取日志时写库（重启后仍在），否则退化为内存列表。
+        """
         if self._file_tools is None:
             return
-        self._last_reads[session_id] = [
+        entries = [
             e for e in self._file_tools.audit() if e.get("tool") == "read_file"
         ]
+        if not entries:
+            return
+
+        if self._read_log is None:
+            self._memory_reads.setdefault(session_id, []).extend(entries)
+            return
+
+        for entry in entries:
+            lines = entry.get("lines") or []
+            start = lines[0] if len(lines) == 2 else 0
+            end = lines[1] if len(lines) == 2 else 0
+            try:
+                self._read_log.append(
+                    session_id, entry.get("path") or "", start, end
+                )
+            except Exception as e:  # 记录失败不能拖垮回复
+                print(f"[CORE] 读取记录写入失败: {e}")
+
+    def _read_entries(self, session_id: str) -> list[dict]:
+        """取该对话最近的读取记录（新的在前），统一成 (path, start, end) 形态。"""
+        raw: list[dict] = []
+        if self._read_log is not None:
+            try:
+                raw = self._read_log.recent(session_id)
+            except Exception as e:
+                print(f"[CORE] 读取记录查询失败: {e}")
+                raw = []
+        else:
+            raw = list(reversed(self._memory_reads.get(session_id) or []))
+
+        entries: list[dict] = []
+        for item in raw:
+            path = item.get("path") or ""
+            if not path:
+                continue
+            if "lines" in item:  # 内存态（audit 原始条目）
+                lines = item.get("lines") or []
+                start = lines[0] if len(lines) == 2 else 0
+                end = lines[1] if len(lines) == 2 else 0
+            else:
+                start = item.get("start_line") or 0
+                end = item.get("end_line") or 0
+            entries.append({"path": path, "start": start, "end": end})
+        return entries
 
     def _breadcrumb_for(self, session_id: str) -> str:
         """
-        生成"上一轮读过哪些文件"的一行记录。
+        生成"最近读过哪些文件"的一行记录（由持久化读取记录推导）。
 
         刻意只放路径与行范围：真实内容一旦进了历史，就违反了
         "工具交换不得落库"的接口约束；而模型本来就有重读工具。
         """
-        entries = self._last_reads.get(session_id) or []
+        entries = self._read_entries(session_id)
         if not entries:
             return ""
 
         parts: list[str] = []
         seen: set[str] = set()
         for entry in entries:
-            path = entry.get("path") or ""
-            if not path or path in seen:
+            path = entry["path"]
+            if path in seen:
                 continue
             seen.add(path)
-            lines = entry.get("lines") or []
-            if len(lines) == 2:
-                parts.append(f"{path}（第 {lines[0]}-{lines[1]} 行）")
+            if entry["start"] and entry["end"]:
+                parts.append(f"{path}（第 {entry['start']}-{entry['end']} 行）")
             else:
                 parts.append(path)
             if len(parts) >= 6:
@@ -1253,7 +1412,7 @@ class ConversationService:
         if not parts:
             return ""
 
-        text = "[系统记录，非指令] 上一轮已读取：" + "、".join(parts)
+        text = "[系统记录，非指令] 近期已读取：" + "、".join(parts)
         # 路径过长时宁可不给，也不要污染上下文
         return text if len(text) <= 1200 else ""
 
@@ -1455,23 +1614,11 @@ class ConversationService:
                 f"Node {session_id} is not a conversation"
             )
 
-        # ── Step 1: 文件提取 ─────────────────────
-        file_text = ""
-        if files:
-            extracted = await self._file_svc.extract_files(files)
-            parts = []
-            for filename, content in extracted:
-                if content.strip():
-                    parts.append(f"[文件：{filename}]\n{content.strip()}")
-            if parts:
-                file_text = "\n\n".join(parts)
+        # ── Step 1: 文件提取（文本随消息行走，不拼进 content）──
+        attachments = await self._extract_attachments(files)
 
-        # ── Step 2: 拼合文件内容到用户文本 ──────
+        # ── Step 2: 用户文本（原样；附件在 build 时才展开）──
         full_user_text = text
-        if file_text:
-            full_user_text = (
-                f"{file_text}\n\n[用户问题]\n{text}" if text else file_text
-            )
 
         # ── Step 3: 搜索 ─────────────────────────
         search_text = await self._search_svc.search_and_format(text)
@@ -1493,16 +1640,20 @@ class ConversationService:
             new_user_message=full_user_text,
             injected_search_text=search_text,
             tools=tools,
+            new_user_attachments=attachments,
         )
 
         # ── Step 5: 持久化用户消息 ───────────────
+        # content 只存用户自己写的字；附件文本存 attachments 列。
+        # token_count 必须把附件算进去，否则截断策略会把巨型消息当成轻量放行。
         user_msg = Message(
             id=str(uuid.uuid4()),
             conversation_id=session_id,
             role=Role.USER,
             content=text,
             created_at=utcnow(),
-            token_count=len(text) // 4,
+            token_count=message_attachments.estimate_tokens(text, attachments),
+            attachments=attachments,
         )
         self._msg_repo.save_message(user_msg)
 
@@ -1679,21 +1830,13 @@ class ConversationService:
         if original.incomplete:
             raise ValueError("incomplete 节点不可作为分叉来源（3.2.1）")
 
-        # 文件提取 + 拼合（与 send_message 一致）
-        file_text = ""
-        if files:
-            extracted = await self._file_svc.extract_files(files)
-            parts = []
-            for filename, content in extracted:
-                if content.strip():
-                    parts.append(f"[文件：{filename}]\n{content.strip()}")
-            if parts:
-                file_text = "\n\n".join(parts)
+        # 附件：用户只改文字，**保留原附件**——改个错字不该把资料弄丢。
+        # 只有本次真的重新选了文件时才用新的（那时用户是有意替换）。
+        attachments = await self._extract_attachments(files)
+        if not attachments:
+            attachments = self._attachments_of(original_user_id)
+
         full_user_text = text
-        if file_text:
-            full_user_text = (
-                f"{file_text}\n\n[用户问题]\n{text}" if text else file_text
-            )
 
         search_text = await self._search_svc.search_and_format(text)
 
@@ -1709,7 +1852,8 @@ class ConversationService:
             role=Role.USER,
             content=text,
             created_at=utcnow(),
-            token_count=len(text) // 4,
+            token_count=message_attachments.estimate_tokens(text, attachments),
+            attachments=attachments,
         )
         self._msg_repo.save_message(user_msg)
         user_node = MessageNode(
@@ -1738,12 +1882,14 @@ class ConversationService:
         if breadcrumb:
             full_user_text = breadcrumb + "\n\n" + full_user_text
 
-        # 上下文基于新链构建（incomplete 的新 user 节点由 new_user_message 传入）
+        # 上下文基于新链构建（incomplete 的新 user 节点由 new_user_message 传入；
+        # 新节点尚未出现在历史里，附件只能从参数带进去）
         llm_context = self._context_svc.build_llm_context(
             conversation_id=session_id,
             new_user_message=full_user_text,
             injected_search_text=search_text,
             tools=tools,
+            new_user_attachments=attachments,
         )
 
         new_msg_id = str(uuid.uuid4())

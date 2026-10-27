@@ -87,6 +87,64 @@ class FileService:
                 return parser
         return None
 
+    # ──────────────────────────────────────────
+    # 同步提取（上下文构建等同步路径用）
+    # ──────────────────────────────────────────
+
+    def extract_text_sync(self, path: str, filename: str | None = None) -> str:
+        """
+        同步提取单个文件的文本。
+
+        解析器都提供 extract_text_sync；老的自定义解析器若只有异步版本，
+        在没有运行中的事件循环时也能被驱动完成（它们内部不含 await）。
+        这样上下文构建（同步）与发送链路（异步）共用同一套解析器，
+        docx/pdf 不会再被当成裸 UTF-8 读出乱码。
+
+        Args:
+            path:     文件绝对路径
+            filename: 用于选解析器的文件名（默认取路径 basename）。
+                      挂载快照的路径没有扩展名，必须靠展示名路由。
+        """
+        name = filename or _extract_filename(path)
+        parser = self._find_parser(name)
+        if parser is None:
+            print(f"[FileService] 没有找到支持 {name} 的解析器")
+            return ""
+
+        sync_fn = getattr(parser, "extract_text_sync", None)
+        if callable(sync_fn):
+            try:
+                return sync_fn(path) or ""
+            except Exception as e:
+                print(f"[FileService] 同步解析异常: {e}")
+                return ""
+
+        return _drive_coroutine(parser.extract_text(path))
+
+    def read_mount_text(self, blob_store, mount: dict) -> str:
+        """
+        读节点挂载文件的文本：优先用解析缓存，缺失时解析 blob 并回写缓存。
+
+        blob 内容寻址且不可变，所以缓存永远不需要失效逻辑。
+        """
+        blob_id = str((mount or {}).get("blob_id") or "")
+        name = str((mount or {}).get("name") or "")
+        if not blob_id or blob_store is None:
+            return ""
+
+        cached = blob_store.read_cached_text(blob_id)
+        if cached is not None:
+            return cached
+
+        path = blob_store.blob_path(blob_id)
+        if not path.exists():
+            print(f"[FileService] 挂载快照缺失: {blob_id[:12]} ({name})")
+            return ""
+
+        text = self.extract_text_sync(str(path), name)
+        blob_store.write_cached_text(blob_id, text)
+        return text
+
 
 # ──────────────────────────────────────────────
 # 模块级工具
@@ -96,3 +154,26 @@ def _extract_filename(path: str) -> str:
     """从路径中提取文件名（跨平台）。"""
     import os
     return os.path.basename(path)
+
+
+def _drive_coroutine(coro) -> str:
+    """
+    在同步上下文里跑完一个不含 await 的协程（老式纯异步解析器的兜底）。
+
+    刻意不用 asyncio.run：上下文构建可能发生在事件循环内部，那样会直接报错。
+    """
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        return stop.value or ""
+    except Exception as e:
+        print(f"[FileService] 解析协程异常: {e}")
+        return ""
+    finally:
+        try:
+            coro.close()
+        except Exception:
+            pass
+    # 协程真的 yield 了：说明它是流式的，同步路径无法安全驱动
+    print("[FileService] 解析器返回了未完成的协程，已放弃")
+    return ""
