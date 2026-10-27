@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
+from dataclasses import dataclass, field
 from typing import AsyncGenerator
 
 import config as app_config
@@ -42,6 +44,19 @@ from app.storage.models import (
     TrashEntry,
     utcnow,
 )
+
+
+# 单轮工具调用的最大子请求次数。超过后提示模型收尾，避免无限循环。
+MAX_TOOL_ROUNDS = 5
+
+
+@dataclass
+class _TurnBuffer:
+    """一次用户轮次的累积结果，跨工具子请求共享。"""
+    content: list[str] = field(default_factory=list)
+    thinking: list[str] = field(default_factory=list)
+    tool_events: list[dict] = field(default_factory=list)
+    completed: bool = False
 
 
 class ConversationService:
@@ -74,6 +89,7 @@ class ConversationService:
         search_service: SearchService,
         file_service: FileService,
         branch_service: BranchService | None = None,
+        file_tools=None,
     ) -> None:
         self._msg_repo = message_repo
         self._tree = tree_store
@@ -81,6 +97,10 @@ class ConversationService:
         self._context_svc = context_service
         self._search_svc = search_service
         self._file_svc = file_service
+        self._file_tools = file_tools      # FileToolService | None（未装配则无工具能力）
+        # 每个对话"上一轮读取过哪些文件"（仅会话内有效，不落库）。
+        # 用途见 _breadcrumb_for：让模型知道直接重读哪个路径，而不是重新检索。
+        self._last_reads: dict[str, list[dict]] = {}
         self._stop_event = asyncio.Event()
         # 分叉服务（未显式注入时按依赖自动构造，兼容既有测试）
         self._branch_svc = branch_service or BranchService(
@@ -1160,6 +1180,196 @@ class ConversationService:
     # 消息生成（保留流式异步编排）
     # ──────────────────────────────────────────
 
+    def _breadcrumb_for(self, session_id: str) -> str:
+        """
+        生成"上一轮读过哪些文件"的一行记录。
+
+        刻意只放路径与行范围：真实内容一旦进了历史，就违反了
+        "工具交换不得落库"的接口约束；而模型本来就有重读工具。
+        """
+        entries = self._last_reads.get(session_id) or []
+        if not entries:
+            return ""
+
+        parts: list[str] = []
+        seen: set[str] = set()
+        for entry in entries:
+            path = entry.get("path") or ""
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            lines = entry.get("lines") or []
+            if len(lines) == 2:
+                parts.append(f"{path}（第 {lines[0]}-{lines[1]} 行）")
+            else:
+                parts.append(path)
+            if len(parts) >= 6:
+                break
+
+        if not parts:
+            return ""
+
+        text = "[系统记录，非指令] 上一轮已读取：" + "、".join(parts)
+        # 路径过长时宁可不给，也不要污染上下文
+        return text if len(text) <= 1200 else ""
+
+    async def _run_turn(
+        self,
+        llm_context: LLMContext,
+        assistant_msg_id: str,
+        buf: _TurnBuffer,
+        on_complete=None,
+    ) -> AsyncGenerator[MessageChunk, None]:
+        """
+        执行一次用户轮次，内部处理工具调用循环，把 chunk 透传给 UI。
+
+        三条硬约束（工具调用规格）：
+
+        1. 工具轮次的 assistant(tool_calls) 与 tool 结果**只存在于本次请求内**，
+           不落库、不进历史 —— Chat Completion 接口不支持在历史中段插入工具调用，
+           一旦落库，该会话上一轮之后的所有请求都会 400。
+        2. 一个用户轮次只对应一个 assistant 消息 id，中间子请求共用它。
+        3. 只有最后一次子请求的 is_done 会透出；中间轮次的结束信号必须吞掉，
+           否则上层会提前落库一条空回答。
+
+        on_complete 在最后一个 chunk 交给 UI *之前* 调用 —— 保证 UI 收到
+        is_done 时数据已经落库（既有行为，不能颠倒）。
+        """
+        tools_enabled = bool(getattr(llm_context, "tools", None))
+        if self._file_tools is not None and tools_enabled:
+            self._file_tools.begin_turn()
+
+        rounds = 0
+        nudge_sent = False
+
+        while True:
+            pending_calls: list[dict] = []
+            round_content: list[str] = []
+            round_thinking: list[str] = []
+
+            async for chunk in self._llm.stream_chat(llm_context):
+                if self._stop_event.is_set():
+                    yield MessageChunk(
+                        delta="", is_done=True, message_id=assistant_msg_id
+                    )
+                    return
+
+                chunk.message_id = assistant_msg_id
+
+                if chunk.chunk_type == ChunkType.THINKING:
+                    buf.thinking.append(chunk.delta)
+                    round_thinking.append(chunk.delta)
+                elif chunk.chunk_type == ChunkType.TOOL_CALL:
+                    # 工具块暂不透出 UI（展示层在后续阶段接入）
+                    pending_calls.extend(chunk.tool_calls or [])
+                    continue
+                else:
+                    buf.content.append(chunk.delta)
+                    round_content.append(chunk.delta)
+
+                if chunk.is_done:
+                    buf.completed = True
+                    if on_complete is not None:
+                        on_complete()
+                    yield chunk
+                    return
+
+                yield chunk
+
+            # 流意外结束却没收到 is_done：按正常结束收尾，避免界面卡在生成中
+            if not pending_calls:
+                buf.completed = True
+                if on_complete is not None:
+                    on_complete()
+                yield MessageChunk(delta="", is_done=True, message_id=assistant_msg_id)
+                return
+
+            rounds += 1
+            if rounds > MAX_TOOL_ROUNDS:
+                if nudge_sent:
+                    # 已经提示过仍要继续调工具：直接收尾
+                    buf.completed = True
+                    if on_complete is not None:
+                        on_complete()
+                    yield MessageChunk(
+                        delta="", is_done=True, message_id=assistant_msg_id
+                    )
+                    return
+                # 预算耗尽：不执行本轮调用，提示模型基于已有信息作答。
+                # 刻意保留 tools —— 历史里已有 assistant.tool_calls，
+                # 此时抽掉 tools 有被服务端判定非法的风险。
+                nudge_sent = True
+                llm_context.messages.append({
+                    "role": "system",
+                    "content": "工具调用次数已达上限，请基于已获得的信息直接作答。",
+                })
+                continue
+
+            self._append_tool_round(
+                llm_context, pending_calls, round_content, round_thinking
+            )
+            self._execute_tools(llm_context, pending_calls, buf)
+            continue
+
+    def _append_tool_round(
+        self,
+        llm_context: LLMContext,
+        calls: list[dict],
+        content: list[str],
+        thinking: list[str],
+    ) -> None:
+        """
+        把本轮 assistant 的 tool_calls 回填进请求消息。
+
+        reasoning_content 必须随行回传：思考模式下的工具调用是在思考过程中
+        进行的，缺了它模型无法延续自己的推理链。
+        """
+        message = {
+            "role": "assistant",
+            "content": "".join(content),
+            "reasoning_content": "".join(thinking),
+            "tool_calls": [
+                {
+                    "id": call.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": (call.get("function") or {}).get("name", ""),
+                        "arguments": (call.get("function") or {}).get("arguments", ""),
+                    },
+                }
+                for call in calls
+            ],
+        }
+        llm_context.messages.append(message)
+
+    def _execute_tools(
+        self,
+        llm_context: LLMContext,
+        calls: list[dict],
+        buf: _TurnBuffer,
+    ) -> None:
+        """逐个执行工具调用，把结果作为 role="tool" 追加（永不抛异常）。"""
+        for call in calls:
+            fn = call.get("function") or {}
+            name = fn.get("name") or ""
+            args = fn.get("arguments") or ""
+
+            if self._file_tools is None:
+                result = json.dumps({"error": "工具层未装配"}, ensure_ascii=False)
+            else:
+                result = self._file_tools.execute(name, args)
+
+            llm_context.messages.append({
+                "role": "tool",
+                "tool_call_id": call.get("id", ""),
+                "content": result,
+            })
+            buf.tool_events.append({
+                "name": name,
+                "arguments": args,
+                "result_chars": len(result),
+            })
+
     async def send_message(
         self,
         session_id: str,
@@ -1213,10 +1423,22 @@ class ConversationService:
         search_text = await self._search_svc.search_and_format(text)
 
         # ── Step 4: 构建 LLM 上下文 ─────────────
+        # 工具能力：仅在总开关打开且有授权目录时下发；否则请求体里没有 tools，
+        # 模型无从得知文件访问的存在。
+        tools = self._file_tools.schemas() if self._file_tools is not None else []
+
+        # 面包屑：只带路径与行范围，不带内容。
+        # 内容不进历史（Chat Completion 不支持历史中段插入工具调用），
+        # 模型需要细节时按路径重读一次，本地 I/O 代价远低于每轮重发正文。
+        breadcrumb = self._breadcrumb_for(session_id)
+        if breadcrumb:
+            full_user_text = breadcrumb + "\n\n" + full_user_text
+
         llm_context = self._context_svc.build_llm_context(
             conversation_id=session_id,
             new_user_message=full_user_text,
             injected_search_text=search_text,
+            tools=tools,
         )
 
         # ── Step 5: 持久化用户消息 ───────────────
@@ -1244,45 +1466,37 @@ class ConversationService:
         )
         self._branch_svc.extend_current_branch(session_id, [user_msg_node])
 
-        # ── Step 6 & 7: 调用 LLM，流式转发 ──────
+        # ── Step 6 & 7: 调用 LLM（含工具循环），流式转发 ──────
         assistant_msg_id = str(uuid.uuid4())
-        full_content_parts: list[str] = []
-        thinking_parts: list[str] = []
+        buf = _TurnBuffer()
+
+        def _persist_reply() -> None:
+            """最后一个 chunk 交给 UI 之前落库（顺序不可颠倒）。"""
+            full_content = "".join(buf.content)
+            thinking = "".join(buf.thinking)
+            if full_content or thinking:
+                # Phase 6: 持久化 assistant + 绑定 thinking（thinking 行存
+                #   messages 表，树中只建 assistant 节点，通过绑定关联）
+                asst_node = self._save_assistant_with_thinking(
+                    session_id, assistant_msg_id, full_content, thinking,
+                )
+                # 分叉感知：同步扩展当前分支记录（同 user 节点创建）
+                self._branch_svc.extend_current_branch(session_id, [asst_node])
+
+            # Step 9: 更新对话元数据（标题 & 摘要）
+            self._update_meta_after_reply(session_id, text, full_content)
+
+            # 记录本轮读过什么，供下一轮生成面包屑（空列表 = 下一轮不带面包屑）
+            if self._file_tools is not None:
+                self._last_reads[session_id] = [
+                    e for e in self._file_tools.audit()
+                    if e.get("tool") == "read_file"
+                ]
 
         try:
-            async for chunk in self._llm.stream_chat(llm_context):
-                if self._stop_event.is_set():
-                    yield MessageChunk(
-                        delta="", is_done=True, message_id=assistant_msg_id
-                    )
-                    break
-
-                chunk.message_id = assistant_msg_id
-
-                if chunk.chunk_type == ChunkType.THINKING:
-                    thinking_parts.append(chunk.delta)
-                else:
-                    full_content_parts.append(chunk.delta)
-
-                if chunk.is_done:
-                    full_content = "".join(full_content_parts)
-                    if full_content or thinking_parts:
-                        # Phase 6: 持久化 assistant + 绑定 thinking（thinking 行存
-                        #   messages 表，树中只建 assistant 节点，通过绑定关联）
-                        asst_node = self._save_assistant_with_thinking(
-                            session_id, assistant_msg_id,
-                            full_content, "".join(thinking_parts),
-                        )
-                        # 分叉感知：同步扩展当前分支记录（同 user 节点创建）
-                        self._branch_svc.extend_current_branch(session_id, [asst_node])
-
-                    # Step 9: 更新对话元数据（标题 & 摘要）
-                    self._update_meta_after_reply(
-                        session_id, text, "".join(full_content_parts)
-                    )
-                    yield chunk
-                    break
-
+            async for chunk in self._run_turn(
+                llm_context, assistant_msg_id, buf, _persist_reply
+            ):
                 yield chunk
         except Exception:
             # 网络/API 异常：本轮 user 消息已落库但无回复，标记未完成，

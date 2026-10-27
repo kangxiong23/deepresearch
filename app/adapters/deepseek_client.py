@@ -71,18 +71,8 @@ class DeepSeekClient:
         try:
             async with client.stream("POST", url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if self._abort_flag:
-                        yield MessageChunk(delta="", is_done=True,
-                                           chunk_type=ChunkType.TEXT)
-                        return
-
-                    chunk = _parse_sse_line(line)
-                    if chunk is None:
-                        continue
+                async for chunk in self._iter_sse(resp):
                     yield chunk
-                    if chunk.is_done:
-                        return
 
         except httpx.HTTPStatusError as e:
             raise LLMAPIError(
@@ -127,18 +117,8 @@ class DeepSeekClient:
         try:
             async with client.stream("POST", url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if self._abort_flag:
-                        yield MessageChunk(delta="", is_done=True,
-                                           chunk_type=ChunkType.TEXT)
-                        return
-
-                    chunk = _parse_sse_line(line)
-                    if chunk is None:
-                        continue
+                async for chunk in self._iter_sse(resp):
                     yield chunk
-                    if chunk.is_done:
-                        return
 
         except httpx.HTTPStatusError as e:
             raise LLMAPIError(
@@ -147,6 +127,22 @@ class DeepSeekClient:
             ) from e
         except httpx.RequestError as e:
             raise LLMAPIError(f"DeepSeek request failed: {e}") from e
+
+    async def _iter_sse(self, resp) -> AsyncGenerator[MessageChunk, None]:
+        """
+        把一次 HTTP 响应解析为 MessageChunk 序列。
+
+        有状态（工具调用的 arguments 是跨行分片下发的），故每次请求新建解析器。
+        """
+        parser = _SSEParser()
+        async for line in resp.aiter_lines():
+            if self._abort_flag:
+                yield MessageChunk(delta="", is_done=True, chunk_type=ChunkType.TEXT)
+                return
+            for chunk in parser.feed(line):
+                yield chunk
+                if chunk.is_done:
+                    return
 
     def abort(self) -> None:
         """设置中止标志，stream_chat 在下次读取前检测并退出。"""
@@ -187,6 +183,11 @@ class DeepSeekClient:
             "messages": messages,
             "stream":   True,
         }
+
+        # 工具定义：仅当 Core 提供了工具时才下发。
+        # 无工具请求体保持原样，避免影响现有正常对话。
+        if context.tools:
+            payload["tools"] = context.tools
 
         # max_tokens
         max_tokens = context.max_tokens or app_config.max_tokens
@@ -239,60 +240,154 @@ class DeepSeekClient:
 # SSE 解析（模块私有）
 # ──────────────────────────────────────────────
 
-def _parse_sse_line(line: str) -> MessageChunk | None:
+class _SSEParser:
     """
-    解析单行 SSE 数据。
+    SSE 行 → MessageChunk 的有状态解析器。
 
-    返回值：
-    - MessageChunk — 有内容的块
-    - None         — 空行 / 注释行 / 非 data 行，跳过
+    相比原先的逐行无状态解析，有两处必须区别对待：
+
+    1. tool_calls 的 arguments 是跨多行分片下发的（实测一次调用会拆成 10+ 段），
+       需按 index 累加拼成完整 JSON，不能逐行解析；
+    2. finish_reason == "tool_calls" 表示"本轮把控制权交给客户端"，**不是**回答结束。
+       此时若产出 is_done=True，上层会立刻落库一条空回答并结束生成。
 
     DeepSeek SSE 格式：
         data: {"choices":[{"delta":{"content":"..."},"finish_reason":null}]}
         data: {"choices":[{"delta":{"reasoning_content":"..."},"finish_reason":null}]}
+        data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{...}}]}}]}
         data: [DONE]
     """
-    if not line or not line.startswith("data:"):
-        return None
 
-    raw = line[len("data:"):].strip()
+    def __init__(self) -> None:
+        self._slots: dict[int, dict] = {}
+        self._finish_reason: str | None = None
 
-    if raw == "[DONE]":
-        return MessageChunk(delta="", is_done=True, chunk_type=ChunkType.TEXT)
+    def feed(self, line: str) -> list[MessageChunk]:
+        """解析单行，返回 0..n 个块（同一行可能同时带思考与工具分片）。"""
+        if not line or not line.startswith("data:"):
+            return []
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
+        raw = line[len("data:"):].strip()
 
-    choices = data.get("choices")
-    if not choices:
-        return None
+        if raw == "[DONE]":
+            # 工具轮：结束信号由 TOOL_CALL 块承担，这里不能再补一个 done
+            if self._finish_reason == "tool_calls":
+                return []
+            return [MessageChunk(delta="", is_done=True, chunk_type=ChunkType.TEXT)]
 
-    choice = choices[0]
-    delta = choice.get("delta", {})
-    finish_reason = choice.get("finish_reason")
-    is_done = finish_reason is not None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
 
-    # reasoning_content → THINKING 块（若同块携带 finish_reason，同样透传结束信号）
-    reasoning = delta.get("reasoning_content") or ""
-    if reasoning:
-        return MessageChunk(
-            delta=reasoning,
-            is_done=is_done,
-            chunk_type=ChunkType.THINKING,
-        )
+        choices = data.get("choices") or []
+        if not choices:
+            return []
 
-    # content → TEXT 块
-    content = delta.get("content") or ""
-    if content or is_done:
-        return MessageChunk(
-            delta=content,
-            is_done=is_done,
-            chunk_type=ChunkType.TEXT,
-        )
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        finish = choice.get("finish_reason")
+        if finish:
+            self._finish_reason = finish
 
-    return None
+        # 工具轮的 finish_reason 只是交棒，本轮并未结束
+        turn_ends = finish is not None and finish != "tool_calls"
+
+        out: list[MessageChunk] = []
+
+        reasoning = delta.get("reasoning_content") or ""
+        if reasoning:
+            out.append(
+                MessageChunk(delta=reasoning, chunk_type=ChunkType.THINKING)
+            )
+
+        self._feed_tool_calls(delta.get("tool_calls"))
+
+        content = delta.get("content") or ""
+        if content:
+            out.append(MessageChunk(delta=content, chunk_type=ChunkType.TEXT))
+
+        # 工具调用：把累积好的完整调用作为一个块交出
+        if finish == "tool_calls":
+            calls = self._build_calls()
+            if calls:
+                out.append(
+                    MessageChunk(
+                        delta="",
+                        chunk_type=ChunkType.TOOL_CALL,
+                        tool_calls=calls,
+                        finish_reason=finish,
+                    )
+                )
+            else:
+                # 声明了工具调用却没收到任何分片：按正常结束收尾，避免界面永远停在生成中
+                out.append(
+                    MessageChunk(delta="", is_done=True, chunk_type=ChunkType.TEXT)
+                )
+            return out
+
+        # 普通收尾：把结束标记放在本行最后一个块上（thinking / text 都适用）
+        if turn_ends:
+            if out:
+                out[-1].is_done = True
+            else:
+                out.append(
+                    MessageChunk(delta="", is_done=True, chunk_type=ChunkType.TEXT)
+                )
+
+        return out
+
+    # ── 工具调用分片累积 ──────────────────────
+
+    def _feed_tool_calls(self, raw: list | None) -> None:
+        for tc in raw or []:
+            try:
+                idx = int(tc.get("index") or 0)
+            except (TypeError, ValueError):
+                idx = 0
+
+            slot = self._slots.setdefault(idx, {"id": "", "name": "", "args": ""})
+
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                slot["name"] += fn["name"]
+            args = fn.get("arguments")
+            if args:
+                slot["args"] += args
+
+    def _build_calls(self) -> list[dict]:
+        """拼装为可直接回传的 OpenAI 兼容结构（保持 index 顺序）。"""
+        calls: list[dict] = []
+        for idx in sorted(self._slots):
+            slot = self._slots[idx]
+            name = slot.get("name") or ""
+            if not name:
+                continue
+            calls.append(
+                {
+                    "id": slot.get("id") or "",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": slot.get("args") or "",
+                    },
+                }
+            )
+        return calls
+
+
+def _parse_sse_line(line: str) -> MessageChunk | None:
+    """
+    单行便捷解析（无跨行状态）。
+
+    仅用于一次性解析与单元测试；流式主路径请用 _SSEParser ——
+    工具调用参数是分片下发的，逐行解析只能拿到碎片。
+    """
+    chunks = _SSEParser().feed(line)
+    return chunks[0] if chunks else None
 
 
 # ──────────────────────────────────────────────

@@ -86,6 +86,7 @@ class ContextService:
         injected_search_text: str = "",
         *,
         history_until: str | None = None,
+        tools: list[dict] | None = None,
     ) -> LLMContext:
         """
         为一次 LLM 调用组装完整上下文。
@@ -168,6 +169,7 @@ class ContextService:
             thinking_enabled=app_config.thinking_enabled,
             max_tokens=app_config.max_tokens,
             temperature=app_config.temperature,
+            tools=list(tools or []),
         )
 
     # ──────────────────────────────────────────

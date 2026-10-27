@@ -87,6 +87,12 @@ _defaults: dict = {
     "kg_max_inject": int(os.getenv("KG_MAX_INJECT", "10")),
     # 知识提取时分析的最近消息条数
     "kg_extract_recent_n": int(os.getenv("KG_EXTRACT_RECENT_N", "6")),
+    # ── 本地文件只读访问（工具调用）──
+    # 总开关：关闭时请求体不带 tools，模型无法访问任何本地文件
+    "file_access_enabled": False,
+    # 已授权的根目录列表（只有这些目录下的文件可被检索/读取）。
+    # 约定：整体赋值，不要原地 append —— _defaults 是跨 scope 共享的可变对象。
+    "file_access_roots": [],
 }
 
 

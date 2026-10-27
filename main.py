@@ -32,6 +32,7 @@ from app.core.conversation_service import ConversationService
 from app.core.context_service import ContextService
 from app.core.search_service import SearchService
 from app.core.file_service import FileService
+from app.core.file_tool_service import FileToolService
 from app.core.knowledge_service import KnowledgeService
 from app.core.branch_service import BranchService
 
@@ -97,6 +98,9 @@ def assemble_app() -> ChatApp:
     file_service = FileService(
         parsers=file_parsers,
     )
+    # 本地文件只读访问（工具调用）。默认关闭：config.file_access_enabled=False
+    # 与空授权目录共同保证"未启用时请求体里不出现 tools"。
+    file_tool_service = FileToolService()
     branch_service = BranchService(
         tree_store=tree_store,
         branch_store=branch_store,
@@ -110,6 +114,7 @@ def assemble_app() -> ChatApp:
         search_service=search_service,
         file_service=file_service,
         branch_service=branch_service,
+        file_tools=file_tool_service,
     )
 
     # ── 4b. 知识图谱服务 ──────────────────────

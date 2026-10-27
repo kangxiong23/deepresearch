@@ -30,8 +30,9 @@ class Role(str, Enum):
 
 
 class ChunkType(str, Enum):
-    TEXT     = "text"
-    THINKING = "thinking"
+    TEXT      = "text"
+    THINKING  = "thinking"
+    TOOL_CALL = "tool_call"   # 模型请求调用工具（本轮未结束，等待工具结果回传）
 
 
 class ContextSource(str, Enum):
@@ -95,6 +96,11 @@ class MessageChunk:
     is_done: bool = False
     chunk_type: ChunkType = ChunkType.TEXT
     message_id: str = ""
+    # 工具调用（chunk_type == TOOL_CALL 时非空）。元素为 API 线格式：
+    # {"id": ..., "type": "function", "function": {"name": ..., "arguments": <json 串>}}
+    # Core 需原样回传进下一轮 messages，故此处不做领域化包装。
+    tool_calls: Optional[list[dict]] = None
+    finish_reason: str = ""
 
 
 # ──────────────────────────────────────────────
@@ -142,6 +148,9 @@ class LLMContext:
     thinking_enabled: bool = False
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
+    # 工具定义（OpenAI 兼容格式）。由 Core 决定给哪些工具，Adapter 只负责序列化；
+    # 为空则请求体不出现 tools 字段（保持无工具请求的原有形态）。
+    tools: list[dict] = field(default_factory=list)
 
 
 # ──────────────────────────────────────────────
