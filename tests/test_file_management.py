@@ -185,6 +185,89 @@ class TestMessageRepoAttachments(TempDataCase):
 
 
 # ──────────────────────────────────────────────
+# 迁移事故回归：attachments 列必须真的加上
+# ──────────────────────────────────────────────
+
+class TestAttachmentsMigration(TempDataCase):
+    """_ensure_column 的 ddl 参数必须含列名。
+
+    历史事故：传了 "TEXT"（只有类型）→ 生成 ALTER TABLE messages ADD COLUMN TEXT，
+    SQLite 于是加了一列名叫 TEXT 的空列，attachments 始终没加上；
+    save_message 报 "no column named attachments"，整条发送链路在落库处就断了
+    （界面只留下一个空白气泡，看板上也没有任何调用记录）。
+    """
+
+    OLD_DDL = """
+        CREATE TABLE messages (
+            id              TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            role            TEXT NOT NULL,
+            content         TEXT NOT NULL DEFAULT '',
+            is_thinking     INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL,
+            token_count     INTEGER NOT NULL DEFAULT 0
+        )
+    """
+
+    def rebuild(self, extra_column: str = "") -> None:
+        conn = get_connection()
+        with conn:
+            conn.execute("DROP TABLE IF EXISTS messages")
+            ddl = self.OLD_DDL
+            if extra_column:
+                ddl = ddl.replace(
+                    "token_count     INTEGER NOT NULL DEFAULT 0",
+                    "token_count     INTEGER NOT NULL DEFAULT 0,\n            " + extra_column,
+                )
+            conn.execute(ddl)
+
+    def columns(self) -> list[str]:
+        conn = get_connection()
+        return [r["name"] for r in conn.execute("PRAGMA table_info(messages)")]
+
+    def test_old_table_gets_attachments_column(self) -> None:
+        self.rebuild()
+        self.assertNotIn("attachments", self.columns())
+
+        initialize_database()
+
+        cols = self.columns()
+        self.assertIn("attachments", cols)
+        self.assertNotIn("TEXT", cols, "不能让类型名变成列名")
+
+    def test_migration_is_idempotent(self) -> None:
+        self.rebuild()
+        initialize_database()
+        initialize_database()   # 第二次启动不能报 duplicate column name
+        self.assertEqual(self.columns().count("attachments"), 1)
+
+    def test_accidental_text_column_is_removed(self) -> None:
+        # 现场就是这个状态：多了一列 "TEXT"，缺 attachments
+        self.rebuild(extra_column="TEXT")
+        self.assertIn("TEXT", self.columns())
+
+        initialize_database()
+
+        cols = self.columns()
+        self.assertNotIn("TEXT", cols)
+        self.assertIn("attachments", cols)
+
+    def test_existing_rows_survive_migration(self) -> None:
+        self.rebuild()
+        conn = get_connection()
+        with conn:
+            conn.execute(
+                "INSERT INTO messages VALUES "
+                "('m-old','c-1','user','历史内容',0,'2026-01-01T00:00:00.000000',3)"
+            )
+        initialize_database()
+
+        loaded = MessageRepo().get_messages("c-1")
+        self.assertEqual(loaded[0].content, "历史内容")
+        self.assertEqual(loaded[0].attachments, [])
+
+
+# ──────────────────────────────────────────────
 # 上下文展开
 # ──────────────────────────────────────────────
 

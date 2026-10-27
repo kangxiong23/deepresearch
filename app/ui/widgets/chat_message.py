@@ -1104,6 +1104,20 @@ class ChatMessage(QFrame):
         #   区域可立即上屏（同步、不处理其他事件，不会重入）。
         self._content_browser.viewport().repaint()
 
+    def show_error(self, text: str) -> None:
+        """
+        把失败原因写进气泡（请求失败时用）。
+
+        以前流出错只 print 到控制台：气泡空白、用户既不知道失败、也没有
+        任何可复制的信息。错误必须留在看得见的地方。
+        """
+        detail = (text or "").strip() or "未知错误"
+        body = "⚠️ **请求失败**：" + detail
+        current = (self._stream_buffer or "").strip()
+        self._stream_buffer = (current + "\n\n" + body) if current else body
+        self._status_line = ""
+        self._render_stream(repaint=True)
+
     def finalize_stream(self) -> None:
         """结束流式接收（正常完成）。状态行在此清除，正文不含它。"""
         self._is_streaming = False

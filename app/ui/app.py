@@ -971,6 +971,8 @@ class ChatApp:
 
         def on_error(error_msg: str):
             print(f"[UI] Prefork regenerate error: {error_msg}")
+            if self._streaming_message:
+                self._streaming_message.show_error(error_msg)
             on_finished()
 
         def on_aborted():
@@ -1411,8 +1413,10 @@ class ChatApp:
                 QTimer.singleShot(0, self._refresh_fork_controls)
 
         def on_error(error_msg: str):
-            """流出错。"""
+            """流出错：原因写进气泡，再收尾（以前只剩一个空白气泡）。"""
             print(f"[UI] Stream error: {error_msg}")
+            if self._streaming_message:
+                self._streaming_message.show_error(error_msg)
             on_finished()
 
         def on_aborted():
@@ -1547,6 +1551,8 @@ class ChatApp:
 
         def on_error(error_msg: str):
             print(f"[UI] Continue error: {error_msg}")
+            if self._streaming_message:
+                self._streaming_message.show_error(error_msg)
             on_finished()
 
         def on_aborted():

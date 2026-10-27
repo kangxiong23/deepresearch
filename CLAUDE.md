@@ -189,7 +189,10 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 上限：单文件 20,000 字、单条 50,000 字，超限**截断并显式标注**（不拒发）。`token_count`
 必须用 `message_attachments.estimate_tokens`（正文 + 展开后的附件）——否则
 `_truncate_history` 会把 30 万 token 的巨无霸当轻量消息放行。resend 未选新文件时
-**沿用原附件**（改错字不丢资料）。迁移：`_ensure_column(messages, attachments, TEXT)`。
+**沿用原附件**（改错字不丢资料）。迁移：`_ensure_column(conn, "messages", "attachments", "attachments TEXT")`
+——**ddl 参数必须含列名**，拼出来的是 `ALTER TABLE <t> ADD COLUMN <ddl>`；只传类型会加出一列名叫
+`TEXT` 的空列，并让 `save_message` 在落库处报 "no column named attachments"（发送链路整条断掉，
+界面上只剩一个空白气泡）。
 
 **节点挂载 (D2)**。`ConversationService.attach_file` 走 `FileBlobStore` 复制字节进
 `data/files/<sha256>`（天然去重，单文件 20 MB / 单节点 200 MB 上限），节点上只存

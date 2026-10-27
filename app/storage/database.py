@@ -70,12 +70,22 @@ def initialize_database() -> None:
     with conn:
         conn.executescript(_DDL)
         # 旧版 fork_nodes（无 role 列）补列 —— SQLite 不支持 ADD COLUMN IF NOT EXISTS
-        _ensure_column(conn, "fork_nodes", "role", "TEXT NOT NULL DEFAULT ''")
+        # 注意：ddl 参数必须是"列名 + 类型"的完整片段（见 _ensure_column）。
+        _ensure_column(conn, "fork_nodes", "role", "role TEXT NOT NULL DEFAULT ''")
         # 消息附件列（老库没有）。NULL = 无附件，代码里用 or [] 兜底。
-        _ensure_column(conn, "messages", "attachments", "TEXT")
+        _ensure_column(conn, "messages", "attachments", "attachments TEXT")
+        # 修复历史事故：早期版本把类型当列名传进来，真的给 messages 加了一列叫
+        # "TEXT" 的空列，而 attachments 始终没加上（save_message 因此报
+        # "no column named attachments"，整条发送链路在落库处就断了）。
+        _drop_accidental_column(conn, "messages", "TEXT")
 
     # 检测是否需要迁移
     _migrate_if_needed(conn)
+
+    # _finalize_migration 里有一份旧的 messages DDL（不含 attachments），
+    # 重建表之后新列会丢，这里补一次（幂等）。
+    with conn:
+        _ensure_column(conn, "messages", "attachments", "attachments TEXT")
 
     # Phase 5: MessageNode 迁移
     _migrate_message_nodes_if_needed()
@@ -152,10 +162,44 @@ CREATE INDEX IF NOT EXISTS idx_branch_nodes_fp
 def _ensure_column(
     conn: sqlite3.Connection, table: str, column: str, ddl: str
 ) -> None:
-    """若表缺少指定列则 ALTER TABLE 补列（幂等）。"""
+    """
+    若表缺少指定列则 ALTER TABLE 补列（幂等）。
+
+    ⚠️ ddl 必须是**含列名的完整片段**（如 "attachments TEXT"），
+    因为拼出来的是 `ALTER TABLE <table> ADD COLUMN <ddl>`。
+    只传类型（"TEXT"）会得到一列名为 TEXT 的空列，且目标列根本没加上。
+    """
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column in cols:
+        return
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+    except sqlite3.OperationalError as e:
+        # 补列失败不该把整个应用启动打断；留一条醒目的日志（下次启动还会重试）
+        print(f"[MIGRATE] 补列失败 {table}.{column}: {e}（ddl={ddl!r}）")
+        return
+    print(f"[MIGRATE] 已为 {table} 补列: {column}")
+
+
+def _drop_accidental_column(
+    conn: sqlite3.Connection, table: str, column: str
+) -> None:
+    """
+    删除历史事故遗留的意外列（如名字就叫 "TEXT" 的空列）。
+
+    只在"列存在"时动手，且 SQLite < 3.35 不支持 DROP COLUMN 时静默跳过。
+    """
     cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
     if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        return
+    if sqlite3.sqlite_version_info < (3, 35, 0):
+        print(f"[MIGRATE] SQLite 版本过低，无法删除事故列 {table}.{column}")
+        return
+    try:
+        conn.execute(f'ALTER TABLE {table} DROP COLUMN "{column}"')
+        print(f"[MIGRATE] 已删除事故列 {table}.{column}")
+    except sqlite3.OperationalError as e:
+        print(f"[MIGRATE] 删除事故列失败 {table}.{column}: {e}")
 
 
 # ──────────────────────────────────────────────
