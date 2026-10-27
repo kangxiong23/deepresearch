@@ -1204,6 +1204,18 @@ class ConversationService:
     # 消息生成（保留流式异步编排）
     # ──────────────────────────────────────────
 
+    def reload_file_access(self) -> None:
+        """
+        授权变更后重新加载：把持久化配置写回 config，并清空检索索引。
+
+        下一次检索会按新目录重新扫描；已授权的目录不会自动失效。
+        """
+        from app.utils.file_access_settings import FileAccessSettings
+
+        FileAccessSettings().apply_to_config()
+        if self._file_tools is not None:
+            self._file_tools.invalidate()
+
     def _breadcrumb_for(self, session_id: str) -> str:
         """
         生成"上一轮读过哪些文件"的一行记录。

@@ -1088,6 +1088,10 @@ class AppController:
         """UI 调用：清空回收站。返回清除的条目数。"""
         return self._conversation_svc.clear_trash()
 
+    def on_reload_file_access(self) -> None:
+        """UI 调用：本地文件授权变更后重载配置并清空检索索引。"""
+        self._conversation_svc.reload_file_access()
+
 # ──────────────────────────────────────────────
 # 模块级辅助（不含业务知识，仅格式化）
 # ──────────────────────────────────────────────

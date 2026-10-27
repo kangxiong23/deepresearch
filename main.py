@@ -50,6 +50,7 @@ from app.ui.theme import get_theme_manager
 # ── 日志 ─────────────────────────────────────
 from app.utils.async_utils import get_logger
 from app.utils.run_marker import RunMarker, describe
+from app.utils.file_access_settings import FileAccessSettings
 
 logger = get_logger("MAIN", "main")
 
@@ -66,6 +67,15 @@ def assemble_app() -> ChatApp:
         - 流式出错？从 logger 的 [CORE] / [ADPTR] 层标签过滤日志定位。
     """
     logger.info("=== DeepResearch starting ===")
+
+    # ── 0. 读回持久化的用户设置 ───────────────
+    # 本地文件访问的开关与授权目录存在 data/file_access.json，
+    # 必须在 Core 服务构建前写回 config（FileToolService 在调用时读 config）。
+    access = FileAccessSettings().apply_to_config()
+    logger.info(
+        "file access: enabled=%s roots=%d",
+        access["enabled"], len(access["roots"]),
+    )
 
     # ── 1. 初始化数据库 ───────────────────────
     initialize_database()

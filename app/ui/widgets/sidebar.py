@@ -60,6 +60,7 @@ class Sidebar(QWidget):
     multi_select_toggled = Signal(bool)  # True=进入多选, False=退出多选
     refresh_requested = Signal()    # 刷新整个对话树界面与对话界面
     open_theme_clicked = Signal()   # 打开主题风格选择对话框
+    open_file_access_clicked = Signal()  # 打开本地文件访问授权
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -352,6 +353,13 @@ class Sidebar(QWidget):
             on_click=lambda: self.open_kg_panel_clicked.emit(),
         )
 
+        # 本地文件访问入口
+        file_entry = self._make_bottom_entry(
+            icon_text="📁",
+            label="本地文件",
+            on_click=lambda: self.open_file_access_clicked.emit(),
+        )
+
         # 主题风格入口
         theme_entry = self._make_bottom_entry(
             icon_text="🎨",
@@ -362,6 +370,7 @@ class Sidebar(QWidget):
         layout.addWidget(trash_entry)
         layout.addWidget(context_entry)
         layout.addWidget(kg_entry)
+        layout.addWidget(file_entry)
         layout.addWidget(theme_entry)
 
         return container

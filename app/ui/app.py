@@ -22,12 +22,14 @@ from app.ui.main_window import MainWindow
 from app.ui.widgets.chat_message import ChatMessage, ThinkingBlock
 from app.ui.widgets.search_popup import SearchPopup
 from app.ui.widgets.sidebar import Sidebar
+from app.ui.widgets.file_access_dialog import show_file_access_dialog
 from app.ui.async_bridge import (
     AsyncStreamWorker,
     StreamRelay,
     run_async_in_thread,
 )
 from app.utils.draft_store import DraftStore
+from app.utils.file_access_settings import FileAccessSettings
 
 
 class ChatApp:
@@ -166,6 +168,7 @@ class ChatApp:
         sidebar.multi_select_toggled.connect(self._on_multi_select_toggled)
         sidebar.refresh_requested.connect(self._handle_refresh)
         sidebar.open_theme_clicked.connect(self._handle_open_theme)
+        sidebar.open_file_access_clicked.connect(self._handle_open_file_access)
 
         # ── TreePanel 信号 ────────────────────────
         tree = sidebar.tree_panel
@@ -2132,6 +2135,22 @@ class ChatApp:
         self._window.show_kg_panel()
 
     # ── 主题风格 ────────────────────────────
+
+    def _handle_open_file_access(self) -> None:
+        """
+        侧栏 → 本地文件访问授权。
+        改动即时落盘并重载（清空索引），没有"取消"。
+        """
+        store = FileAccessSettings()
+        data = store.load()
+
+        def on_change(enabled: bool, roots: list[str]) -> None:
+            store.save(enabled, roots)
+            self._ctrl.on_reload_file_access()
+
+        show_file_access_dialog(
+            self._window, data["enabled"], data["roots"], on_change
+        )
 
     def _handle_open_theme(self) -> None:
         """Sidebar 底部"主题风格"入口：打开主题选择对话框。"""
