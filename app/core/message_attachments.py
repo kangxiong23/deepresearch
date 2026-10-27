@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from app.core import image_attachments
+
 # ── 上限 ─────────────────────────────────────
 # 单文件 2 万字、单条消息合计 5 万字。超限截断并显式标注，绝不静默丢内容，
 # 也不拒绝发送（拒绝会让用户困惑）；界面提示"建议改用节点挂载"。
@@ -69,13 +71,24 @@ def normalize(
     return attachments, warnings
 
 
-def expand(content: str, attachments: list[dict] | None) -> str:
+def expand(
+    content: str,
+    attachments: list[dict] | None,
+    image_suffix: str = "",
+) -> str:
     """
     把附件文本拼到消息正文后面——**唯一**的展开点。
 
     只允许在构建 LLM 上下文时调用。其他任何地方（编辑、复制、预览、
     搜索、token 记账以外的展示）都应使用 content 原值，否则会出现
     "文档正文灌进输入框" / "regenerate 重复注入" 这类回归。
+
+    图片附件只留一行标注（形如 [图片：name]），图片字节是否随请求发出由
+    ContextService 决定；image_suffix 用于说明"这次没有发"（模型不支持 / 超出预算）。
+
+    Args:
+        image_suffix: 追加在图片标注名字后面的说明，例如
+                      "（当前模型不支持图片，未发送）"；正常发送时为空。
     """
     body = content or ""
     if not attachments:
@@ -83,6 +96,10 @@ def expand(content: str, attachments: list[dict] | None) -> str:
 
     parts: list[str] = [body] if body else []
     for att in attachments:
+        if image_attachments.is_image(att):
+            name = str(att.get("name") or "图片")
+            parts.append("[图片：" + name + image_suffix + "]")
+            continue
         text = (att.get("text") or "")
         if not text.strip():
             continue
@@ -96,9 +113,17 @@ def estimate_tokens(content: str, attachments: list[dict] | None = None) -> int:
 
     必须把附件算进去：否则一条挂了 30 万字附件的消息会被 _truncate_history
     当成轻量消息放行，请求直接 400。
+
+    图片按服务端的计费方式单独折算（每张 200-1024 token），不能只数文字：
+    一张图在正文里只有 "[图片：shot.png]" 十几个字，按字符算会严重低估。
     """
     text = expand(content, attachments) if attachments else (content or "")
-    return len(text) // 4
+    tokens = len(text) // 4
+    for image in image_attachments.of(attachments):
+        tokens += image_attachments.estimate_tokens(
+            int(image.get("width") or 0), int(image.get("height") or 0)
+        )
+    return tokens
 
 
 def names(attachments: list[dict] | None) -> list[str]:

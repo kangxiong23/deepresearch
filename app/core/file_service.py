@@ -152,6 +152,34 @@ class FileService:
 
         return _drive_coroutine(parser.extract_text(path))
 
+    def extract_embedded_images(
+        self,
+        path: str,
+        filename: str | None = None,
+        limit: int = 8,
+    ) -> list[bytes]:
+        """
+        取文档内嵌图片的原始字节（目前只有 docx 支持）。拿不到就返回空表。
+
+        只负责搬运字节；能不能发、发多大由 Core 的 image_attachments 判断
+        （适配器不该知道模型的图片限制）。
+        """
+        name = filename or _extract_filename(path)
+        parser = self._find_parser(name)
+        if parser is None:
+            return []
+
+        extractor = getattr(parser, "extract_images_sync", None)
+        if not callable(extractor):
+            return []
+
+        try:
+            images = extractor(path) or []
+        except Exception as e:
+            print(f"[FileService] 提取内嵌图片异常: {e}")
+            return []
+        return list(images[: max(0, limit)])
+
     def read_mount_text(self, blob_store, mount: dict) -> str:
         """
         读节点挂载文件的文本：优先用解析缓存，缺失时解析 blob 并回写缓存。

@@ -498,6 +498,8 @@ class _AttachmentChip(QFrame):
         self,
         name: str,
         chars: int = 0,
+        kind: str = "",
+        size: int = 0,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -513,7 +515,7 @@ class _AttachmentChip(QFrame):
         layout.setContentsMargins(6, 2, 6, 2)
         layout.setSpacing(4)
 
-        text = "📎 " + _elide_name(name)
+        text = ("🖼 " if kind == "image" else "📎 ") + _elide_name(name)
         label = QLabel(text)
         label.setFont(Fonts.body(Fonts.SIZE_XS))
         apply_style(label, lambda: f"""
@@ -526,13 +528,31 @@ class _AttachmentChip(QFrame):
         layout.addWidget(label)
 
         tip = name
-        if chars > 0:
+        if kind == "image":
+            tip += "\n图片" + (" · " + _format_bytes(size) if size else "")
+            tip += "（已随消息保存，送模型时按 blob 读取）"
+        elif chars > 0:
             tip += "\n约 " + f"{chars:,}" + " 字（已随消息保存）"
         else:
             tip += "\n（已随消息保存）"
         self.setToolTip(tip)
 
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+
+
+def _format_bytes(size: int) -> str:
+    """320 KB / 1.2 MB 这类人类可读大小。"""
+    try:
+        value = float(size or 0)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    if value < 1024:
+        return f"{int(value)} B"
+    if value < 1024 * 1024:
+        return f"{value / 1024:.0f} KB"
+    return f"{value / (1024 * 1024):.1f} MB"
 
 
 def _elide_name(name: str, limit: int = 28) -> str:
@@ -1051,7 +1071,12 @@ class ChatMessage(QFrame):
                 chars = int((att or {}).get("chars") or 0)
             except (TypeError, ValueError):
                 chars = 0
-            items.append({"name": name, "chars": chars})
+            items.append({
+                "name": name,
+                "chars": chars,
+                "kind": str((att or {}).get("kind") or ""),
+                "size": int((att or {}).get("size") or 0),
+            })
 
         self._attachment_details = items
 
@@ -1062,7 +1087,7 @@ class ChatMessage(QFrame):
                 item.widget().deleteLater()
 
         for att in items:
-            chip = _AttachmentChip(att["name"], att["chars"])
+            chip = _AttachmentChip(att["name"], att["chars"], att["kind"], att["size"])
             self._attachments_layout.insertWidget(
                 self._attachments_layout.count() - 1, chip
             )

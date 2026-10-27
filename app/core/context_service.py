@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 
 import config as app_config
-from app.core import message_attachments
+from app.core import image_attachments, message_attachments
 from app.core.protocols import (
     ContextStoreProtocol,
     MessageRepoProtocol,
@@ -99,6 +99,75 @@ class ContextService:
         self._file_svc = file_service
 
     # ──────────────────────────────────────────
+    # 图片（视觉输入）
+    # ──────────────────────────────────────────
+
+    @staticmethod
+    def _sticky_image_message_id(history: list) -> str:
+        """
+        最近一条带图片的 user 消息，这一轮继续带图。
+
+        用户发张截图问完，接着追问"那第二点呢"时，如果只有新消息带图，那张图
+        在历史里已经退化成一行标注，模型就答不上来了。代价是它每轮重发一次
+        （≤1024 token），换来多轮追问能继续看图。
+
+        这条消息的字数不进历史预算（图片计费在 message_attachments 里），
+        但一次请求的总量仍受 MAX_IMAGES_PER_REQUEST 约束。
+        """
+        for message in reversed(history):
+            if getattr(message, "role", None) != Role.USER:
+                continue
+            if image_attachments.of(getattr(message, "attachments", None)):
+                return str(getattr(message, "id", "") or "")
+        return ""
+
+    def _with_images(self, content, images: list[dict], budget: int):
+        """
+        把最多 budget 张图挂到这条 user 消息上。
+
+        图片只能出现在 user 消息里（system / assistant 带图会 400），
+        所以挂载进 system prompt 的资料图片无法走这条路——见 CLAUDE.md。
+
+        Returns:
+            (content, 剩余预算)。一张都没挂上时原样返回 content。
+        """
+        blocks: list[dict] = [
+            {"type": "text", "text": content if isinstance(content, str) else ""}
+        ]
+        used = 0
+        missing: list[str] = []
+
+        for image in images:
+            if used >= budget:
+                break
+            blob_id = str(image.get("blob_id") or "")
+            data = self._blobs.read_bytes(blob_id) if self._blobs is not None else None
+            if not data:
+                missing.append(str(image.get("name") or "图片"))
+                continue
+            mime = str(image.get("mime") or "") or (
+                image_attachments.sniff_mime(data) or "image/png"
+            )
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": image_attachments.data_url(data, mime)},
+            })
+            used += 1
+
+        if not used:
+            if missing:
+                print(f"[CTX] 图片快照缺失，未发送: {missing}")
+                # 一张都没挂上时也不能默默返回：模型和用户都要知道图没发出去
+                body = content if isinstance(content, str) else ""
+                return body + "\n[图片已丢失，未发送：" + "、".join(missing) + "]", budget
+            return content, budget
+
+        if missing:
+            print(f"[CTX] 图片快照缺失，未发送: {missing}")
+            blocks[0]["text"] += "\n[图片已丢失，未发送：" + "、".join(missing) + "]"
+        return blocks, budget - used
+
+    # ──────────────────────────────────────────
     # 主接口：构建 LLM 请求上下文
     # ──────────────────────────────────────────
 
@@ -179,21 +248,38 @@ class ContextService:
             budget_tokens=app_config.max_history_tokens,
         )
 
-        # 3. 组装 messages 列表（OpenAI 格式）
-        #    附件在这里展开（唯一展开点）：content 列只存用户自己写的字，
-        #    附件只在送模型的那一刻拼到正文后面。
-        messages: list[dict] = []
-        for msg in truncated:
-            messages.append({
-                "role": msg.role.value if hasattr(msg.role, "value") else msg.role,
-                "content": message_attachments.expand(msg.content, msg.attachments),
-            })
+        # 3. 图片预算：新消息优先，剩余的留给"最近一条带图的历史消息"
+        vision = image_attachments.supports_images(app_config.model_type)
+        budget = image_attachments.MAX_IMAGES_PER_REQUEST if vision else 0
+        image_suffix = "" if vision else "（当前模型不支持图片，未发送）"
 
-        # 4. 构建本次用户消息（可能含搜索注入 + 附件）
+        # 4. 本次用户消息（可能含搜索注入 + 附件 + 图片）
         user_content = self._compose_user_message(
             new_user_message, injected_search_text
         )
-        user_content = message_attachments.expand(user_content, new_user_attachments)
+        user_content = message_attachments.expand(
+            user_content, new_user_attachments, image_suffix
+        )
+        new_images = image_attachments.of(new_user_attachments) if vision else []
+        if new_images:
+            user_content, budget = self._with_images(user_content, new_images, budget)
+
+        # 5. 组装历史 messages（OpenAI 格式）
+        #    附件在这里展开（唯一展开点）：content 列只存用户自己写的字，
+        #    附件只在送模型的那一刻拼到正文后面。
+        sticky_id = self._sticky_image_message_id(truncated) if vision else ""
+        messages: list[dict] = []
+        for msg in truncated:
+            content = message_attachments.expand(msg.content, msg.attachments, image_suffix)
+            if sticky_id and str(msg.id) == sticky_id:
+                images = image_attachments.of(msg.attachments)
+                if images:
+                    content, budget = self._with_images(content, images, budget)
+            messages.append({
+                "role": msg.role.value if hasattr(msg.role, "value") else msg.role,
+                "content": content,
+            })
+
         messages.append({"role": Role.USER.value, "content": user_content})
 
         return LLMContext(
@@ -627,12 +713,22 @@ class ContextService:
             history, budget_tokens=app_config.max_history_tokens
         )
 
+        vision = image_attachments.supports_images(app_config.model_type)
+        budget = image_attachments.MAX_IMAGES_PER_REQUEST if vision else 0
+        image_suffix = "" if vision else "（当前模型不支持图片，未发送）"
+        sticky_id = self._sticky_image_message_id(truncated) if vision else ""
+
         messages: list[dict] = []
         for msg in truncated:
+            # 续写同样要把消息附件展开，否则"继续"会丢掉前文资料
+            content = message_attachments.expand(msg.content, msg.attachments, image_suffix)
+            if sticky_id and str(msg.id) == sticky_id:
+                images = image_attachments.of(msg.attachments)
+                if images:
+                    content, budget = self._with_images(content, images, budget)
             messages.append({
                 "role": msg.role.value if hasattr(msg.role, "value") else msg.role,
-                # 续写同样要把消息附件展开，否则"继续"会丢掉前文资料
-                "content": message_attachments.expand(msg.content, msg.attachments),
+                "content": content,
             })
 
         # 末尾追加部分 assistant 作为 prefix（续写起点）

@@ -444,7 +444,13 @@ class AppController:
             is_thinking=getattr(domain_obj, "is_thinking", False),
             created_at=_format_datetime(getattr(domain_obj, "created_at", None)),
             attachments=[
-                {"name": str(a.get("name") or ""), "chars": len(a.get("text") or "")}
+                {
+                    "name": str(a.get("name") or ""),
+                    "chars": len(a.get("text") or ""),
+                    # 图片没有文本，靠 kind/size 让 chip 显示成"图片 · 320 KB"
+                    "kind": str(a.get("kind") or ""),
+                    "size": int(a.get("size") or 0),
+                }
                 for a in (getattr(domain_obj, "attachments", None) or [])
                 if str(a.get("name") or "")
             ],

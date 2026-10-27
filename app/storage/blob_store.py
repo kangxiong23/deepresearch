@@ -115,6 +115,48 @@ class FileBlobStore:
             "source_path": str(src.resolve()),
         }
 
+    def put_bytes(
+        self,
+        data: bytes,
+        *,
+        name: str = "",
+        max_bytes: int = MAX_BLOB_BYTES,
+    ) -> dict:
+        """
+        把内存里的字节快照进仓库（图片来源：解码、缩放后的图片没有源文件路径）。
+
+        与 put() 同样按内容寻址：同一张图重复发不会占第二份空间。
+        """
+        size = len(data)
+        if size > max_bytes:
+            raise BlobTooLarge(
+                f"{name or '内容'} 超过单文件快照上限 "
+                f"({size / 1024 / 1024:.1f} MB > {max_bytes / 1024 / 1024:.0f} MB)"
+            )
+
+        sha = hashlib.sha256(data).hexdigest()
+        dest = self.blob_path(sha)
+        if not dest.exists():
+            fd, tmp = tempfile.mkstemp(dir=str(self.root), prefix=".tmp_", suffix=".part")
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                os.replace(tmp, dest)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+
+        return {
+            "blob_id": sha,
+            "sha256": sha,
+            "name": name,
+            "size": size,
+            "added_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
     # ──────────────────────────────────────────
     # 读取 / 删除
     # ──────────────────────────────────────────

@@ -18,6 +18,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QShortcut, QKeySequence
 
+import config as app_config
+from app.core import image_attachments
+
 from app.ui.theme import Colors, build_global_stylesheet, get_theme_manager
 from app.ui.main_window import MainWindow
 from app.ui.widgets.chat_message import ChatMessage, ThinkingBlock
@@ -737,6 +740,9 @@ class ChatApp:
         if not text and not files:
             return
 
+        if files and not self._confirm_image_support(files):
+            return
+
         # 移除旧未完成轮次的控件（被标记的 user + 其下所有消息），
         # 保持 UI 与 tree.json 的一致性（tree.json 已在上面 cleanup 时软删）
         self._remove_incomplete_widgets()
@@ -760,6 +766,38 @@ class ChatApp:
 
         # 启动流式线程
         self._start_stream(self._current_session_id, text, files)
+
+    def _confirm_image_support(self, files: list[str]) -> bool:
+        """
+        当前模型看不了图时，发送前先问一句。
+
+        实测 deepseek-v4-pro 收到图片**不报错也不生效**：返回 200，但图根本没进
+        模型（prompt_tokens 里没有图片那部分），答出来的内容与图无关。这种失败
+        最坑人，所以在发送前拦一下，而不是让它悄悄给出错误答案。
+        """
+        if image_attachments.supports_images(app_config.model_type):
+            return True
+
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        images = [
+            os.path.basename(path)
+            for path in files
+            if os.path.splitext(path)[1].lower() in image_exts
+        ]
+        if not images:
+            return True
+
+        answer = QMessageBox.question(
+            self._window,
+            "当前模型看不到图片",
+            "当前模型 " + str(app_config.model_type) + " 不支持图片输入，"
+            "附上的图片会被忽略（不会报错，但模型看不到）。\n\n"
+            "识别图片请切换到 deepseek-v4-flash。\n\n"
+            "仍然继续发送吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def _handle_stop(self) -> None:
         """停止当前生成。

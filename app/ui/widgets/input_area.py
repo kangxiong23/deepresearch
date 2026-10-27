@@ -932,7 +932,8 @@ class InputArea(QFrame):
             self,
             "选择文件",
             "",
-            "支持的文件 (*.txt *.md *.json *.docx *.pdf);;所有文件 (*.*)",
+            "支持的文件 (*.txt *.md *.json *.docx *.pdf "
+            "*.png *.jpg *.jpeg *.webp *.gif);;所有文件 (*.*)",
         )
         if paths:
             import os

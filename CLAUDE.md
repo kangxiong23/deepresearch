@@ -240,6 +240,26 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 按网格重复返回同一个 tc），嵌套表格递归成独立块，首行只有带 `w:tblHeader` 才补分隔行。
 页眉/页脚追加在文末并丢掉纯页码行，覆盖普通/首页/偶数页三种变体（按文本去重，变体没定义时自动回落）以及页眉里的表格；文本框单独成 "[文本框]" 段；脚注/尾注在正文原位留"[脚注 N]" 标记、正文之后按 id 附上正文（`word/footnotes.xml`、`word/endnotes.xml` 只能自己解 zip，其中 `w:type="separator"` 的分隔条目必须跳过）；图片只留 "[图片 N]" 占位并在结尾声明"未做文字识别"。挂载缓存**不写失败结果**，否则一次偶发失败会被永久固定。
 
+**图片输入（视觉）**。只有 `deepseek-v4-flash` 真的能看图；`deepseek-v4-pro` 收到图片
+**不报错也不生效**——实测返回 200，但 prompt_tokens 里没有图片那部分，问颜色答成"白色"
+（图是红的）。这种沉默失败最难查，所以 `image_attachments.supports_images()` 按模型名硬拦，
+UI 在发送前弹一次确认，`expand()` 也会在标注里写"当前模型不支持图片，未发送"。
+
+- **入口只有消息附件**。字节存 `data/files/<sha256>`（`FileBlobStore.put_bytes`），消息里
+  只留 `{kind:"image", blob_id, mime, width, height}`。刻意不把 base64 塞进 `messages` 表：
+  一条消息膨胀几 MB 会拖垮每次读取。
+- **组装**。只在 `build_llm_context` 里按 blob_id 读字节，拼成
+  `{"type":"image_url","image_url":{"url":"data:..."}}` 块。图片**只能出现在 user 消息**里
+  （system / assistant 带图会 400），所以挂载进 system prompt 的资料图片发不出去——挂载图片
+  时给的提示就是"请在输入框里作为消息附件发送"。
+- **预算**。每轮最多 4 张，新消息优先，剩下的留给"最近一条带图的历史消息"（用户追问
+  "那第二点呢"时不用重新上传）；单图 ≤4 MB、缩到约 1300×1300（服务端本来就会缩到这个
+  量级，再大只浪费带宽）；每张按 200-1024 token 估算并计入 `message_attachments.estimate_tokens`。
+- **历史**。更早的带图消息退化成一行 `[图片：name]` 标注，图不再重发。
+- **docx 内嵌图片**（`word/media/*`）跟着它所属的文档一起作为消息附件发出：适配器只搬字节，
+  能不能发、发多大由 Core 判断（`DocxParser.extract_images_sync` 不做格式判断）。
+- 已知缺口：挂载的图片不发送（受"图片只能在 user 消息"限制）。
+
 ### Key files
 
 | File | Role |
@@ -254,6 +274,7 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 | `app/storage/branch_store.py` | fork_nodes/branch_nodes 表 CRUD + 引用收集(孤儿清理用) |
 | `app/core/file_service.py` | File parsing orchestration（`extract_text_sync` / `read_mount_text`） |
 | `app/core/message_attachments.py` | 消息附件唯一规则：上限裁剪、展开、token 记账 |
+| `app/core/image_attachments.py` | 图片附件：格式嗅探、缩放、data URL、token 估算、模型能力判断 |
 | `app/storage/blob_store.py` | 节点挂载的内容寻址快照仓库（`data/files/<sha256>`） |
 | `app/storage/read_log_store.py` | `file_reads` 表读写（工具读取记录） |
 | `app/core/file_tool_service.py` | 本地文件只读工具（search_files / read_file） |

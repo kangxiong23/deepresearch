@@ -137,6 +137,24 @@ class DocxParser:
     async def extract_text(self, file_path: str) -> str:
         return self.extract_text_sync(file_path)
 
+    def extract_images_sync(self, file_path: str) -> list[bytes]:
+        """
+        提取文档内嵌图片的原始字节（word/media/*），按出现顺序。
+
+        刻意**不做**格式判断与缩放：哪些能发、发多大是 Core 的事
+        （app/core/image_attachments.py），适配器只负责把字节拿出来。
+        """
+        try:
+            import zipfile
+
+            with zipfile.ZipFile(file_path) as archive:
+                names = [n for n in archive.namelist() if n.startswith("word/media/")]
+                names.sort(key=_natural_key)
+                return [archive.read(n) for n in names if not n.endswith("/")]
+        except Exception as e:
+            print(f"[FileParser] 提取 docx 图片失败: {file_path} -> {e}")
+            return []
+
     # ──────────────────────────────────────────
     # 渲染
     # ──────────────────────────────────────────
@@ -392,11 +410,13 @@ def unsupported_hints() -> dict[str, str]:
         ".xlsx": "暂不支持 .xlsx，请另存为 .csv 后重试",
         ".ppt": "暂不支持 .ppt，请另存为 .pdf 后重试",
         ".pptx": "暂不支持 .pptx，请另存为 .pdf 后重试",
-        ".png": "图片不能直接读取文字，请另附文字稿",
-        ".jpg": "图片不能直接读取文字，请另附文字稿",
-        ".jpeg": "图片不能直接读取文字，请另附文字稿",
-        ".webp": "图片不能直接读取文字，请另附文字稿",
-        ".gif": "图片不能直接读取文字，请另附文字稿",
+        # 图片走"消息附件"那条路（app/core/image_attachments.py），挂载进 system
+        # prompt 的图片发不出去——服务端只接受 user 消息里带图。
+        ".png": "挂载的图片不会送进模型，请在输入框里作为消息附件发送",
+        ".jpg": "挂载的图片不会送进模型，请在输入框里作为消息附件发送",
+        ".jpeg": "挂载的图片不会送进模型，请在输入框里作为消息附件发送",
+        ".webp": "挂载的图片不会送进模型，请在输入框里作为消息附件发送",
+        ".gif": "挂载的图片不会送进模型，请在输入框里作为消息附件发送",
     }
 
 
@@ -704,3 +724,9 @@ def _ext(filename: str) -> str:
 
 def _basename(path: str) -> str:
     return os.path.basename(path or "") or (path or "")
+
+
+def _natural_key(name: str) -> tuple:
+    """让 image2.png 排在 image10.png 前面（Word 按插入顺序编号）。"""
+    parts = re.split(r"(\d+)", name)
+    return tuple((0, int(p)) if p.isdigit() else (1, p) for p in parts)

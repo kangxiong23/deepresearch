@@ -21,7 +21,7 @@ from typing import AsyncGenerator
 import config as app_config
 from app.core.branch_service import BranchService
 from app.core.context_service import ContextService
-from app.core import message_attachments
+from app.core import image_attachments, message_attachments
 from app.core.file_service import FileService
 from app.core.protocols import (
     LLMClientProtocol,
@@ -56,6 +56,9 @@ from app.storage.models import (
 
 # 单轮工具调用的最大子请求次数。超过后提示模型收尾，避免无限循环。
 MAX_TOOL_ROUNDS = 5
+
+# 读进内存前的源文件上限。服务端单图上限 32 MiB，超过它连解码都没必要。
+_MAX_SOURCE_IMAGE_BYTES = 32 * 1024 * 1024
 
 
 def _describe_tool_call(call: dict) -> str:
@@ -1416,22 +1419,132 @@ class ConversationService:
         """
         把用户选中的文件解析成可落库的消息附件。
 
-        统一走 FileService 的解析器（docx / pdf / json 都能取出文本），
-        不再用裸 UTF-8 读取——那是历史遗留的乱码来源。
-        超限由 message_attachments 截断并给出可读提示，绝不静默丢内容。
+        两条路：
+
+        - **文本**：统一走 FileService 的解析器（docx / pdf / json 都能取出文本），
+          不再用裸 UTF-8 读取——那是历史遗留的乱码来源。超限由
+          message_attachments 截断并给出可读提示，绝不静默丢内容。
+        - **图片**：字节存进内容寻址快照仓库（data/files/<sha256>），消息里只留
+          {kind:"image", blob_id, mime, width, height}。刻意不把 base64 塞进
+          messages 表——一条消息膨胀几 MB 会拖垮每次读取；只有构建上下文时
+          才按 blob_id 把字节读出来。
+
+        顺序：文本附件在前、图片在后。docx 内嵌图片（word/media）跟着它所属的
+        文档排在图片组里，正文里的 "[图片 N]" 标记才能和实际发出的图对上。
 
         解析失败的文件也会带着一句 "[无法解析…]" 说明进入附件列表
         （FileService 保证一个文件都不丢）——用户看得见，模型也读得到。
         """
         if not files:
             return []
-        pairs = await self._file_svc.extract_files(files)
+
+        text_paths: list[str] = []
+        images: list[dict] = []
+        failures: list[dict] = []
+
+        for path in files:
+            if self._sniff_image(path) is None:
+                text_paths.append(path)
+                continue
+            entry, reason = self._image_attachment(path)
+            if entry is not None:
+                images.append(entry)
+            else:
+                print(f"[CORE] 图片未能附加: {path} -> {reason}")
+                failures.append({
+                    "name": os.path.basename(path) or path,
+                    "text": "[这张图片没有发送成功：" + reason + "]",
+                })
+
+        pairs = await self._file_svc.extract_files(text_paths)
         attachments, warnings = message_attachments.normalize(pairs)
         for warning in warnings:
             print(f"[CORE] 附件超限：{warning}")
-        if not attachments:
+        attachments.extend(failures)
+
+        # 文档内嵌图片：排在文本之后，但仍受单条消息的图片张数上限约束
+        for path in text_paths:
+            if len(images) >= image_attachments.MAX_IMAGES_PER_REQUEST:
+                break
+            if os.path.splitext(path)[1].lower() != ".docx":
+                continue
+            raw_images = self._file_svc.extract_embedded_images(
+                path,
+                limit=image_attachments.MAX_IMAGES_PER_REQUEST - len(images),
+            )
+            for raw in raw_images:
+                entry, reason = self._image_from_bytes(
+                    raw, name=os.path.basename(path) or path
+                )
+                if entry is not None:
+                    images.append(entry)
+                else:
+                    print(f"[CORE] 文档内嵌图片跳过: {path} -> {reason}")
+
+        if len(images) > image_attachments.MAX_IMAGES_PER_REQUEST:
+            print(
+                f"[CORE] 图片数量超限，只附加前 "
+                f"{image_attachments.MAX_IMAGES_PER_REQUEST} 张"
+            )
+            images = images[: image_attachments.MAX_IMAGES_PER_REQUEST]
+
+        if not attachments and not images:
             print(f"[CORE] 附件解析结果为空，未附加：{files}")
-        return attachments
+        return attachments + images
+
+    # ──────────────────────────────────────────
+    # 图片附件
+    # ──────────────────────────────────────────
+
+    @staticmethod
+    def _sniff_image(path: str) -> str | None:
+        """只看前 16 字节判断是不是图片（服务端也是按内容判断，不看扩展名）。"""
+        try:
+            with open(path, "rb") as handle:
+                return image_attachments.sniff_mime(handle.read(16))
+        except OSError:
+            return None
+
+    def _image_attachment(self, path: str) -> tuple[dict | None, str]:
+        """读取一个图片文件并归一化；失败返回 (None, 人话原因)。"""
+        name = os.path.basename(path) or path
+        try:
+            size = os.path.getsize(path)
+        except OSError as e:
+            return None, f"读取失败（{e.strerror or '未知错误'}）"
+        if size > _MAX_SOURCE_IMAGE_BYTES:
+            return None, (
+                f"超过 {_MAX_SOURCE_IMAGE_BYTES // (1024 * 1024)} MB 上限"
+            )
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError as e:
+            return None, f"读取失败（{e.strerror or '未知错误'}）"
+        return self._image_from_bytes(data, name)
+
+    def _image_from_bytes(self, data: bytes, name: str) -> tuple[dict | None, str]:
+        """归一化 + 落快照仓库；返回可落库的附件项。"""
+        if self._blobs is None:
+            return None, "图片仓库未装配"
+        prepared = image_attachments.prepare(data)
+        if prepared is None:
+            return None, "格式不支持（只支持 JPEG / PNG / GIF / WebP）或压缩后仍然过大"
+        try:
+            record = self._blobs.put_bytes(prepared["data"], name=name)
+        except BlobTooLarge as e:
+            return None, str(e)
+        except OSError as e:
+            return None, f"写入快照失败（{e.strerror or '未知错误'}）"
+        return {
+            "name": name,
+            "kind": "image",
+            "blob_id": record["blob_id"],
+            "mime": prepared["mime"],
+            "width": prepared["width"],
+            "height": prepared["height"],
+            "size": record["size"],
+        }, ""
 
     def _attachments_of(self, message_id: str) -> list[dict]:
         """取某条消息已有的附件（编辑重发送时用，保证改错字不丢资料）。"""
