@@ -190,6 +190,26 @@ class TestErrors(FileToolServiceTestBase):
             self.assertIn("缺少 path", out["error"])
 
 
+class TestStopSignal(FileToolServiceTestBase):
+    def test_stop_aborts_scan_and_skips_cache(self) -> None:
+        self.write("a.txt", "x")
+        with self.scope():
+            svc = FileToolService()
+            svc.execute("search_files", json.dumps({"query": "x"}),
+                        should_stop=lambda: True)
+            self.assertTrue(svc._stats.aborted, "扫描应被标记为中止")
+            self.assertEqual(svc._indexed_at, 0.0, "中止的结果不得缓存")
+
+    def test_normal_scan_caches(self) -> None:
+        self.write("a.txt", "x")
+        with self.scope():
+            svc = FileToolService()
+            svc.execute("search_files", json.dumps({"query": "x"}),
+                        should_stop=lambda: False)
+            self.assertFalse(svc._stats.aborted)
+            self.assertGreater(svc._indexed_at, 0.0)
+
+
 class TestIndexCache(FileToolServiceTestBase):
     def test_index_reused_within_ttl(self) -> None:
         self.write("a.txt", "x")

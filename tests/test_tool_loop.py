@@ -66,7 +66,7 @@ class FakeTools:
     def begin_turn(self) -> None:
         self.begin_count += 1
 
-    def execute(self, name: str, arguments: str) -> str:
+    def execute(self, name: str, arguments: str, should_stop=None) -> str:
         self.executed.append((name, arguments))
         if self._result is not None:
             return self._result
@@ -399,6 +399,173 @@ class TestToolStatusChunks(unittest.IsolatedAsyncioTestCase):
         chunks = await drain(svc, ctx([{"type": "function"}]), buf)
         status = [c for c in chunks if c.chunk_type == ChunkType.TOOL_CALL]
         self.assertEqual(len(status), MAX_TOOL_ROUNDS)
+
+
+class StubTreeMap:
+    """按 id 查节点，记录 mark_incomplete 调用。"""
+
+    def __init__(self, nodes: dict) -> None:
+        self.nodes = nodes
+        self.marked: list[tuple[str, bool]] = []
+
+    def get_node(self, node_id):
+        return self.nodes.get(node_id)
+
+    def get_predecessor(self, session_id, node_id):
+        return None
+
+    def get_conversation_chain(self, session_id):
+        return [n for n in self.nodes.values() if n.parent_id == session_id
+                or n.id == session_id]
+
+    def mark_incomplete(self, node_id, value=True) -> None:
+        self.marked.append((node_id, value))
+
+
+class StubBranchLog:
+    def __init__(self) -> None:
+        self.created: list = []
+        self.extended: list = []
+
+    def create_branch(self, session_id, fork_point_id, chain) -> None:
+        self.created.append([n.id for n in chain])
+
+    def extend_current_branch(self, session_id, nodes) -> None:
+        self.extended.append([n.id for n in nodes])
+
+
+class TestRegenerateWithTools(unittest.IsolatedAsyncioTestCase):
+    """预分支路径：工具轮不得产生额外落库，停止仍然零持久化。"""
+
+    def make(self, llm, stop=False):
+        from app.storage.models import ConversationNode, MessageNode
+
+        conv = ConversationNode(id="conv-1", parent_id=None, title="t")
+        asst = MessageNode(id="asst-1", parent_id="conv-1", message_id="asst-1",
+                           role="assistant", preview="", title="A")
+        svc = ConversationService.__new__(ConversationService)
+        svc._llm = llm
+        svc._stop_event = asyncio.Event()
+        if stop:
+            svc._stop_event.set()
+        svc._file_tools = FileToolService()
+        svc._last_reads = {}
+        svc._tree = StubTreeMap({"conv-1": conv, "asst-1": asst})
+        svc._branch_svc = StubBranchLog()
+        svc._context_svc = StubContext()
+
+        self.saved: list = []
+
+        def _save(session_id, msg_id, content, thinking):
+            self.saved.append((msg_id, content, thinking))
+            return MessageNode(id=msg_id, parent_id=session_id, message_id=msg_id,
+                               role="assistant", preview="", title="new")
+
+        svc._save_assistant_with_thinking = _save
+        svc._update_meta_after_reply = lambda *a, **k: None
+        svc._user_text_before = lambda sid, tid: "原问题"
+        return svc
+
+    async def run_regen(self, svc):
+        return [c async for c in svc.regenerate_message("conv-1", "asst-1")]
+
+    async def test_tools_passed_but_no_breadcrumb(self) -> None:
+        root = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "logs", "_test_regen_root",
+        )
+        os.makedirs(root, exist_ok=True)
+        self.addCleanup(shutil.rmtree, root, True)
+
+        svc = self.make(FakeLLM([[text("好", done=True)]]))
+        svc._last_reads["conv-1"] = [
+            {"tool": "read_file", "path": r"D:\x\a.md", "lines": [1, 2]}
+        ]
+        with ConfigScope(file_access_enabled=True, file_access_roots=[root]):
+            await self.run_regen(svc)
+
+        kw = svc._context_svc.kw
+        self.assertEqual(
+            [t["function"]["name"] for t in kw["tools"]],
+            ["search_files", "read_file"],
+        )
+        self.assertNotIn("系统记录", kw["new_user_message"],
+                         "预分支路径不得注入面包屑")
+
+    async def test_tool_round_saves_exactly_once(self) -> None:
+        llm = FakeLLM([
+            [tool_call("call_a", "search_files", {"query": "预算"})],
+            [text("找到 1 个", done=True)],
+        ])
+        svc = self.make(llm)
+        with ConfigScope(file_access_enabled=True, file_access_roots=[os.getcwd()]):
+            await self.run_regen(svc)
+
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual(len(self.saved), 1, "工具轮不得产生额外 assistant")
+        self.assertEqual(len(svc._branch_svc.created), 1)
+        self.assertEqual(self.saved[0][1], "找到 1 个")
+
+    async def test_stop_persists_nothing(self) -> None:
+        """
+        停止语义：已产出的部分只存在于内存，不落库、不建分支。
+        注意 regenerate_message 入口会 clear() 停止事件，所以必须在
+        流式中途触发，不能在调用前置位。
+        """
+
+        class StopAfterFirst:
+            def __init__(self, svc) -> None:
+                self.svc = svc
+                self.calls = 0
+
+            async def stream_chat(self, context):
+                self.calls += 1
+                yield text("部分内容")
+                self.svc._stop_event.set()
+                yield text("后续内容")
+
+        svc = self.make(FakeLLM([]))
+        svc._llm = StopAfterFirst(svc)
+
+        with ConfigScope(file_access_enabled=True, file_access_roots=[os.getcwd()]):
+            chunks = await self.run_regen(svc)
+
+        self.assertTrue(chunks[-1].is_done)
+        self.assertEqual(self.saved, [], "停止后不得落库")
+        self.assertEqual(svc._branch_svc.created, [], "停止后不得建分支")
+
+
+class TestResendWithTools(unittest.IsolatedAsyncioTestCase):
+    async def test_breadcrumb_is_injected(self) -> None:
+        from app.storage.models import ConversationNode, MessageNode
+
+        conv = ConversationNode(id="conv-1", parent_id=None, title="t")
+        orig = MessageNode(id="u-1", parent_id="conv-1", message_id="u-1",
+                           role="user", preview="", title="U")
+        svc = ConversationService.__new__(ConversationService)
+        svc._llm = FakeLLM([[text("好", done=True)]])
+        svc._stop_event = asyncio.Event()
+        svc._file_tools = FileToolService()
+        svc._last_reads = {"conv-1": [
+            {"tool": "read_file", "path": r"D:\x\预算.md", "lines": [1, 9]}
+        ]}
+        svc._tree = StubTreeMap({"conv-1": conv, "u-1": orig})
+        svc._branch_svc = StubBranchLog()
+        svc._context_svc = StubContext()
+        svc._msg_repo = StubRepo()
+        svc._file_svc = StubFile()
+        svc._search_svc = StubSearch()
+        svc._save_assistant_with_thinking = lambda *a, **k: orig
+        svc._update_meta_after_reply = lambda *a, **k: None
+
+        with ConfigScope(file_access_enabled=True, file_access_roots=[os.getcwd()]):
+            async for _ in svc.resend_edited_message("conv-1", "u-1", "新问题", []):
+                pass
+
+        kw = svc._context_svc.kw
+        self.assertIn("系统记录", kw["new_user_message"])
+        self.assertIn("预算.md", kw["new_user_message"])
+        self.assertTrue(kw["tools"])
 
 
 if __name__ == "__main__":

@@ -149,7 +149,7 @@ class FileToolService:
 
     # ── 执行入口 ─────────────────────────────
 
-    def execute(self, name: str, arguments: str) -> str:
+    def execute(self, name: str, arguments: str, should_stop=None) -> str:
         try:
             args = json.loads(arguments) if arguments else {}
             if not isinstance(args, dict):
@@ -159,7 +159,7 @@ class FileToolService:
 
         try:
             if name == "search_files":
-                return self._search(args)
+                return self._search(args, should_stop)
             if name == "read_file":
                 return self._read(args)
             return _err(f"未知工具：{name}")
@@ -168,7 +168,7 @@ class FileToolService:
 
     # ── search_files ─────────────────────────
 
-    def _search(self, args: dict) -> str:
+    def _search(self, args: dict, should_stop=None) -> str:
         roots = self.roots()
         if not roots:
             return _err("用户尚未授权任何文件夹")
@@ -177,7 +177,7 @@ class FileToolService:
         in_content = bool(args.get("in_content") or False)
         types = _normalize_types(args.get("types"))
 
-        entries = self._ensure_index()
+        entries = self._ensure_index(should_stop)
         if not entries:
             return json.dumps(
                 {"count": 0, "files": [], "note": "授权范围内没有找到受支持的文件"},
@@ -196,7 +196,9 @@ class FileToolService:
 
         note = ""
         if in_content and len(hits) < MAX_SEARCH_RESULTS:
-            content_hits, scanned = self._search_content(entries, needle, types)
+            content_hits, scanned = self._search_content(
+                entries, needle, types, should_stop
+            )
             seen = {h.path for h in hits}
             for e in content_hits:
                 if e.path not in seen:
@@ -231,7 +233,8 @@ class FileToolService:
         return json.dumps(payload, ensure_ascii=False)
 
     def _search_content(self, entries: list[FileEntry], needle: str,
-                        types: set[str]) -> tuple[list[FileEntry], int]:
+                        types: set[str],
+                        should_stop=None) -> tuple[list[FileEntry], int]:
         """在文件内容里找关键词。有字节预算，命中即停。"""
         if not needle:
             return [], 0
@@ -240,6 +243,8 @@ class FileToolService:
         scanned = 0
         budget = _CONTENT_MAX_SCAN_BYTES
         for e in entries:
+            if should_stop is not None and should_stop():
+                break
             if types and e.ext not in types:
                 continue
             if e.size > _CONTENT_MAX_FILE_BYTES:
@@ -320,7 +325,7 @@ class FileToolService:
 
     # ── 索引 ─────────────────────────────────
 
-    def _ensure_index(self) -> list[FileEntry]:
+    def _ensure_index(self, should_stop=None) -> list[FileEntry]:
         roots = tuple(self.roots())
         fresh = (
             self._entries
@@ -331,12 +336,17 @@ class FileToolService:
             return self._entries
 
         entries, stats = local_fs.scan(
-            list(roots), max_files=MAX_INDEX_ENTRIES, should_stop=None
+            list(roots), max_files=MAX_INDEX_ENTRIES, should_stop=should_stop
         )
         self._entries = entries
         self._stats = stats
-        self._indexed_at = self._clock()
-        self._indexed_roots = roots
+        if stats.aborted:
+            # 扫描被用户中止：结果不完整，不能缓存，下次重新扫
+            self._indexed_at = 0.0
+            self._indexed_roots = ()
+        else:
+            self._indexed_at = self._clock()
+            self._indexed_roots = roots
         return entries
 
     def index_stats(self) -> dict:

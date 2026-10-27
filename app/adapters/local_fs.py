@@ -65,6 +65,7 @@ class ScanStats:
     skipped: int = 0        # 黑名单目录 / 无权限 / 非目标类型
     errors: int = 0
     truncated: bool = False  # 达到 max_files 提前停止
+    aborted: bool = False    # 被 should_stop 中断（结果不完整，不可缓存）
 
 
 @dataclass
@@ -162,6 +163,9 @@ def scan(
 
         if stats.truncated:
             break
+
+    if should_stop is not None and should_stop():
+        stats.aborted = True
 
     return entries, stats
 

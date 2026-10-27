@@ -1216,6 +1216,14 @@ class ConversationService:
         if self._file_tools is not None:
             self._file_tools.invalidate()
 
+    def _remember_reads(self, session_id: str) -> None:
+        """记录本轮读过哪些文件，供下一轮面包屑使用（空列表 = 下一轮不带）。"""
+        if self._file_tools is None:
+            return
+        self._last_reads[session_id] = [
+            e for e in self._file_tools.audit() if e.get("tool") == "read_file"
+        ]
+
     def _breadcrumb_for(self, session_id: str) -> str:
         """
         生成"上一轮读过哪些文件"的一行记录。
@@ -1401,7 +1409,9 @@ class ConversationService:
             if self._file_tools is None:
                 result = json.dumps({"error": "工具层未装配"}, ensure_ascii=False)
             else:
-                result = self._file_tools.execute(name, args)
+                result = self._file_tools.execute(
+                    name, args, should_stop=self._stop_event.is_set
+                )
 
             llm_context.messages.append({
                 "role": "tool",
@@ -1531,11 +1541,7 @@ class ConversationService:
             self._update_meta_after_reply(session_id, text, full_content)
 
             # 记录本轮读过什么，供下一轮生成面包屑（空列表 = 下一轮不带面包屑）
-            if self._file_tools is not None:
-                self._last_reads[session_id] = [
-                    e for e in self._file_tools.audit()
-                    if e.get("tool") == "read_file"
-                ]
+            self._remember_reads(session_id)
 
         try:
             async for chunk in self._run_turn(
@@ -1589,39 +1595,32 @@ class ConversationService:
         # 上下文：目标之前的全部历史 + 目标之前最后一条 user 消息文本
         # （4.1"保留该 assistant 消息之前的所有上下文"）
         user_text = self._user_text_before(session_id, target_id)
+
+        # 工具能力照常下发，但**不注入面包屑**：本次历史被截断在 target 之前，
+        # "上一轮读过什么"指的是一条不在本次上下文里的轮次，注入了只会误导。
+        tools = self._file_tools.schemas() if self._file_tools is not None else []
+
         llm_context = self._context_svc.build_llm_context(
             conversation_id=session_id,
             new_user_message=user_text,
             injected_search_text="",
             history_until=target_id,
+            tools=tools,
         )
 
         # 预分支流式：不持久化，完成时才创建分支。
         # 停止/出错（4.3）：零持久化，UI 丢弃回退——必须自然完成才落地。
         new_msg_id = str(uuid.uuid4())
-        full_parts: list[str] = []
-        thinking_parts: list[str] = []
-        completed = False
+        buf = _TurnBuffer()
 
-        async for chunk in self._llm.stream_chat(llm_context):
-            if self._stop_event.is_set():
-                yield MessageChunk(
-                    delta="", is_done=True, message_id=new_msg_id
-                )
-                break
-            chunk.message_id = new_msg_id
-            if chunk.chunk_type == ChunkType.THINKING:
-                thinking_parts.append(chunk.delta)
-            else:
-                full_parts.append(chunk.delta)
+        # 工具循环内含在 _run_turn 里：**没有 on_complete**，
+        # 因为预分支语义要求"自然完成前不落任何东西"，落库统一放在循环之后。
+        async for chunk in self._run_turn(llm_context, new_msg_id, buf, None):
             yield chunk
-            if chunk.is_done:
-                completed = True
-                break
 
-        full_content = "".join(full_parts)
-        thinking_content = "".join(thinking_parts)
-        if completed and (full_content or thinking_content):
+        full_content = "".join(buf.content)
+        thinking_content = "".join(buf.thinking)
+        if buf.completed and (full_content or thinking_content):
             # 持久化 assistant + 绑定 thinking
             asst_node = self._save_assistant_with_thinking(
                 session_id, new_msg_id, full_content, thinking_content
@@ -1635,6 +1634,7 @@ class ConversationService:
             new_chain = old_chain[:idx] + [asst_node]
             self._branch_svc.create_branch(session_id, fork_point_id, new_chain)
             self._update_meta_after_reply(session_id, user_text, full_content)
+            self._remember_reads(session_id)
 
     async def resend_edited_message(
         self,
@@ -1732,39 +1732,33 @@ class ConversationService:
         new_chain = old_chain[:idx] + [user_node]
         self._branch_svc.create_branch(session_id, fork_point_id, new_chain)
 
+        # 工具与普通发送一致；面包屑语义也一致（"上一轮"确实在历史里）
+        tools = self._file_tools.schemas() if self._file_tools is not None else []
+        breadcrumb = self._breadcrumb_for(session_id)
+        if breadcrumb:
+            full_user_text = breadcrumb + "\n\n" + full_user_text
+
         # 上下文基于新链构建（incomplete 的新 user 节点由 new_user_message 传入）
         llm_context = self._context_svc.build_llm_context(
             conversation_id=session_id,
             new_user_message=full_user_text,
             injected_search_text=search_text,
+            tools=tools,
         )
 
         new_msg_id = str(uuid.uuid4())
-        full_parts: list[str] = []
-        thinking_parts: list[str] = []
-        completed = False
+        buf = _TurnBuffer()
 
-        async for chunk in self._llm.stream_chat(llm_context):
-            if self._stop_event.is_set():
-                yield MessageChunk(
-                    delta="", is_done=True, message_id=new_msg_id
-                )
-                break
-            chunk.message_id = new_msg_id
-            if chunk.chunk_type == ChunkType.THINKING:
-                thinking_parts.append(chunk.delta)
-            else:
-                full_parts.append(chunk.delta)
+        # 同 regenerate：没有 on_complete，落库统一放在循环之后，
+        # 保证"停止 = 保持 incomplete 暂停态"这条语义不被工具轮破坏。
+        async for chunk in self._run_turn(llm_context, new_msg_id, buf, None):
             yield chunk
-            if chunk.is_done:
-                completed = True
-                break
 
-        full_content = "".join(full_parts)
-        thinking_content = "".join(thinking_parts)
+        full_content = "".join(buf.content)
+        thinking_content = "".join(buf.thinking)
         # 仅自然完成才持久化与扩展分支（5.4：停止 → 保持 incomplete 暂停态，
         # 部分内容只存在于内存，由继续生成/重新生成/放弃接管）
-        if completed and (full_content or thinking_content):
+        if buf.completed and (full_content or thinking_content):
             asst_node = self._save_assistant_with_thinking(
                 session_id, new_msg_id, full_content, thinking_content
             )
@@ -1772,6 +1766,7 @@ class ConversationService:
             self._branch_svc.extend_current_branch(session_id, [asst_node])
             self._tree.mark_incomplete(new_user_id, False)
             self._update_meta_after_reply(session_id, text, full_content)
+            self._remember_reads(session_id)
 
     async def continue_message(
         self,
