@@ -60,6 +60,35 @@ MAX_TOOL_ROUNDS = 5
 # 读进内存前的源文件上限。服务端单图上限 32 MiB，超过它连解码都没必要。
 _MAX_SOURCE_IMAGE_BYTES = 32 * 1024 * 1024
 
+# 从文档里"挑"图时的扫描上限（不是发送量，发送量由 MAX_IMAGES_PER_REQUEST 约束）。
+# 要能挑出最大的几张，就必须先把候选都读出来看看尺寸。
+_MAX_DOCX_IMAGE_SCAN = 40
+
+
+def _document_image_note(total: int, picked: list[dict]) -> str:
+    """
+    告诉模型：这份文档里的图，这次发出去几张、还剩几张。
+
+    没有这句话时，模型看到正文里的 "[图片 6]" 却只有几张贴图，很容易顺势编造。
+    """
+    if not total:
+        return ""
+    if not picked:
+        return (
+            f"[图片] 文档里有 {total} 张图片，本次一张都没发送"
+            "（格式不受支持，或单条消息的图片额度已用完）"
+        )
+
+    names = "、".join(str(a.get("name") or "") for a in picked)
+    note = f"[图片] 本次随消息附上 {len(picked)} 张：{names}"
+    remaining = total - len(picked)
+    if remaining > 0:
+        note += (
+            f"；另有 {remaining} 张未发送"
+            f"（每条消息最多 {image_attachments.MAX_IMAGES_PER_REQUEST} 张，优先发清晰的）"
+        )
+    return note
+
 
 def _describe_tool_call(call: dict) -> str:
     """把一次工具调用翻成一行给用户看的文字（只用于展示，不进入正文）。"""
@@ -1438,59 +1467,95 @@ class ConversationService:
         if not files:
             return []
 
-        text_paths: list[str] = []
+        attachments: list[dict] = []
         images: list[dict] = []
         failures: list[dict] = []
+        char_budget = message_attachments.MAX_MESSAGE_CHARS
+        image_budget = image_attachments.MAX_IMAGES_PER_REQUEST
 
+        # 逐个文件处理（而不是批量解析）：
+        # 1) 文档内嵌图片的说明要挂回它所属文档的附件文本上；
+        # 2) 字符预算要能跨文件累计。
         for path in files:
-            if self._sniff_image(path) is None:
-                text_paths.append(path)
-                continue
-            entry, reason = self._image_attachment(path)
-            if entry is not None:
-                images.append(entry)
-            else:
-                print(f"[CORE] 图片未能附加: {path} -> {reason}")
-                failures.append({
-                    "name": os.path.basename(path) or path,
-                    "text": "[这张图片没有发送成功：" + reason + "]",
-                })
+            name = os.path.basename(path) or path
 
-        pairs = await self._file_svc.extract_files(text_paths)
-        attachments, warnings = message_attachments.normalize(pairs)
-        for warning in warnings:
-            print(f"[CORE] 附件超限：{warning}")
-        attachments.extend(failures)
-
-        # 文档内嵌图片：排在文本之后，但仍受单条消息的图片张数上限约束
-        for path in text_paths:
-            if len(images) >= image_attachments.MAX_IMAGES_PER_REQUEST:
-                break
-            if os.path.splitext(path)[1].lower() != ".docx":
-                continue
-            raw_images = self._file_svc.extract_embedded_images(
-                path,
-                limit=image_attachments.MAX_IMAGES_PER_REQUEST - len(images),
-            )
-            for raw in raw_images:
-                entry, reason = self._image_from_bytes(
-                    raw, name=os.path.basename(path) or path
-                )
-                if entry is not None:
-                    images.append(entry)
+            if self._sniff_image(path) is not None:
+                entry, reason = self._image_attachment(path)
+                if entry is None:
+                    print(f"[CORE] 图片未能附加: {path} -> {reason}")
+                    failures.append({
+                        "name": name,
+                        "text": "[这张图片没有发送成功：" + reason + "]",
+                    })
+                elif image_budget <= 0:
+                    failures.append({
+                        "name": name,
+                        "text": "[图片超出单条消息上限，未发送]",
+                    })
                 else:
-                    print(f"[CORE] 文档内嵌图片跳过: {path} -> {reason}")
+                    images.append(entry)
+                    image_budget -= 1
+                continue
 
-        if len(images) > image_attachments.MAX_IMAGES_PER_REQUEST:
-            print(
-                f"[CORE] 图片数量超限，只附加前 "
-                f"{image_attachments.MAX_IMAGES_PER_REQUEST} 张"
+            pairs = await self._file_svc.extract_files([path])
+            text_atts, warnings = message_attachments.normalize(
+                pairs, max_message_chars=char_budget
             )
-            images = images[: image_attachments.MAX_IMAGES_PER_REQUEST]
+            for warning in warnings:
+                print(f"[CORE] 附件超限：{warning}")
+            char_budget -= sum(len(a.get("text") or "") for a in text_atts)
 
+            if os.path.splitext(path)[1].lower() == ".docx" and image_budget > 0:
+                picked, total = self._pick_docx_images(path, image_budget, name)
+                if total:
+                    images.extend(picked)
+                    image_budget -= len(picked)
+                    note = _document_image_note(total, picked)
+                    if text_atts:
+                        text_atts[0]["text"] = (
+                            (text_atts[0].get("text") or "") + "\n\n" + note
+                        )
+                    else:
+                        failures.append({"name": name, "text": note})
+
+            attachments.extend(text_atts)
+
+        attachments.extend(failures)
         if not attachments and not images:
             print(f"[CORE] 附件解析结果为空，未附加：{files}")
         return attachments + images
+
+    def _pick_docx_images(
+        self, path: str, budget: int, doc_name: str
+    ) -> tuple[list[dict], int]:
+        """
+        从文档里挑最多 budget 张图，返回 (选中的图片, 文档里可用的图片总数)。
+
+        **按像素面积从大到小挑**，再按原顺序返回。踩过的坑：按文档顺序取前 N 张，
+        一份"几张行内公式截图 + 三张真·截图"的文档，前 N 张全是 830×42 这种细条，
+        真正的截图一张没发出去，模型自然答不出图里的内容。
+        """
+        stem = os.path.splitext(doc_name)[0] or doc_name
+        candidates: list[tuple[int, dict]] = []
+
+        raw_images = self._file_svc.extract_embedded_images(path, limit=_MAX_DOCX_IMAGE_SCAN)
+        for index, raw in enumerate(raw_images, 1):
+            entry, reason = self._image_from_bytes(raw, name=f"{stem}-图{index}.png")
+            if entry is None:
+                print(f"[CORE] 文档内嵌图片跳过: {path}#{index} -> {reason}")
+                continue
+            candidates.append((index, entry))
+
+        if not candidates:
+            return [], 0
+
+        ranked = sorted(
+            candidates,
+            key=lambda item: (item[1].get("width") or 0) * (item[1].get("height") or 0),
+            reverse=True,
+        )
+        chosen = sorted(ranked[:budget], key=lambda item: item[0])
+        return [entry for _, entry in chosen], len(candidates)
 
     # ──────────────────────────────────────────
     # 图片附件

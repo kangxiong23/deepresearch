@@ -267,6 +267,31 @@ class TestExtractAttachments(_Tmp):
         text_entry = next(a for a in attachments if a.get("kind") != "image")
         self.assertIn("正文", text_entry["text"])
 
+    def test_prefers_larger_images_when_capped(self):
+        """按顺序取前 N 张是不够的：文档开头常是细条状行内图，真截图被挤掉。"""
+        from docx import Document
+
+        document = Document()
+        document.add_paragraph("正文")
+        for i in range(5):
+            document.add_picture(
+                self.write("strip%d.png" % i, png_bytes(400, 30, color=(10 + i * 10, 0, 0)))
+            )
+        document.add_picture(self.write("big.png", png_bytes(900, 700, color=(0, 120, 200))))
+        path = os.path.join(self.dir, "mixed.docx")
+        document.save(path)
+
+        attachments = asyncio.run(self._service()._extract_attachments([path]))
+
+        images = [a for a in attachments if a.get("kind") == "image"]
+        self.assertEqual(len(images), image_attachments.MAX_IMAGES_PER_REQUEST)
+        areas = [a["width"] * a["height"] for a in images]
+        self.assertIn(900 * 700, areas)
+
+        text = next(a for a in attachments if a.get("kind") != "image")
+        self.assertIn("[图片] 本次随消息附上", text["text"])
+        self.assertIn("未发送", text["text"])
+
     def test_too_many_images_are_capped(self):
         paths = [self.write("p%d.png" % i, png_bytes(32, 32)) for i in range(7)]
 

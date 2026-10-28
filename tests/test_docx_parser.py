@@ -197,7 +197,10 @@ class TestDocxStructure(_DocxFixture):
         text = self.parser.extract_text_sync(self._save(document))
 
         self.assertIn("[图片 1]", text)
-        self.assertIn("未做文字识别", text)
+        # 只报事实："文档含 N 张图片"。刻意不再写"未做文字识别"——
+        # 文档作为消息附件时图片是会发出去的，那句话会误导模型。
+        self.assertIn("文档含 1 张图片", text)
+        self.assertNotIn("未做文字识别", text)
 
 
 class TestDocxMarkup(_DocxFixture):

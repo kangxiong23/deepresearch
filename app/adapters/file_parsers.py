@@ -184,10 +184,9 @@ class DocxParser:
 
         media = _count_media(file_path)
         if media:
-            chunks.append(
-                f"[备注] 文档含 {media} 张图片，未做文字识别"
-                "（图片里的文字需另附图片或手动摘录）"
-            )
+            # 只报事实（文档里有几张图）。刻意不再断言"未做文字识别"：
+            # 文档作为消息附件时图片是会随消息发出去的，说"没识别"会反过来误导模型。
+            chunks.append(f"[备注] 文档含 {media} 张图片]")
 
         return "\n\n".join(c for c in chunks if c and c.strip())
 
@@ -694,7 +693,11 @@ def _count_media(file_path: str) -> int:
     try:
         import zipfile
         with zipfile.ZipFile(file_path) as archive:
-            return sum(1 for n in archive.namelist() if n.startswith("word/media/"))
+            # 目录条目 "word/media/" 本身也会出现在 namelist 里，不排除会多数一张
+            return sum(
+                1 for n in archive.namelist()
+                if n.startswith("word/media/") and not n.endswith("/")
+            )
     except Exception:
         return 0
 
