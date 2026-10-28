@@ -1203,6 +1203,21 @@ class ConversationService:
         )
         return ""
 
+    def read_attachment_bytes(self, blob_id: str) -> bytes | None:
+        """
+        按 blob_id 读附件原始字节（只给界面画预览用）。
+
+        刻意不做解析、不做格式判断：能不能显示是 UI 的事，
+        这里只负责把快照取出来；读不到返回 None。
+        """
+        if self._blobs is None or not blob_id:
+            return None
+        try:
+            return self._blobs.read_bytes(blob_id)
+        except OSError as e:
+            print(f"[CORE] 读取附件快照失败 {blob_id[:12]}: {e}")
+            return None
+
     def get_attachments_view(self, node_id: str) -> dict:
         """
         返回该节点**实际生效**的附件视图（管理面板用）。

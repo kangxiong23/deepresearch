@@ -22,6 +22,7 @@ from PySide6.QtGui import QFont, QFontMetrics, QKeyEvent, QTextCursor, QTextOpti
 
 import config as app_config
 from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
+from app.ui.widgets.image_preview import ImageSource, MiniThumb, is_image_path
 
 
 # ──────────────────────────────────────────────
@@ -410,13 +411,13 @@ class AttachmentBar(QWidget):
         """添加文件标签。"""
         self._files.append((name, abs_path or name))
 
-        chip = self._make_chip(name)
+        chip = self._make_chip(name, abs_path or name)
         self._layout.insertWidget(self._layout.count() - 1, chip)
         self.setVisible(True)
         self.files_changed.emit()
 
-    def _make_chip(self, name: str) -> QFrame:
-        """创建单个文件标签控件。"""
+    def _make_chip(self, name: str, path: str = "") -> QFrame:
+        """创建单个文件标签控件（图片显示小缩略图，可点开看原图）。"""
         chip = QFrame()
         apply_style(chip, lambda: f"""
             QFrame {{
@@ -431,9 +432,14 @@ class AttachmentBar(QWidget):
         chip_layout.setContentsMargins(6, 3, 2, 3)
         chip_layout.setSpacing(4)
 
-        # 文件图标
-        icon_label = QLabel("📎")
-        icon_label.setFont(Fonts.body(10))
+        # 文件图标（图片直接用缩略图，发送前就能确认选对了）
+        if path and is_image_path(path):
+            thumb = MiniThumb(ImageSource(name=name, path=path), side=22)
+            chip_layout.addWidget(thumb)
+        else:
+            icon_label = QLabel("📎")
+            icon_label.setFont(Fonts.body(10))
+            chip_layout.addWidget(icon_label)
 
         # 文件名
         name_label = QLabel(name)
@@ -465,7 +471,6 @@ class AttachmentBar(QWidget):
         """)
         remove_btn.clicked.connect(lambda: self._remove(name))
 
-        chip_layout.addWidget(icon_label)
         chip_layout.addWidget(name_label)
         chip_layout.addWidget(remove_btn)
 
@@ -485,8 +490,8 @@ class AttachmentBar(QWidget):
                 item.widget().deleteLater()
 
         # 重新添加标签
-        for name, _ in self._files:
-            chip = self._make_chip(name)
+        for name, path in self._files:
+            chip = self._make_chip(name, path)
             self._layout.insertWidget(self._layout.count() - 1, chip)
 
         if not self._files:

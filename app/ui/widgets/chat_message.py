@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
+    QGridLayout,
     QLabel,
     QTextBrowser,
     QPushButton,
@@ -25,6 +26,14 @@ from PySide6.QtCore import Qt, Signal, QPointF
 from PySide6.QtGui import QFont, QColor, QPainter, QPolygonF
 
 from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
+from app.ui.widgets.image_preview import (
+    ImageSource,
+    ImageTile,
+    TILE_MAX_H,
+    TILE_MAX_W,
+    TILE_SIZE_PRESETS,
+    is_image_path,
+)
 
 
 # ──────────────────────────────────────────────
@@ -540,6 +549,24 @@ class _AttachmentChip(QFrame):
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
 
 
+def _is_image_item(att: dict) -> bool:
+    """这条附件是不是图片（决定画缩略图还是文字 chip）。"""
+    kind = str(att.get("kind") or "")
+    if kind == "image":
+        return True
+    if kind:
+        return False
+    # 发送中的附件还没落库，只有本地路径，按扩展名粗判
+    return bool(att.get("path")) and is_image_path(str(att.get("path")))
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _format_bytes(size: int) -> str:
     """320 KB / 1.2 MB 这类人类可读大小。"""
     try:
@@ -659,15 +686,29 @@ class ChatMessage(QFrame):
         if content:
             self._content_browser.setHtml(_render_markdown(content))
 
-        # ── 附件标签行（仅带附件的 user 消息显示）─────
+        # ── 附件区（仅带附件的 user 消息显示）─────
+        # 图片走缩略图（点开看原图），其它文件走文字 chip：
+        #     [图1] [图2] [图3]      ← 网格，每行最多 3 张
+        #     📎 a.docx  📎 b.pdf    ← 文字 chip 行
         self._attachments_widget = QWidget()
         self._attachments_widget.setStyleSheet(
             "QWidget { background-color: transparent; }"
         )
-        self._attachments_layout = QHBoxLayout(self._attachments_widget)
-        self._attachments_layout.setContentsMargins(0, 0, 0, 0)
-        self._attachments_layout.setSpacing(Spacing.XS)
-        self._attachments_layout.addStretch()
+        attachments_vbox = QVBoxLayout(self._attachments_widget)
+        attachments_vbox.setContentsMargins(0, 0, 0, 0)
+        attachments_vbox.setSpacing(Spacing.XS)
+
+        self._image_grid = QGridLayout()
+        self._image_grid.setContentsMargins(0, 0, 0, 0)
+        self._image_grid.setSpacing(Spacing.XS)
+        attachments_vbox.addLayout(self._image_grid)
+
+        self._chip_row = QHBoxLayout()
+        self._chip_row.setContentsMargins(0, 0, 0, 0)
+        self._chip_row.setSpacing(Spacing.XS)
+        self._chip_row.addStretch()
+        attachments_vbox.addLayout(self._chip_row)
+
         self._attachments_widget.setVisible(False)
 
         self._basenames: list[str] = [
@@ -909,13 +950,20 @@ class ChatMessage(QFrame):
         doc = self._content_browser.document()
         doc.setTextWidth(-1)
         ideal = int(doc.size().width())
+        # 附件区可能比正文宽（一张缩略图就有 132px），气泡要跟着放宽，
+        # 否则图片行会被 fixed 宽度裁掉
+        attach_w = self._attachment_width()
         available = self.width() - 2 * Spacing.LG  # 外层 HBox 左右边距
         max_w = max(
             int(self._conversation_area_width() * BUBBLE_MAX_RATIO),
             MIN_BUBBLE_WIDTH,
         )
         target = min(
-            max(ideal + _BUBBLE_H_PADDING, MIN_BUBBLE_WIDTH),
+            max(
+                ideal + _BUBBLE_H_PADDING,
+                attach_w + _BUBBLE_H_PADDING,
+                MIN_BUBBLE_WIDTH,
+            ),
             max_w,
             max(available, MIN_BUBBLE_WIDTH),
         )
@@ -930,6 +978,18 @@ class ChatMessage(QFrame):
             self._bubble_stack.updateGeometry()
             self.updateGeometry()
             self.layout().activate()
+
+    def _attachment_width(self) -> int:
+        """附件区的自然宽度；没有附件或尚未显示时为 0。"""
+        try:
+            if not self._attachments_widget.isVisible():
+                return 0
+            layout = self._attachments_widget.layout()
+            if layout is not None:
+                layout.activate()
+            return int(self._attachments_widget.sizeHint().width())
+        except RuntimeError:
+            return 0
 
     def _update_content_height(self) -> None:
         """
@@ -1056,41 +1116,82 @@ class ChatMessage(QFrame):
 
     def set_attachments(self, attachments: list[dict] | None) -> None:
         """
-        设置/刷新附件 chip（仅名字 + 字符数）。
+        设置/刷新附件区：图片显示缩略图，其它文件显示文字 chip。
 
         只展示"这条消息带了哪些资料"，绝不渲染正文：附件文本在
         messages.attachments 里，只有构建 LLM 上下文时才展开。
         复制按钮因此只复制用户自己写的字。
+
+        图片的缩略图/查看器只按 blob_id 或本地路径读字节来显示，
+        不参与解析、不参与发送，附件文本与图片内容仍由 Core 负责。
         """
         items: list[dict] = []
-        for att in (attachments or []):
-            name = str((att or {}).get("name") or "").strip()
+        for raw in (attachments or []):
+            att = raw or {}
+            name = str(att.get("name") or "").strip()
             if not name:
                 continue
             try:
-                chars = int((att or {}).get("chars") or 0)
+                chars = int(att.get("chars") or 0)
             except (TypeError, ValueError):
                 chars = 0
             items.append({
                 "name": name,
                 "chars": chars,
-                "kind": str((att or {}).get("kind") or ""),
-                "size": int((att or {}).get("size") or 0),
+                "kind": str(att.get("kind") or ""),
+                "size": _safe_int(att.get("size")),
+                "blob_id": str(att.get("blob_id") or ""),
+                "path": str(att.get("path") or ""),
+                "width": _safe_int(att.get("width")),
+                "height": _safe_int(att.get("height")),
             })
 
         self._attachment_details = items
 
-        # 清空旧 chip（保留末尾 stretch）
-        while self._attachments_layout.count() > 1:
-            item = self._attachments_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        # 清空旧内容（grid 全清；chip 行保留末尾 stretch）
+        while self._image_grid.count():
+            taken = self._image_grid.takeAt(0)
+            old = taken.widget()
+            if old is not None:
+                old.hide()
+                old.deleteLater()
+        while self._chip_row.count() > 1:
+            taken = self._chip_row.takeAt(0)
+            old = taken.widget()
+            if old is not None:
+                old.hide()
+                old.deleteLater()
 
-        for att in items:
-            chip = _AttachmentChip(att["name"], att["chars"], att["kind"], att["size"])
-            self._attachments_layout.insertWidget(
-                self._attachments_layout.count() - 1, chip
+        images = [item for item in items if _is_image_item(item)]
+        files = [item for item in items if not _is_image_item(item)]
+
+        # 图片：每行最多 3 张，多余换行（不占用气泡横向空间）。
+        # 张数少时给更大的预览：1 张 288×190，2 张 200×140，3 张以上 132×100。
+        columns = max(1, min(3, len(images)))
+        tile_w, tile_h = TILE_SIZE_PRESETS.get(
+            len(images), (TILE_MAX_W, TILE_MAX_H)
+        )
+        tiles = []
+        for index, att in enumerate(images):
+            tile = ImageTile(ImageSource.of(att), max_w=tile_w, max_h=tile_h)
+            self._image_grid.addWidget(
+                tile,
+                index // columns,
+                index % columns,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
             )
+            tiles.append(tile)
+        # 同一行的图统一高度，宽高比不同也不会参差
+        for start in range(0, len(tiles), columns):
+            row = tiles[start:start + columns]
+            row_height = max(tile.image_box.height() for tile in row)
+            for tile in row:
+                tile.align_height(row_height)
+
+        # 文件：沿用原来的文字 chip
+        for att in files:
+            chip = _AttachmentChip(att["name"], att["chars"], att["kind"], att["size"])
+            self._chip_row.insertWidget(self._chip_row.count() - 1, chip)
 
         self._attachments_widget.setVisible(bool(items))
         # 构造期（__init__ 里首次设置）气泡堆尚未建好，高度在 showEvent 后重算

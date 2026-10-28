@@ -2,6 +2,12 @@
 # File: app/ui/widgets/__init__.py
 
 from app.ui.widgets.chat_message import ChatMessage, ThinkingBlock, _role_badge
+from app.ui.widgets.image_preview import (
+    ImageSource,
+    ImageTile,
+    ImageViewer,
+    show_image,
+)
 from app.ui.widgets.input_area import InputArea, ToggleChip, ModelSelector, AttachmentBar
 from app.ui.widgets.tree_panel import TreePanel
 from app.ui.widgets.sidebar import Sidebar
@@ -18,6 +24,10 @@ __all__ = [
     "ChatMessage",
     "ThinkingBlock",
     "_role_badge",
+    "ImageSource",
+    "ImageTile",
+    "ImageViewer",
+    "show_image",
     "InputArea",
     "ToggleChip",
     "ModelSelector",

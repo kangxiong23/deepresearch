@@ -447,9 +447,14 @@ class AppController:
                 {
                     "name": str(a.get("name") or ""),
                     "chars": len(a.get("text") or ""),
-                    # 图片没有文本，靠 kind/size 让 chip 显示成"图片 · 320 KB"
+                    # 图片没有文本，靠 kind/size 让 chip 显示成"图片 · 320 KB"；
+                    # blob_id/width/height 仅供气泡画缩略图，不参与上下文构建
                     "kind": str(a.get("kind") or ""),
                     "size": int(a.get("size") or 0),
+                    "blob_id": str(a.get("blob_id") or ""),
+                    "mime": str(a.get("mime") or ""),
+                    "width": int(a.get("width") or 0),
+                    "height": int(a.get("height") or 0),
                 }
                 for a in (getattr(domain_obj, "attachments", None) or [])
                 if str(a.get("name") or "")
@@ -1080,6 +1085,17 @@ class AppController:
     def on_detach_file(self, folder_id: str, file_path: str) -> str:
         """UI 调用：从目录移除附件（路径 / 展示名 / blob_id 均可）。"""
         return self._conversation_svc.detach_file(folder_id, file_path)
+
+    def on_read_attachment_bytes(self, blob_id: str) -> bytes | None:
+        """
+        UI 调用：按 blob_id 读图片附件原始字节。
+
+        只服务于气泡缩略图 / 放大查看，不进入上下文构建，也不缓存。
+        读不到返回 None（附件可能已被回收站清理），UI 降级为占位图。
+        """
+        if not blob_id:
+            return None
+        return self._conversation_svc.read_attachment_bytes(blob_id)
 
     def on_get_node_attachments(self, node_id: str) -> dict:
         """

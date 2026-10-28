@@ -262,6 +262,17 @@ UI 在发送前弹一次确认，`expand()` 也会在标注里写"当前模型�
   3 张 1344×709 真截图"的文档，发出去的全是细条，真截图一张没发，模型自然答不出图里写了
   什么。选完在文档正文末尾补一行 `[图片] 本次随消息附上 N 张：…；另有 M 张未发送`，
   否则模型看到正文里 "[图片 6]" 的标记却没有对应图片，很容易顺势编造。
+- **预览（纯展示层）**。气泡里的图片附件显示缩略图，点击打开原图查看器
+  （`app/ui/widgets/image_preview.py`）：滚轮以光标为锚点缩放、拖拽平移、双击在"适应窗口/
+  原始大小"间切换、`Ctrl+0/1`、`Ctrl+S` 另存原图。缩略图按张数给不同上限（1 张 288×190，
+  2 张 200×140，3 张以上 132×100），同一行的图统一高度（`align_height`），细长图（830×42 的
+  行内公式）保 40px 下限，否则缩完只有 7px 高、根本点不到。解码走 `QImageReader.setScaledSize`，
+  不先把 4000×3000 全解出来再缩；**原图不进缓存**（一张就 48 MB），缩略图缓存 64 条。
+  这段只读字节，不解析、不落库、不发送：已落库的附件按 `blob_id` 经
+  `AppController.on_read_attachment_bytes` 取快照，发送中的附件按本地路径读，
+  读不到就画"无法预览"占位，消息本身照常。
+  气泡宽度计算必须带上附件区（`_attachment_width()`）——气泡宽度是
+  `setMinimumWidth/setMaximumWidth` 锁死的，漏算会把整行缩略图裁掉。
 - 已知缺口：挂载的图片不发送（受"图片只能在 user 消息"限制）。
 
 ### Key files
@@ -304,7 +315,8 @@ UI 在发送前弹一次确认，`expand()` 也会在标注里写"当前模型�
 | `app/ui/theme.py` | Colors, Fonts, Spacing, Radius constants + `build_global_stylesheet()` |
 | `app/ui/widgets/tree_panel.py` | TreePanel — QTreeView + QStandardItemModel, _TreeStyle (custom checkboxes/arrows), right-click menus, drag-drop |
 | `app/ui/widgets/sidebar.py` | Sidebar — header + action buttons + TreePanel + bottom entries |
-| `app/ui/widgets/chat_message.py` | ChatMessage — role-styled message bubble, Markdown rendering, copy/regenerate/remember buttons |
+| `app/ui/widgets/chat_message.py` | ChatMessage — role-styled message bubble, Markdown rendering, 附件缩略图行, copy/regenerate/remember buttons |
+| `app/ui/widgets/image_preview.py` | 图片预览：气泡缩略图（ImageTile）、原图查看器（ImageViewer，缩放/平移/另存） |
 | `app/ui/widgets/input_area.py` | InputArea — text input, ModelSelector, ToggleChip (thinking/search), AttachmentBar, send/stop buttons |
 | `app/ui/widgets/context_panel.py` | ContextPanel — context block list, preview, template management |
 | `app/ui/widgets/kg_panel.py` | KGPanel — knowledge graph entity/relation viewer |

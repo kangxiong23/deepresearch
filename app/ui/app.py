@@ -26,6 +26,7 @@ from app.ui.main_window import MainWindow
 from app.ui.widgets.chat_message import ChatMessage, ThinkingBlock
 from app.ui.widgets.search_popup import SearchPopup
 from app.ui.widgets.sidebar import Sidebar
+from app.ui.widgets import image_preview
 from app.ui.widgets.file_access_dialog import show_file_access_dialog
 from app.ui.widgets.attachment_dialog import show_attachment_dialog
 from app.ui.async_bridge import (
@@ -35,6 +36,20 @@ from app.ui.async_bridge import (
 )
 from app.utils.draft_store import DraftStore
 from app.utils.file_access_settings import FileAccessSettings
+
+
+def _pending_attachment(path: str) -> dict:
+    """
+    发送中的附件先拼一个展示用条目。
+
+    此时文件还没解析、没落快照，气泡里先按本地路径画缩略图（图片）
+    或只显示文件名（其它）。解析失败的文件不会落库，下一次树刷新
+    会以 messages.attachments 的真实结果为准。
+    """
+    name = os.path.basename(path) or path
+    if image_preview.is_image_path(path):
+        return {"name": name, "kind": "image", "path": path}
+    return {"name": name}
 
 
 class ChatApp:
@@ -50,6 +65,12 @@ class ChatApp:
     def __init__(self, app_controller, settings_controller) -> None:
         self._ctrl = app_controller
         self._settings_ctrl = settings_controller
+
+        # 气泡里的图片缩略图要读原图字节：接上 Controller 的只读访问器
+        # （UI 不碰 data/files 布局，取不到就降级成占位图）
+        image_preview.set_blob_reader(
+            getattr(app_controller, "on_read_attachment_bytes", None)
+        )
 
         # ── 状态（与 Flet 版本 ChatApp 字段一一对应）──
         self._current_session_id: str = ""
@@ -752,9 +773,7 @@ class ChatApp:
         # 解析失败的文件不会算作附件，下一次树刷新会以落库结果为准）
         user_msg = ChatMessage(role="user", content=text)
         if files:
-            user_msg.set_attachments(
-                [{"name": os.path.basename(p) or p} for p in files]
-            )
+            user_msg.set_attachments([_pending_attachment(p) for p in files])
         user_msg.message_id = ""  # 用户消息在流完成后由 tree refresh 更新
         self._connect_message_signals(user_msg)
         self._append_message(user_msg)
@@ -1161,9 +1180,7 @@ class ChatApp:
                 w.set_translucent(False)
                 # 只有本次真的换了文件才刷新 chip；否则沿用原附件（后端同样保留）
                 if files:
-                    w.set_attachments(
-                        [{"name": os.path.basename(p) or p} for p in files]
-                    )
+                    w.set_attachments([_pending_attachment(p) for p in files])
                 target_widget = w
                 target_idx = i
                 break
