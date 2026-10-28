@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import os
+
 from PySide6.QtWidgets import (
     QFrame,
     QWidget,
@@ -22,6 +24,7 @@ from PySide6.QtGui import QFont, QFontMetrics, QKeyEvent, QTextCursor, QTextOpti
 
 import config as app_config
 from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
+from app.ui.widgets.file_drop import is_supported_path
 from app.ui.widgets.image_preview import ImageSource, MiniThumb, is_image_path
 
 
@@ -407,14 +410,18 @@ class AttachmentBar(QWidget):
         self.setVisible(False)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
 
-    def add_file(self, name: str, abs_path: str = "") -> None:
-        """添加文件标签。"""
-        self._files.append((name, abs_path or name))
+    def add_file(self, name: str, abs_path: str = "") -> bool:
+        """添加文件标签；同一路径重复添加会被忽略，返回是否真的加进去了。"""
+        path = abs_path or name
+        if any(existing == path for _, existing in self._files):
+            return False
+        self._files.append((name, path))
 
-        chip = self._make_chip(name, abs_path or name)
+        chip = self._make_chip(name, path)
         self._layout.insertWidget(self._layout.count() - 1, chip)
         self.setVisible(True)
         self.files_changed.emit()
+        return True
 
     def _make_chip(self, name: str, path: str = "") -> QFrame:
         """创建单个文件标签控件（图片显示小缩略图，可点开看原图）。"""
@@ -577,6 +584,9 @@ class InputArea(QFrame):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Minimum,
         )
+        # 文件拖进来要变成附件，而不是把路径当文字插进输入框，
+        # 所以关掉 QTextEdit 自己的拖放：事件会冒泡到 ChatDropArea。
+        self._text_edit.setAcceptDrops(False)
         # 启用 Enter 发送
         self._text_edit.installEventFilter(self)
         self._text_edit.setWordWrapMode(QTextOption.WrapMode.WordWrap)
@@ -941,10 +951,7 @@ class InputArea(QFrame):
             "*.png *.jpg *.jpeg *.webp *.gif);;所有文件 (*.*)",
         )
         if paths:
-            import os
-            for p in paths:
-                name = os.path.basename(p)
-                self._attachment_bar.add_file(name, p)
+            self.add_files(paths)
 
     # ── 芯片回调 ───────────────────────────────
 
@@ -961,6 +968,36 @@ class InputArea(QFrame):
         self.search_toggled.emit(val)
 
     # ── 公开接口 ──────────────────────────────
+
+    def insert_text(self, text: str) -> None:
+        """把外部拖进来的文字插到光标处，并聚焦输入框。"""
+        if not text:
+            return
+        cursor = self._text_edit.textCursor()
+        cursor.insertText(text)
+        self._text_edit.setTextCursor(cursor)
+        self._text_edit.setFocus()
+
+    def add_files(self, paths: list[str]) -> tuple[int, int]:
+        """
+        把一批文件加进附件条（文件对话框与拖放共用同一个入口）。
+
+        Returns:
+            (新增数, 跳过数)。跳过 = 格式不支持 / 路径失效 / 已经在列表里。
+        """
+        added = 0
+        skipped = 0
+        for raw in (paths or []):
+            path = str(raw or "").strip()
+            if not path or not is_supported_path(path) or not os.path.isfile(path):
+                skipped += 1
+                continue
+            name = os.path.basename(path) or path
+            if self._attachment_bar.add_file(name, path):
+                added += 1
+            else:
+                skipped += 1
+        return added, skipped
 
     def set_generating(self, generating: bool) -> None:
         """切换生成状态（发送 ↔ 停止）。"""

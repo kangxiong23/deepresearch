@@ -2,6 +2,7 @@
 # File: app/ui/widgets/__init__.py
 
 from app.ui.widgets.chat_message import ChatMessage, ThinkingBlock, _role_badge
+from app.ui.widgets.file_drop import ChatDropArea, collect_files, is_supported_path
 from app.ui.widgets.image_preview import (
     ImageSource,
     ImageTile,
@@ -24,6 +25,9 @@ __all__ = [
     "ChatMessage",
     "ThinkingBlock",
     "_role_badge",
+    "ChatDropArea",
+    "collect_files",
+    "is_supported_path",
     "ImageSource",
     "ImageTile",
     "ImageViewer",

@@ -194,6 +194,22 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 `TEXT` 的空列，并让 `save_message` 在落库处报 "no column named attachments"（发送链路整条断掉，
 界面上只剩一个空白气泡）。
 
+**拖放添加附件 (D4)**。资源管理器里的文件可以直接拖进聊天区，效果等同点回形针：
+只进附件条，**不自动发送**（手滑拖个文件就把消息发出去是不能接受的）。
+
+- 落点只有聊天区整块（`app/ui/widgets/file_drop.py: ChatDropArea`，消息列表和输入框都在里面）。
+  左侧树自己吃树节点拖拽（`application/x-treenode-id`），两边抢同一个落点会误操作；
+  右侧面板不接。
+- **输入框和气泡正文必须关掉拖放**：`QTextEdit`/`QTextBrowser` 默认吃 `text/uri-list`，
+  会把文件路径当文字插进输入框或历史消息。`setAcceptDrops(False)` 之后事件沿父链冒泡到
+  `ChatDropArea`（Qt 找的是第一个 `acceptDrops()` 为真的控件，所以这条链上一个都不能留）。
+  代价是输入框原本"拖一段文字进去"没了，用 `ChatDropArea.text_dropped` →
+  `InputArea.insert_text()` 接回来。
+- 文件夹递归展开（跳过 `.` 开头的目录），单次最多 20 个文件（`MAX_DROP_FILES`）；
+  不支持的格式、重复路径、超额的部分都跳过，用一条 `QToolTip` 汇总说明，不弹对话框打断。
+- 拖拽经过时盖一层虚线遮罩（`_DropOverlay`）：它带 `WA_TransparentForMouseEvents`，
+  只负责画，不能挡住底下的拖放落点。
+
 **节点挂载 (D2)**。`ConversationService.attach_file` 走 `FileBlobStore` 复制字节进
 `data/files/<sha256>`（天然去重，单文件 20 MB / 单节点 200 MB 上限），节点上只存
 `mounts: [{blob_id, name, size, mtime, sha256, added_at, source_path}]`。源文件被移动/
@@ -317,6 +333,7 @@ UI 在发送前弹一次确认，`expand()` 也会在标注里写"当前模型�
 | `app/ui/widgets/sidebar.py` | Sidebar — header + action buttons + TreePanel + bottom entries |
 | `app/ui/widgets/chat_message.py` | ChatMessage — role-styled message bubble, Markdown rendering, 附件缩略图行, copy/regenerate/remember buttons |
 | `app/ui/widgets/image_preview.py` | 图片预览：气泡缩略图（ImageTile）、原图查看器（ImageViewer，缩放/平移/另存） |
+| `app/ui/widgets/file_drop.py` | 聊天区拖放：文件/文件夹 → 附件条，纯文字 → 输入框，拖拽遮罩 |
 | `app/ui/widgets/input_area.py` | InputArea — text input, ModelSelector, ToggleChip (thinking/search), AttachmentBar, send/stop buttons |
 | `app/ui/widgets/context_panel.py` | ContextPanel — context block list, preview, template management |
 | `app/ui/widgets/kg_panel.py` | KGPanel — knowledge graph entity/relation viewer |

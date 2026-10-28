@@ -19,10 +19,19 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QApplication,
 )
-from PySide6.QtCore import Qt, QMargins, QPropertyAnimation, QEasingCurve, QPoint, QTimer
+from PySide6.QtCore import (
+    Qt,
+    QMargins,
+    QPoint,
+    QPropertyAnimation,
+    QEasingCurve,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QFont
 
 from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
+from app.ui.widgets.file_drop import ChatDropArea
 from app.ui.widgets.input_area import InputArea
 from app.ui.widgets.sidebar import Sidebar
 from app.ui.widgets.context_panel import ContextPanel
@@ -717,6 +726,9 @@ class MainWindow(QMainWindow):
         QStackedWidget 包裹 ContextPanel (index 0) 和 KGPanel (index 1)
     """
 
+    # 从资源管理器拖文件进聊天区（ChatApp 接住后加进附件条）
+    files_dropped = Signal(list)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("DeepResearch")
@@ -757,8 +769,14 @@ class MainWindow(QMainWindow):
         chat_area.addWidget(self._message_list, stretch=1)
         chat_area.addWidget(self._input_area)
 
-        chat_widget = QWidget()
+        # 聊天区整块都是拖放落点（消息列表 + 输入框），
+        # 左侧树/右侧面板不参与，免得和树节点拖拽打架
+        chat_widget = ChatDropArea()
         chat_widget.setLayout(chat_area)
+        chat_widget.files_dropped.connect(self.files_dropped)
+        # 拖一段文字进来 → 插到输入框光标处（QTextEdit 自己的拖放已关闭）
+        chat_widget.text_dropped.connect(self._input_area.insert_text)
+        self.chat_drop_area = chat_widget
 
         # ── 右侧面板 ─────────────────────────────
         self._context_panel = ContextPanel()

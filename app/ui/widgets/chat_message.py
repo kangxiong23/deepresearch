@@ -680,6 +680,9 @@ class ChatMessage(QFrame):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Minimum,
         )
+        # 只读气泡不接受拖放：文件拖到气泡上时，事件要冒泡到聊天区
+        # （ChatDropArea）变成附件，而不是把路径塞进这条历史消息
+        self._content_browser.setAcceptDrops(False)
 
         # 设置初始内容 — 高度在 showEvent / resizeEvent 中计算
         # （此时 viewport().width() 为 0，计算出的高度无效）

@@ -14,9 +14,10 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QMessageBox,
     QFileDialog,
+    QToolTip,
 )
 from PySide6.QtCore import Qt, QThread, QTimer
-from PySide6.QtGui import QShortcut, QKeySequence
+from PySide6.QtGui import QCursor, QShortcut, QKeySequence
 
 import config as app_config
 from app.core import image_attachments
@@ -27,6 +28,7 @@ from app.ui.widgets.chat_message import ChatMessage, ThinkingBlock
 from app.ui.widgets.search_popup import SearchPopup
 from app.ui.widgets.sidebar import Sidebar
 from app.ui.widgets import image_preview
+from app.ui.widgets.file_drop import MAX_DROP_FILES, collect_files
 from app.ui.widgets.file_access_dialog import show_file_access_dialog
 from app.ui.widgets.attachment_dialog import show_attachment_dialog
 from app.ui.async_bridge import (
@@ -182,6 +184,9 @@ class ChatApp:
         input_area.reasoning_effort_changed.connect(
             lambda e: self._settings_ctrl.on_change_reasoning_effort(e)
         )
+
+        # ── 拖放：文件拖进聊天区 → 附件条 ─────────
+        self._window.files_dropped.connect(self._on_files_dropped)
 
         # ── Sidebar 顶部按钮信号 ──────────────────
         sidebar = self._window.sidebar
@@ -817,6 +822,27 @@ class ChatApp:
             QMessageBox.StandardButton.No,
         )
         return answer == QMessageBox.StandardButton.Yes
+
+    def _on_files_dropped(self, paths: list[str]) -> None:
+        """
+        把拖进聊天区的文件变成消息附件（与点回形针完全等价，不自动发送）。
+
+        文件夹会展开成里面的支持文件；不支持的格式和重复文件跳过，
+        用一条 tooltip 说明，不弹对话框打断。
+        """
+        result = collect_files(paths, MAX_DROP_FILES)
+        added, skipped = self._window.input_area.add_files(result.files)
+        skipped += result.skipped
+
+        messages = []
+        if added:
+            messages.append(f"已添加 {added} 个附件")
+        if skipped:
+            messages.append(f"{skipped} 个已忽略（格式不支持或重复）")
+        if result.truncated:
+            messages.append(f"单次最多 {MAX_DROP_FILES} 个文件")
+        if messages:
+            QToolTip.showText(QCursor.pos(), "，".join(messages), self._window)
 
     def _handle_stop(self) -> None:
         """停止当前生成。
