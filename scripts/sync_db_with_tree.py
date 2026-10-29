@@ -83,6 +83,33 @@ def _table_exists(name: str) -> bool:
     return row is not None
 
 
+def collect_branch_keep_ids(
+    store: BranchStore | None = None,
+) -> tuple[set[str], set[str]]:
+    """
+    分支存储引用的消息行——即使用户当前看不到它们，也必须保留。
+
+    分支切换会把旧链归档进 SQLite（tree.json 只存当前链），这些行一旦被当孤儿
+    删掉，切回旧分支就是一片空白。
+
+    Args:
+        store: BranchStore（测试注入用；默认新建，读 config 的 DB_PATH）
+
+    Returns:
+        (node_ids, thinking_ids)：branch_nodes 引用的 node_id + fork_nodes 归档的
+        node_id，以及 fork_nodes 绑定的 thinking_message_id。
+    """
+    store = store or BranchStore()
+    node_ids: set[str] = set()
+    thinking_ids: set[str] = set()
+    if _table_exists("branch_nodes"):
+        node_ids |= store.get_all_referenced_node_ids()
+    if _table_exists("fork_nodes"):
+        node_ids |= store.get_all_archived_node_ids()
+        thinking_ids |= store.get_all_thinking_message_ids()
+    return node_ids, thinking_ids
+
+
 def main() -> int:
     execute = "--execute" in sys.argv[1:]
 
@@ -96,11 +123,8 @@ def main() -> int:
     referenced: set[str] = set()
     referenced |= _collect_tree_references()
     referenced |= _collect_trash_references()
-    if _table_exists("branch_nodes"):
-        referenced |= branch_store.get_all_referenced_node_ids()
-    if _table_exists("fork_nodes"):
-        referenced |= branch_store.get_all_archived_node_ids()
-        referenced |= branch_store.get_all_thinking_message_ids()
+    node_ids, thinking_ids = collect_branch_keep_ids(branch_store)
+    referenced |= node_ids | thinking_ids
 
     all_messages = message_repo.get_all_messages()
     orphans = [m for m in all_messages if m.id not in referenced]
