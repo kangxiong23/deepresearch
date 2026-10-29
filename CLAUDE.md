@@ -231,6 +231,28 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 表（每对话保留 50 条，`ReadLogStore`），下一轮面包屑 `_breadcrumb_for` 从这份持久化
 记录推导（重启仍在；以前是内存字典，重启即丢）。
 
+**本地文件夹授权 (D5)**。工具能读哪些目录**不是全局常量**，而是按对话算出来的三层叠加：
+全局授权（`data/file_access.json`，管所有对话）→ 祖先文件夹的 `local_roots`（管这一支）
+→ 对话自身的 `local_roots`（只管这一条）。`ConversationService.effective_file_roots()`
+是唯一算法入口，`_tool_schemas()` 在每次发送前把它交给 `FileToolService.set_scope()`。
+
+- **`FileToolService` 自己不再读 `config`**。同一进程里两个对话的可见范围不同，全局单例
+  表达不了；`roots()` 里那段 config 回退只为兼容旧调用与单测。范围一变就丢目录索引
+  （`set_scope` 比对 `_scope_roots`），否则会拿上一个对话扫出来的清单应答。
+- **一个目录都没有时不发工具**：`schemas()` 返回空列表 → 请求体里没有 `tools`，
+  模型连「能读文件」都不知道。所以关掉授权是彻底关掉，不是让它调了再报错。
+- **禁用的节点，其授权不生效**（与上下文注入同一条级联规则，`_node_enabled`）。
+  否则用户把目录禁用后模型还能读，那就不叫「这一支不参与对话」了。
+- **全局开关只管全局那一组**：`config.file_access_enabled` 关掉后节点级授权照常生效。
+  这是刻意的 —— 否则「给某个对话开一个目录」会被一个全局开关静默拦掉，界面还看不出来。
+- **界面两处**：右键任一文件夹/对话节点 → 「🔐 授权本地文件夹…」（批量时选一次加到所有
+  选中节点）；侧栏「本地文件」→ 统一管理面板，三类作用域同屏（`QTreeWidget`，选中谁
+  「添加目录」就加到谁）。节点级授权**只能在树里加**，面板负责看和撤 —— 把整棵树塞进
+  对话框不如右键顺手，也免得面板变成迷你文件浏览器。
+- **别把三种文件入口混了**：`attachment_paths` / `mounts` 是「把内容塞进上下文」，
+  `local_roots` 是「给模型一个可查的范围」，内容只在模型真的调工具时才读；前者计 token
+  预算，后者不计。
+
 **删除语义**：删消息 → 附件随行消失；删对话/目录 → 挂载随节点进回收站、读取记录在
 **彻底删除**时清理（软删除保留，恢复后记录还在）；磁盘文件消失 → 快照不受影响。
 分支切换会保留旧链的消息行，所以挂载的存活判据是"节点还在不在"，不是"在不在当前链上"。
@@ -309,7 +331,7 @@ UI 在发送前弹一次确认，`expand()` 也会在标注里写"当前模型�
 | `app/storage/blob_store.py` | 节点挂载的内容寻址快照仓库（`data/files/<sha256>`） |
 | `app/storage/read_log_store.py` | `file_reads` 表读写（工具读取记录） |
 | `app/core/file_tool_service.py` | 本地文件只读工具（search_files / read_file） |
-| `app/ui/widgets/file_access_dialog.py` | 本地文件访问授权对话框 |
+| `app/ui/widgets/file_access_dialog.py` | 本地文件夹权限统一管理面板（全局 + 文件夹节点 + 对话节点） |
 | `app/ui/widgets/attachment_dialog.py` | 节点附件管理面板（列出/添加/移除/旧式转快照，继承项只读） |
 | `app/core/search_service.py` | Search adapter orchestration |
 | `app/storage/tree_store.py` | Tree JSON persistence + recycle bin (`tree.json`, `recycle_bin.json`) |

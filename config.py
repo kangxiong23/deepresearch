@@ -93,9 +93,11 @@ _defaults: dict = {
     # 知识提取时分析的最近消息条数
     "kg_extract_recent_n": int(os.getenv("KG_EXTRACT_RECENT_N", "6")),
     # ── 本地文件只读访问（工具调用）──
-    # 总开关：关闭时请求体不带 tools，模型无法访问任何本地文件
+    # 全局授权开关：只管下面这一组全局目录。节点级授权（tree.json 里的
+    # local_roots）不受它影响；两者叠加成"当前对话可见的目录"。
+    # 一个可见目录都没有时，请求体里不带 tools，模型无从得知文件访问存在。
     "file_access_enabled": False,
-    # 已授权的根目录列表（只有这些目录下的文件可被检索/读取）。
+    # 全局授权目录（对所有对话生效）。节点级授权存在 tree.json 的节点字段上。
     # 约定：整体赋值，不要原地 append —— _defaults 是跨 scope 共享的可变对象。
     "file_access_roots": [],
 }

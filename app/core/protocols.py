@@ -288,6 +288,10 @@ class TreeStoreProtocol(Protocol):
         """返回从根到节点的路径字符串。"""
         ...
 
+    def get_all_node_ids_in_tree_order(self) -> list[str]:
+        """按 DFS 前序遍历返回全部节点 id（目录/对话/消息）。"""
+        ...
+
     def create_node(self, node: AnyTreeNode) -> None:
         """插入新节点。"""
         ...

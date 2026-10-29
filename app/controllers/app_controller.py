@@ -833,6 +833,11 @@ class AppController:
         for pid in child_map:
             child_map[pid].sort(key=lambda n: n.sort_order)
 
+        # 整棵树一个节点级本地目录授权都没有时，跳过逐节点的继承计算
+        has_local_roots = any(
+            getattr(n, "local_roots", None) for n in nodes
+        )
+
         result: list[TreeNodeVM] = []
 
         def dfs(node, depth: int) -> None:
@@ -875,6 +880,11 @@ class AppController:
                     inherited_attachment_count=_inherited_attachment_count(
                         self._conversation_svc, node.id
                     ),
+                    local_root_count=_local_root_count(node),
+                    inherited_local_root_count=(
+                        _inherited_local_root_count(self._conversation_svc, node.id)
+                        if has_local_roots else 0
+                    ),
                 )
             else:  # ConversationNode
                 vm = TreeNodeVM(
@@ -895,6 +905,11 @@ class AppController:
                     attachment_names=_attachment_names(node),
                     inherited_attachment_count=_inherited_attachment_count(
                         self._conversation_svc, node.id
+                    ),
+                    local_root_count=_local_root_count(node),
+                    inherited_local_root_count=(
+                        _inherited_local_root_count(self._conversation_svc, node.id)
+                        if has_local_roots else 0
                     ),
                 )
             result.append(vm)
@@ -1177,8 +1192,22 @@ class AppController:
         """UI 调用：清空回收站。返回清除的条目数。"""
         return self._conversation_svc.clear_trash()
 
+    # ── 本地文件夹访问授权（D5：全局 + 节点）──
+
+    def on_get_file_access_overview(self) -> dict:
+        """UI 调用：统一管理面板的数据源（全局授权 + 各文件夹/对话节点授权）。"""
+        return self._conversation_svc.get_file_access_overview()
+
+    def on_add_node_local_root(self, node_id: str, path: str) -> str:
+        """UI 调用：把某个本地目录授权给节点（空串 = 成功）。"""
+        return self._conversation_svc.add_node_local_root(node_id, path)
+
+    def on_remove_node_local_root(self, node_id: str, path: str) -> str:
+        """UI 调用：撤销节点的某个本地目录授权（空串 = 成功）。"""
+        return self._conversation_svc.remove_node_local_root(node_id, path)
+
     def on_reload_file_access(self) -> None:
-        """UI 调用：本地文件授权变更后重载配置并清空检索索引。"""
+        """UI 调用：全局授权变更后重载配置并清空检索索引。"""
         self._conversation_svc.reload_file_access()
 
 # ──────────────────────────────────────────────
@@ -1209,6 +1238,20 @@ def _attachment_names(node) -> list[str]:
             seen.add(name)
             names.append(name)
     return names
+
+
+def _local_root_count(node) -> int:
+    """节点自己授权的本地目录数（D5）。"""
+    return len([r for r in (getattr(node, "local_roots", None) or []) if r])
+
+
+def _inherited_local_root_count(svc, node_id: str) -> int:
+    """从祖先链继承来的本地目录授权数（不含自己的，已去重）。取不到就当 0。"""
+    try:
+        view = svc.get_node_local_roots(node_id)
+    except Exception:
+        return 0
+    return len(view.get("inherited") or [])
 
 
 def _inherited_attachment_count(svc, node_id: str) -> int:

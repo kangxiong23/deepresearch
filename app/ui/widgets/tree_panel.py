@@ -108,10 +108,11 @@ _MESSAGE_PREVIEW_MAX = 30
 
 _FOLDER_OPS = {
     "new_folder", "new_conversation", "rename",
-    "toggle_enabled", "manage_context", "attach_file", "delete",
+    "toggle_enabled", "manage_context", "attach_file", "local_root", "delete",
 }
 _CONVERSATION_OPS = {
-    "rename", "toggle_enabled", "manage_context", "attach_file", "delete",
+    "rename", "toggle_enabled", "manage_context", "attach_file", "local_root",
+    "delete",
 }
 _MESSAGE_OPS = {"toggle_enabled", "delete"}
 
@@ -1356,6 +1357,7 @@ class TreePanel(QWidget):
         manage_context(str)      — 右键：管理上下文块（仅目录）
         attach_file(str)         — 右键：添加附件（仅目录）
         manage_attachments(str)  — 右键：管理附件面板（单节点）
+        local_root(str)          — 右键：授权本地文件夹给该节点（单节点）
     """
 
     switch_conversation = Signal(str)
@@ -1370,6 +1372,7 @@ class TreePanel(QWidget):
     manage_context = Signal(str)
     attach_file = Signal(str)
     manage_attachments = Signal(str)   # 右键：管理附件面板（列出/添加/移除/转快照）
+    local_root = Signal(str)           # 右键：授权本地文件夹给该节点（D5）
     toggle_context_blocks = Signal(str)   # 启用/禁用节点上下文块（右键菜单）
 
     # ── 多选模式批量操作信号 ──
@@ -2270,6 +2273,18 @@ class TreePanel(QWidget):
                     "📎 管理附件…", lambda: self.manage_attachments.emit(nid)
                 )
 
+        # ── 本地文件夹权限（D5）：让模型可以检索这个范围的目录 ──
+        if "local_root" in available_ops:
+            if is_batch:
+                menu.addAction(
+                    "🔐 授权本地文件夹…",
+                    lambda: self.batch_operation.emit("local_root", batch_ids),
+                )
+            else:
+                menu.addAction(
+                    "🔐 授权本地文件夹…", lambda: self.local_root.emit(nid)
+                )
+
         # ── 启用/禁用上下文块（仅该节点有上下文块时，单节点）──
         if node_type in ("folder", "conversation") and not is_batch:
             node_vm = next((n for n in self._tree_data if n.id == nid), None)
@@ -2374,6 +2389,12 @@ def _build_tooltip(node: TreeNodeVM) -> str:
                 parts.append(f"附件: {own}")
         if inherited > 0:
             parts.append(f"另继承: {inherited} 个（来自上级目录）")
+        local_roots = getattr(node, "local_root_count", 0)
+        inherited_roots = getattr(node, "inherited_local_root_count", 0)
+        if local_roots > 0:
+            parts.append(f"本地目录授权: {local_roots} 个（模型可读）")
+        if inherited_roots > 0:
+            parts.append(f"另继承本地目录: {inherited_roots} 个（来自上级目录）")
     if node.updated_at:
         parts.append(f"更新: {node.updated_at}")
 

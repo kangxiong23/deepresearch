@@ -113,6 +113,8 @@ class FileToolService:
 
     def __init__(self, clock=time.time) -> None:
         self._clock = clock
+        # 本轮可见的授权目录。None = 没设定过，退回全局配置（兼容旧调用/单测）
+        self._scope_roots: list[str] | None = None
         self._entries: list[FileEntry] = []
         self._indexed_at: float = 0.0
         self._indexed_roots: tuple[str, ...] = ()
@@ -124,13 +126,32 @@ class FileToolService:
         self._read_ranges: set[tuple[str, int, int]] = set()
         self._audit: list[dict] = []
 
-    # ── 授权 ─────────────────────────────────
+    # ── 授权范围 ─────────────────────────────
+    #
+    # 范围由 ConversationService 按"当前对话"算好后传进来：全局授权 + 祖先文件夹
+    # + 对话自身（D5）。这里刻意不再自己读 config —— 同一进程里不同对话的可见
+    # 范围不同，一个全局变量表达不了，而且"改了一个节点的授权"不该影响其他对话。
+    # 未显式设定时回退到全局配置，只为兼容旧调用与单元测试。
+
+    def set_scope(self, roots: list[str]) -> None:
+        """设定本次对话可见的授权目录（每次发送前由 Core 计算）。"""
+        cleaned = [str(r) for r in (roots or []) if str(r).strip()]
+        if cleaned != self._scope_roots:
+            # 范围变了，索引必然失效：立刻丢弃，免得拿别的对话的目录清单应答
+            self._entries = []
+            self._indexed_at = 0.0
+            self._indexed_roots = ()
+        self._scope_roots = cleaned
 
     def roots(self) -> list[str]:
+        if self._scope_roots is not None:
+            return list(self._scope_roots)
+        if not getattr(app_config, "file_access_enabled", False):
+            return []
         return [r for r in (app_config.file_access_roots or []) if r]
 
     def enabled(self) -> bool:
-        return bool(getattr(app_config, "file_access_enabled", False)) and bool(self.roots())
+        return bool(self.roots())
 
     def schemas(self) -> list[dict]:
         return list(_ALL_SCHEMAS) if self.enabled() else []

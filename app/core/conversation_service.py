@@ -52,6 +52,7 @@ from app.storage.models import (
     TrashEntry,
     utcnow,
 )
+from app.utils.file_access_settings import normalize_root, root_key
 
 
 # 单轮工具调用的最大子请求次数。超过后提示模型收尾，避免无限循环。
@@ -1447,10 +1448,207 @@ class ConversationService:
     # 消息生成（保留流式异步编排）
     # ──────────────────────────────────────────
 
+    # ──────────────────────────────────────────
+    # 本地文件夹访问授权（D5：全局 + 节点）
+    # ──────────────────────────────────────────
+    #
+    # 三种作用域叠加成"这次对话能看到哪些目录"：
+    #   全局授权（file_access.json）→ 所有对话
+    #   文件夹节点 local_roots      → 该目录下所有对话（含子文件夹）
+    #   对话节点 local_roots        → 仅该对话
+    # 约束与上下文注入保持一致：被禁用的节点，其授权不生效（禁用的意思就是
+    # "这一支不参与本次对话"，权限跟着一起失效才不会有"禁用后还能读"的错觉）。
+    # 不给任何授权时，请求体里根本没有 tools —— 模型不知道文件访问存在。
+
+    def effective_file_roots(self, conversation_id: str) -> list[str]:
+        """
+        这次对话实际可用的授权目录（全局 + 祖先文件夹 + 自身，已归一化去重）。
+
+        FileToolService 的工具入口就按这份清单校验，范围之外一律拒绝。
+        """
+        roots: list[str] = []
+        seen: set[str] = set()
+
+        def push(values) -> None:
+            for raw in values or []:
+                path = normalize_root(raw)
+                if not path:
+                    continue
+                key = root_key(path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                roots.append(path)
+
+        # 全局授权：总开关只关这一组，节点级授权照常生效
+        if bool(getattr(app_config, "file_access_enabled", False)):
+            push(app_config.file_access_roots)
+
+        node = self._tree.get_node(conversation_id) if conversation_id else None
+        own, inherited = self._scope_roots_for_node(node)
+        push(own)
+        push(inherited)
+        return roots
+
+    def _scope_roots_for_node(self, node) -> tuple[list[str], list[str]]:
+        """
+        节点自己的授权目录 与 从祖先继承来的授权目录（近的在前，归一化去重）。
+
+        同一个目录既在父目录又在子目录授权时只保留最近的一条，与挂载去重一致。
+        """
+        own: list[str] = []
+        inherited: list[str] = []
+        if node is None:
+            return own, inherited
+
+        seen: set[str] = set()
+        for owner in self._ancestor_chain(node):
+            if not self._node_enabled(owner.id):
+                continue
+            is_self = owner.id == node.id
+            for raw in (getattr(owner, "local_roots", []) or []):
+                path = normalize_root(raw)
+                if not path:
+                    continue
+                key = root_key(path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                (own if is_self else inherited).append(path)
+        return own, inherited
+
+    def get_node_local_roots(self, node_id: str) -> dict:
+        """
+        供界面展示：节点自己的授权目录 + 继承来的（{"own": [...], "inherited": [...]}）。
+        """
+        node = self._tree.get_node(node_id)
+        own, inherited = self._scope_roots_for_node(node)
+        return {"own": own, "inherited": inherited}
+
+    def add_node_local_root(self, node_id: str, path: str) -> str:
+        """
+        给文件夹/对话节点授予一个本地目录的只读访问权。
+
+        Returns:
+            空串 = 成功（含"已授权过"）；非空 = 给用户看的失败原因
+        """
+        node = self._tree.get_node(node_id)
+        if node is None:
+            return "节点不存在"
+        if not isinstance(node, (FolderNode, ConversationNode)):
+            return "只有文件夹和对话可以授权本地目录"
+
+        target = normalize_root(path)
+        if not target:
+            return "路径为空"
+        if not os.path.isdir(target):
+            return f"目录不存在或无法访问：{target}"
+
+        roots = [r for r in (getattr(node, "local_roots", []) or []) if r]
+        if any(root_key(r) == root_key(target) for r in roots):
+            return ""
+        roots.append(target)
+        self._tree.update_node(node_id, local_roots=roots)
+        self._invalidate_file_index()
+        print(f"[TREE] 授权本地目录 {node_id}: {target}")
+        return ""
+
+    def remove_node_local_root(self, node_id: str, path: str) -> str:
+        """
+        撤销节点自己的某个授权目录（不动全局授权，也不动祖先的）。
+
+        Returns:
+            空串 = 成功（含"本来就没有"）；非空 = 失败原因
+        """
+        node = self._tree.get_node(node_id)
+        if node is None:
+            return "节点不存在"
+        if not isinstance(node, (FolderNode, ConversationNode)):
+            return "只有文件夹和对话可以授权本地目录"
+
+        target = root_key(path)
+        roots = [r for r in (getattr(node, "local_roots", []) or []) if r]
+        kept = [r for r in roots if root_key(r) != target]
+        if len(kept) == len(roots):
+            return ""
+        self._tree.update_node(node_id, local_roots=kept)
+        self._invalidate_file_index()
+        print(f"[TREE] 撤销本地目录授权 {node_id}: {path}")
+        return ""
+
+    def get_file_access_overview(self) -> dict:
+        """
+        统一管理面板的数据源：全局授权 + 所有有节点级授权的节点（DFS 序）。
+
+        Returns:
+            {"enabled": bool, "global_roots": [...],
+             "nodes": [{id, title, node_type, path, roots, enabled}]}
+            只列"有自己授权目录"的节点，避免把整棵树搬进对话框。
+        """
+        nodes: list[dict] = []
+        for node_id in self._tree.get_all_node_ids_in_tree_order():
+            node = self._tree.get_node(node_id)
+            if not isinstance(node, (FolderNode, ConversationNode)):
+                continue
+            roots = []
+            for raw in (getattr(node, "local_roots", []) or []):
+                path = normalize_root(raw)
+                if path:
+                    roots.append(path)
+            if not roots:
+                continue
+            path = self._tree.get_path(node_id) or ""
+            if path.startswith("root/"):
+                path = path[len("root/"):]
+            is_conv = isinstance(node, ConversationNode)
+            nodes.append({
+                "id": node.id,
+                "title": node.title or ("未命名对话" if is_conv else "未命名文件夹"),
+                "node_type": node.node_type.value,
+                "path": path or "root",
+                "roots": roots,
+                "enabled": self._node_enabled(node.id),
+            })
+
+        global_roots = []
+        for raw in (app_config.file_access_roots or []):
+            path = normalize_root(raw)
+            if path:
+                global_roots.append(path)
+
+        return {
+            "enabled": bool(getattr(app_config, "file_access_enabled", False)),
+            "global_roots": global_roots,
+            "nodes": nodes,
+        }
+
+    def _invalidate_file_index(self) -> None:
+        """授权范围变了：丢弃目录索引，下一次检索重新扫。"""
+        if self._file_tools is not None:
+            self._file_tools.invalidate()
+
+    def _tool_schemas(self, session_id: str) -> list[dict]:
+        """
+        按当前对话的授权范围决定下不下发文件工具。
+
+        范围在这里算、在这里交给 FileToolService —— 工具服务本身不读全局配置，
+        否则同一进程里两个对话会互相串权限。
+        """
+        if self._file_tools is None:
+            return []
+        try:
+            roots = self.effective_file_roots(session_id)
+        except Exception as exc:      # 树异常不能把整轮对话打死
+            print(f"[CORE] 解析授权范围失败，本轮按无授权处理: {exc}")
+            roots = []
+        self._file_tools.set_scope(roots)
+        return self._file_tools.schemas()
+
     def reload_file_access(self) -> None:
         """
-        授权变更后重新加载：把持久化配置写回 config，并清空检索索引。
+        全局授权变更后重新加载：把持久化配置写回 config，并清空检索索引。
 
+        节点级授权存在 tree.json 里，改完当场生效，不走这里。
         下一次检索会按新目录重新扫描；已授权的目录不会自动失效。
         """
         from app.utils.file_access_settings import FileAccessSettings
@@ -1934,9 +2132,9 @@ class ConversationService:
         search_text = await self._search_svc.search_and_format(text)
 
         # ── Step 4: 构建 LLM 上下文 ─────────────
-        # 工具能力：仅在总开关打开且有授权目录时下发；否则请求体里没有 tools，
-        # 模型无从得知文件访问的存在。
-        tools = self._file_tools.schemas() if self._file_tools is not None else []
+        # 工具能力：按本次对话的授权范围（全局 + 祖先文件夹 + 自身）下发；
+        # 一个目录都没授权时请求体里没有 tools，模型无从得知文件访问的存在。
+        tools = self._tool_schemas(session_id)
 
         # 面包屑：只带路径与行范围，不带内容。
         # 内容不进历史（Chat Completion 不支持历史中段插入工具调用），
@@ -2059,7 +2257,7 @@ class ConversationService:
 
         # 工具能力照常下发，但**不注入面包屑**：本次历史被截断在 target 之前，
         # "上一轮读过什么"指的是一条不在本次上下文里的轮次，注入了只会误导。
-        tools = self._file_tools.schemas() if self._file_tools is not None else []
+        tools = self._tool_schemas(session_id)
 
         llm_context = self._context_svc.build_llm_context(
             conversation_id=session_id,
@@ -2187,7 +2385,7 @@ class ConversationService:
         self._branch_svc.create_branch(session_id, fork_point_id, new_chain)
 
         # 工具与普通发送一致；面包屑语义也一致（"上一轮"确实在历史里）
-        tools = self._file_tools.schemas() if self._file_tools is not None else []
+        tools = self._tool_schemas(session_id)
         breadcrumb = self._breadcrumb_for(session_id)
         if breadcrumb:
             full_user_text = breadcrumb + "\n\n" + full_user_text

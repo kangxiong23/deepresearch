@@ -213,6 +213,7 @@ class ChatApp:
         tree.manage_context.connect(self._on_tree_manage_context)
         tree.attach_file.connect(self._on_tree_attach_file)
         tree.manage_attachments.connect(self._on_tree_manage_attachments)
+        tree.local_root.connect(self._on_tree_local_root)
         tree.toggle_context_blocks.connect(self._on_tree_toggle_context_blocks)
         # 多选批量操作
         tree.batch_operation.connect(self._on_batch_operation)
@@ -2088,6 +2089,33 @@ class ChatApp:
             # 批量管理上下文块：复用主上下文面板（应用时写入所有选中节点）
             self._open_node_context_mode(node_ids)
 
+        elif operation == "local_root":
+            # 批量授权本地文件夹：选一次，加到所有选中节点
+            path = QFileDialog.getExistingDirectory(
+                self._window,
+                f"选择允许模型读取的目录（将授权给 {len(node_ids)} 个节点）",
+            )
+            if not path:
+                return
+            failures: list[str] = []
+            for nid in node_ids:
+                err = self._ctrl.on_add_node_local_root(nid, path)
+                if err:
+                    failures.append(err)
+            QTimer.singleShot(0, self._load_tree)
+            if failures:
+                QMessageBox.warning(
+                    self._window,
+                    "部分节点未授权",
+                    "\n".join(dict.fromkeys(failures[:10])),
+                )
+            else:
+                QToolTip.showText(
+                    QCursor.pos(),
+                    f"已授权给 {len(node_ids)} 个节点："
+                    + os.path.normpath(path),
+                )
+
         elif operation == "attach_file":
             # 批量添加附件
             paths, _ = QFileDialog.getOpenFileNames(
@@ -2168,6 +2196,30 @@ class ChatApp:
                     failures.append(err)
             self._report_attach_failures(failures)
             QTimer.singleShot(0, self._load_tree)
+
+    def _on_tree_local_root(self, node_id: str) -> None:
+        """
+        右键 → 授权本地文件夹：让模型可以只读检索/读取这个目录。
+
+        与附件挂载的区别：附件是"把内容塞进上下文"，这里是"给模型一个可查的范围"，
+        内容只在模型真的调用工具时才读。
+        """
+        if not self._can_mutate_tree():
+            return
+        path = QFileDialog.getExistingDirectory(
+            self._window, "选择允许模型读取的目录（只读）"
+        )
+        if not path:
+            return
+        err = self._ctrl.on_add_node_local_root(node_id, path)
+        if err:
+            QMessageBox.warning(self._window, "本地文件夹权限", err)
+            return
+        QTimer.singleShot(0, self._load_tree)
+        QToolTip.showText(
+            QCursor.pos(),
+            "已授权给该节点：模型可以只读访问\n" + os.path.normpath(path),
+        )
 
     def _on_tree_manage_attachments(self, node_id: str) -> None:
         """
@@ -2294,19 +2346,40 @@ class ChatApp:
 
     def _handle_open_file_access(self) -> None:
         """
-        侧栏 → 本地文件访问授权。
-        改动即时落盘并重载（清空索引），没有"取消"。
+        侧栏 → 本地文件：统一管理所有本地文件夹授权（全局 + 文件夹节点 + 对话节点）。
+        改动即时落盘/落树并重载（清空索引），没有"取消"。
         """
-        store = FileAccessSettings()
-        data = store.load()
-
-        def on_change(enabled: bool, roots: list[str]) -> None:
-            store.save(enabled, roots)
+        def on_global(enabled: bool, roots: list[str]) -> None:
+            FileAccessSettings().save(enabled, roots)
             self._ctrl.on_reload_file_access()
 
         show_file_access_dialog(
-            self._window, data["enabled"], data["roots"], on_change
+            self._window,
+            fetch=self._ctrl.on_get_file_access_overview,
+            on_global=on_global,
+            on_add_node_root=self._add_node_local_root,
+            on_remove_node_root=self._remove_node_local_root,
         )
+        # 授权数量变了，树行的悬停提示要跟着变
+        QTimer.singleShot(0, self._load_tree)
+
+    def _add_node_local_root(self, node_id: str, path: str) -> str:
+        """给节点授权一个本地目录（对话框与右键菜单共用）。"""
+        if not self._can_mutate_tree():
+            return "正在生成中，暂时不能修改节点授权"
+        err = self._ctrl.on_add_node_local_root(node_id, path)
+        if not err:
+            QTimer.singleShot(0, self._load_tree)
+        return err
+
+    def _remove_node_local_root(self, node_id: str, path: str) -> str:
+        """撤销节点的本地目录授权。"""
+        if not self._can_mutate_tree():
+            return "正在生成中，暂时不能修改节点授权"
+        err = self._ctrl.on_remove_node_local_root(node_id, path)
+        if not err:
+            QTimer.singleShot(0, self._load_tree)
+        return err
 
     def _handle_open_theme(self) -> None:
         """Sidebar 底部"主题风格"入口：打开主题选择对话框。"""

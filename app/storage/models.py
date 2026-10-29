@@ -235,6 +235,9 @@ class FolderNode(TreeNode):
     # "added_at", "source_path"}]。内容存在 data/files/<sha256>，
     # 祖先链继承；文件被删被移都不影响已挂载内容。
     mounts: list[dict] = field(default_factory=list)
+    # 本地文件夹访问授权（D5）：本节点授予模型只读访问的目录（工具调用范围）。
+    # 与全局授权叠加，沿祖先链继承；节点被禁用时其授权不生效。
+    local_roots: list[str] = field(default_factory=list)
     node_type: NodeType = field(default=NodeType.FOLDER, init=False)
 
 
@@ -252,6 +255,7 @@ class ConversationNode(TreeNode):
     context_blocks_enabled: bool = True   # 节点上下文块是否启用
     attachment_paths: list[str] = field(default_factory=list)   # 旧式附件（路径）
     mounts: list[dict] = field(default_factory=list)            # 文件快照挂载（D2）
+    local_roots: list[str] = field(default_factory=list)        # 本地目录授权（D5）
     node_type: NodeType = field(default=NodeType.CONVERSATION, init=False)
 
 

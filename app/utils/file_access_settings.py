@@ -1,7 +1,8 @@
 # Layer: app/utils（独立工具，不在 Stack 内）
 # File: app/utils/file_access_settings.py
-# Responsibility: 本地文件访问授权的持久化——把"是否允许"与"授权目录"写入
-#                 data 目录下的 file_access.json，启动时读回并覆盖 config。
+# Responsibility: 本地文件访问的**全局授权**持久化——把"是否允许"与"授权目录"
+#                 写入 data 目录下的 file_access.json，启动时读回并覆盖 config。
+#                 节点级授权（文件夹/对话）存在 tree.json 的节点字段上，不在这里。
 # Input:  无（路径由 config.DB_PATH 推导，测试用 ConfigScope 自然隔离）
 # Output: dict{enabled, roots}
 # 禁止: 导入 UI 库；读写用户文件（这里只碰本应用自己的 data 目录）
@@ -9,12 +10,34 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import config as app_config
 from app.storage.json_io import write_json_atomic
 
 _FILENAME = "file_access.json"
+
+
+def normalize_root(path: str) -> str:
+    """
+    授权目录的规范形式：去空白/引号、统一分隔符、去掉结尾分隔符。
+
+    拖进来的路径、对话框选的路径、手写配置里的路径形态各不相同，
+    不归一化就会出现"同一个目录授权两次"（去重失效）或"路径尾斜杠看不出来"。
+    """
+    text = str(path or "").strip().strip('"').strip("'")
+    if not text:
+        return ""
+    try:
+        return os.path.normpath(text)
+    except (OSError, ValueError):   # Windows 保留设备名等极端情况
+        return text
+
+
+def root_key(path: str) -> str:
+    """去重用的比较键：Windows 下大小写不敏感（同一个目录的不同大小写写法算一条）。"""
+    return os.path.normcase(normalize_root(path))
 
 
 class FileAccessSettings:
