@@ -73,10 +73,10 @@ class TestStore(AppSettingsTestBase):
         with self.scope():
             store = AppSettings()
             self.assertEqual(store.path.name, "app_settings.json")
-            store.save({"model_type": "deepseek-v4-flash", "max_tokens": 4096})
+            store.save({"reasoning_effort": "max", "max_tokens": 4096})
             self.assertEqual(
                 store.load(),
-                {"model_type": "deepseek-v4-flash", "max_tokens": 4096},
+                {"reasoning_effort": "max", "max_tokens": 4096},
             )
 
     def test_corrupt_file_falls_back(self) -> None:
@@ -112,13 +112,13 @@ class TestStore(AppSettingsTestBase):
     def test_apply_to_config(self) -> None:
         with self.scope():
             AppSettings().save({
-                "model_type": "deepseek-v4-flash",
+                "reasoning_effort": "max",
                 "temperature": 0.3,
                 "max_tokens": 2048,
             })
             data = AppSettings().apply_to_config()
             self.assertEqual(len(data), 3)
-            self.assertEqual(app_config.model_type, "deepseek-v4-flash")
+            self.assertEqual(app_config.reasoning_effort, "max")
             self.assertEqual(app_config.temperature, 0.3)
             self.assertEqual(app_config.max_tokens, 2048)
 
@@ -133,8 +133,9 @@ class TestStore(AppSettingsTestBase):
         with self.scope():
             current = AppSettings().current()
             self.assertEqual(set(current), set(EDITABLE))
-            self.assertIn("model_type", current)
             self.assertNotIn("DB_PATH", current)
+            # 模型是部署配置，不参与持久化——否则启动时会把 .env 的 DEFAULT_MODEL 盖掉
+            self.assertNotIn("model_type", current)
 
     def test_factory_defaults_ignore_saved_preferences(self) -> None:
         with self.scope():

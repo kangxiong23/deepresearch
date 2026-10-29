@@ -52,7 +52,8 @@ LOG_LEVEL=DEBUG python main.py
 |---|---|---|---|
 | `DEEPSEEK_API_KEY` | ✅ | — | DeepSeek API 密钥 |
 | `DEEPSEEK_BASE_URL` | ❌ | `https://api.deepseek.com` | API 基础 URL |
-| `DEFAULT_MODEL` | ❌ | `deepseek-v4-pro` | 默认模型 |
+| `DEFAULT_MODEL` | ❌ | `config.py` 里 `MODEL_OPTIONS` 的第一项 | 默认模型；换模型只改这一行 |
 | `MAX_TOKENS` | ❌ | `8192` | 单次回复最大 token |
+| `KG_MODEL` | ❌ | `MODEL_OPTIONS` 第一项 | 知识图谱提取用的模型（不影响对话模型）|
 | `LOG_LEVEL` | ❌ | `INFO` | 日志级别（DEBUG/INFO/WARNING）|
 | `DB_PATH` | ❌ | `data/deepresearch.db`（项目根目录下） | SQLite 数据库路径 |

@@ -796,7 +796,7 @@ class ChatApp:
         """
         当前模型看不了图时，发送前先问一句。
 
-        实测 deepseek-v4-pro 收到图片**不报错也不生效**：返回 200，但图根本没进
+        实测 pro 系列收到图片**不报错也不生效**：返回 200，但图根本没进
         模型（prompt_tokens 里没有图片那部分），答出来的内容与图无关。这种失败
         最坑人，所以在发送前拦一下，而不是让它悄悄给出错误答案。
         """
@@ -812,13 +812,23 @@ class ChatApp:
         if not images:
             return True
 
+        # 提示语里的备选模型也从清单取，别写死一个已经下线的名字
+        candidates = "、".join(app_config.vision_model_ids())
+        switch_hint = (
+            f"识别图片请切换到 {candidates}。"
+            if candidates
+            else "要让模型能看图，请在 config.py 的 MODEL_OPTIONS 里给某个模型标上 True。"
+        )
+        message = (
+            f"当前模型 {app_config.model_type} 不支持图片输入，"
+            "附上的图片会被忽略（不会报错，但模型看不到）。\n\n"
+            f"{switch_hint}\n\n"
+            "仍然继续发送吗？"
+        )
         answer = QMessageBox.question(
             self._window,
             "当前模型看不到图片",
-            "当前模型 " + str(app_config.model_type) + " 不支持图片输入，"
-            "附上的图片会被忽略（不会报错，但模型看不到）。\n\n"
-            "识别图片请切换到 deepseek-v4-flash。\n\n"
-            "仍然继续发送吗？",
+            message,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )

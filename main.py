@@ -16,6 +16,7 @@ from PySide6.QtGui import QFont
 faulthandler.enable()
 
 # ── 基础设施 ──────────────────────────────────
+import config as app_config
 from app.storage.database import initialize_database
 from app.storage.message_repo import MessageRepo
 from app.storage.tree_store import TreeStore
@@ -81,6 +82,15 @@ def assemble_app() -> ChatApp:
     # 因为 ModelSelector 等控件在 __init__ 里就直接读 config 决定初始状态。
     preferences = AppSettings().apply_to_config()
     logger.info("app settings: %d 项已应用", len(preferences))
+
+    # 当前模型必须在 config.MODEL_OPTIONS 里，否则界面下拉只能显示"（清单外）"、
+    # 图片能力按不支持处理。多半是改了 .env 的 DEFAULT_MODEL 却忘了改清单。
+    if app_config.model_type not in app_config.model_ids():
+        logger.warning(
+            "模型 %r 不在 config.MODEL_OPTIONS %s 里：下拉会显示（清单外），"
+            "图片能力按不支持处理；如需完整支持请把它加进清单",
+            app_config.model_type, list(app_config.model_ids()),
+        )
 
     # 本地文件访问的开关与授权目录存在 data/file_access.json，
     # 必须在 Core 服务构建前写回 config（FileToolService 在调用时读 config）。

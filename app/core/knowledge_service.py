@@ -238,7 +238,9 @@ class KnowledgeService:
     ) -> str:
         """
         调用 LLM 执行提取，收集完整响应。
-        使用 deepseek-v4-flash（不用 reasoner，节省 token）。
+
+        固定用 config.kg_model（默认清单第一项，通常是便宜的 flash），
+        不受当前对话选了什么模型影响——提取是后台活，用贵模型毫无收益。
         """
         from app.storage.models import LLMContext, ChunkType
 
@@ -250,8 +252,8 @@ class KnowledgeService:
         )
 
         full_text = ""
-        # 强制使用 chat 模型提取，不受当前 model_type 影响（ConfigScope 自动恢复）
-        with ConfigScope(model_type="deepseek-v4-flash"):
+        # 强制使用提取专用模型（ConfigScope 自动恢复，不影响用户当前选择）
+        with ConfigScope(model_type=app_config.kg_model):
             async for chunk in self._llm.stream_chat(context):
                 if chunk.chunk_type == ChunkType.TEXT:
                     full_text += chunk.delta

@@ -33,7 +33,6 @@ class Field:
 # 范围写在这一处，界面直接拿它建控件——不然 SpinBox 允许 999999、config 其实只认
 # 64..65536，就成了两套规则。
 EDITABLE: dict[str, Field] = {
-    "model_type": Field("choice", options=("deepseek-v4-flash", "deepseek-v4-pro")),
     "thinking_enabled": Field("bool"),
     "reasoning_effort": Field("choice", options=("low", "high", "max")),
     "temperature": Field("float", 0.0, 2.0),
@@ -47,9 +46,17 @@ EDITABLE: dict[str, Field] = {
     "kg_extract_recent_n": Field("int", 2, 50),
 }
 
-# 静态部署配置：设置面板只展示，不允许改。改了 DB_PATH / 存储目录会让旧数据
-# “凭空消失”（其实只是读到另一个空库），这类迁移必须由人显式决定。
+# 设置面板里"只展示、不落盘"的项。
+#
+# model_type 刻意放在这里而不是 EDITABLE：模型是部署配置（.env 的 DEFAULT_MODEL /
+# config.py 的 MODEL_OPTIONS）。一旦它被存进 app_settings.json，启动时的
+# apply_to_config() 就会盖掉 .env —— 于是"改了 .env 没生效，界面上还看不出来"。
+# 工具栏下拉仍然可以临时切换，只是不会跨重启记住。
+#
+# 其余是路径类部署项：运行时改 DB_PATH 等于换一个空库，表现成“数据凭空消失”，
+# 这类迁移必须由人显式决定。
 READONLY: tuple[str, ...] = (
+    "model_type",
     "DEEPSEEK_BASE_URL",
     "DB_PATH",
     "TREE_STORE_PATH",

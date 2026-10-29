@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import base64
 
+import config as app_config
+
 # 服务端只认这四种，且按**文件内容**判断而不是扩展名或 MIME 声明，
 # 所以下面一律用魔数嗅探（docs：图像理解 - 支持的图片格式）。
 SUPPORTED_MIMES = ("image/jpeg", "image/png", "image/gif", "image/webp")
@@ -67,11 +69,16 @@ def supports_images(model: str) -> bool:
     """
     当前模型能不能真的看见图片。
 
-    实测（2026-10）：deepseek-v4-flash 认得图（prompt_tokens 含图片，答对了颜色），
-    deepseek-v4-pro **静默丢弃**图片——返回 200，但 prompt_tokens 里没有图片那部分，
-    回答与图毫无关系。这种"不报错但不生效"最坑人，所以按模型名硬性拦下来。
+    实测（2026-10）：flash 系列认得图（prompt_tokens 含图片，答对了颜色），
+    pro 系列**静默丢弃**图片——返回 200，但 prompt_tokens 里没有图片那部分，
+    回答与图毫无关系。这种"不报错但不生效"最坑人，所以发送前按能力清单拦下来。
+
+    判定依据是 config.MODEL_OPTIONS 的能力列，不是名字里有没有 "flash"——
+    官方换个名字（deepseek-v4-flash → deepseek-flash）就不该再改代码。
+    清单外的模型按"不能看图"处理：宁可多问一句，也不要把图静默丢掉。
     """
-    return "flash" in (model or "").lower()
+    resolved = app_config.resolve_model(model)
+    return bool(resolved) and resolved in app_config.vision_model_ids()
 
 
 # ──────────────────────────────────────────────

@@ -18,7 +18,7 @@ from app.ui.widgets.config_dialog import _ConfigDialog  # noqa: E402
 _app = QApplication.instance() or QApplication([])
 
 VALUES = {
-    "model_type": "deepseek-v4-flash",
+    "model_type": "deepseek-flash",
     "thinking_enabled": True,
     "reasoning_effort": "max",
     "temperature": 0.7,
@@ -31,7 +31,7 @@ VALUES = {
     "kg_extract_recent_n": 6,
 }
 
-FACTORY = dict(VALUES, model_type="deepseek-v4-pro", temperature=1.0, max_tokens=4096)
+FACTORY = dict(VALUES, temperature=1.0, max_tokens=4096)
 
 READONLY = [
     ("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
@@ -54,7 +54,9 @@ class TestConfigDialog(unittest.TestCase):
 
     def test_renders_current_values(self) -> None:
         dlg = self.make()
-        self.assertEqual(dlg._widgets["model_type"].currentData(), "deepseek-v4-flash")
+        # 模型不在可编辑项里：它属于部署配置（.env 的 DEFAULT_MODEL）
+        self.assertNotIn("model_type", dlg._widgets)
+        self.assertEqual(dlg._widgets["reasoning_effort"].currentData(), "max")
         self.assertTrue(dlg._widgets["thinking_enabled"].isChecked())
         self.assertEqual(dlg._widgets["max_tokens"].value(), 8192)
         self.assertAlmostEqual(dlg._widgets["temperature"].value(), 0.7, places=2)
@@ -102,7 +104,7 @@ class TestConfigDialog(unittest.TestCase):
     def test_reset_fills_factory_defaults(self) -> None:
         dlg = self.make()
         dlg._on_reset()
-        self.assertEqual(dlg._widgets["model_type"].currentData(), "deepseek-v4-pro")
+        self.assertEqual(dlg._widgets["reasoning_effort"].currentData(), "max")
         self.assertEqual(dlg._widgets["max_tokens"].value(), 4096)
         self.assertAlmostEqual(dlg._widgets["temperature"].value(), 1.0, places=2)
         self.assertIn("保存", dlg._status.text())

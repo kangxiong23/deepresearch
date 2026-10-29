@@ -35,7 +35,6 @@ from app.utils.app_settings import EDITABLE, Field
 # (分组标题, ((键, 名称, 说明), ...))
 _GROUPS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
     ("模型与生成", (
-        ("model_type", "模型", "输入框下方也能切；这里改完会同步过去"),
         ("thinking_enabled", "思考模式",
          "开启后随请求发送 reasoning_effort，并且不再发送 temperature"),
         ("reasoning_effort", "思考强度", "low / high / max，仅思考模式开启时生效"),
@@ -85,6 +84,8 @@ class _ConfigDialog(QDialog):
         self._readonly = list(readonly or [])
         self._on_apply = on_apply
         self._widgets: dict[str, QWidget] = {}
+        # 回填时发现"当前值不在可选清单里"的项（键, 值）
+        self._unknown_choices: list[tuple[str, str]] = []
 
         self._setup_ui()
         self._fill(values or {})
@@ -296,6 +297,20 @@ class _ConfigDialog(QDialog):
                 index = widget.findData(str(value))
                 if index >= 0:
                     widget.setCurrentIndex(index)
+                else:
+                    # 值不在清单里（通常是改了 .env、没改 config.MODEL_OPTIONS）：
+                    # 补一项并选中，绝不静默退回第一项 —— 那样用户只是打开面板点个
+                    # 保存，就把配置里的模型名换成了另一个。
+                    widget.addItem(f"{value}（清单外）", str(value))
+                    widget.setCurrentIndex(widget.count() - 1)
+                    self._unknown_choices.append((key, str(value)))
+        if self._unknown_choices:
+            detail = "、".join(f"{key}={value}" for key, value in self._unknown_choices)
+            self._set_status(
+                f"⚠ {detail} 不在可选清单里（清单见 config.py 的 MODEL_OPTIONS）；"
+                "不动它就不会被保存。",
+                error=True,
+            )
 
     def _collect(self) -> dict:
         out: dict = {}

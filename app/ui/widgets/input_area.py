@@ -126,23 +126,13 @@ class ModelSelector(QComboBox):
 
     model_changed = Signal(str)
 
-    _MODEL_OPTIONS = [
-        ("deepseek-v4-flash", "Flash"),
-        ("deepseek-v4-pro", "Pro"),
-    ]
-
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        current = getattr(app_config, "model_type", "deepseek-v4-pro")
 
-        for key, label in self._MODEL_OPTIONS:
+        # 清单来自 config.MODEL_OPTIONS —— 官方改名只改那张表，这里不写死
+        for key, label in app_config.model_labels():
             self.addItem(label, key)
-
-        # 设置当前选中项
-        for i in range(self.count()):
-            if self.itemData(i) == current:
-                self.setCurrentIndex(i)
-                break
+        self.select_model(getattr(app_config, "model_type", ""))
 
         self.setFont(Fonts.mono(Fonts.SIZE_SM))
         self.setFixedWidth(150)
@@ -182,6 +172,30 @@ class ModelSelector(QComboBox):
         """)
 
         self.currentIndexChanged.connect(self._on_change)
+
+    def _ensure_item(self, model_key: str) -> int:
+        """
+        定位模型项；清单外的模型（改了 .env 却没改 MODEL_OPTIONS）补一项。
+
+        绝不静默落到第一项：那会让下拉显示 Flash、实际发的是另一个模型，
+        用户手一碰就把 .env 里的选择覆盖掉了。
+        """
+        if not model_key:
+            return -1
+        index = self.findData(model_key)
+        if index < 0:
+            self.addItem(f"{model_key}（清单外）", model_key)
+            index = self.findData(model_key)
+        return index
+
+    def select_model(self, model_key: str) -> None:
+        """选中指定模型（blockSignals：同步时不能回写 config）。"""
+        index = self._ensure_item(model_key)
+        if index < 0:
+            return
+        blocked = self.blockSignals(True)
+        self.setCurrentIndex(index)
+        self.blockSignals(blocked)
 
     def _on_change(self, index: int) -> None:
         """下拉选择变更。"""
@@ -1018,11 +1032,7 @@ class InputArea(QFrame):
         必须 blockSignals：这些控件一改就回写 config 并发信号。不同步的话，
         设置里改完工具栏还显示旧值，用户下次碰一下工具栏又把旧值写回去。
         """
-        index = self._model_selector.findData(getattr(app_config, "model_type", ""))
-        if index >= 0:
-            self._model_selector.blockSignals(True)
-            self._model_selector.setCurrentIndex(index)
-            self._model_selector.blockSignals(False)
+        self._model_selector.select_model(getattr(app_config, "model_type", ""))
 
         thinking = bool(getattr(app_config, "thinking_enabled", False))
         self._thinking_chip.set_value(thinking)

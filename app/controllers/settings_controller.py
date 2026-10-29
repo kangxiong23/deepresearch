@@ -33,7 +33,7 @@ class SettingsController:
         后端（deepseek_client 等）在下次调用时自动读取。
 
         Args:
-            model_type: 如 "deepseek-v4-flash" 或 "deepseek-v4-pro"
+            model_type: config.MODEL_OPTIONS 里的某个模型 ID（如 "deepseek-flash"）
         """
         app_config.model_type = model_type
 

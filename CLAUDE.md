@@ -76,7 +76,12 @@ Dependencies flow one way: `Storage → Adapters → Core → Controllers → UI
 
 ### Key architectural decisions
 
-**Config is a global mutable module (`config.py`).** Every layer imports `config` directly. Static values (API key, DB path) are loaded from `.env` at import time. Mutable values (`model_type`, `thinking_enabled`, `reasoning_effort`, `search_enabled`) are written by the UI and read by Core/Adapters — no dependency injection for config. 用户在「设置 → 应用配置」里改的值存进 `data/app_settings.json`（`app/utils/app_settings.py`），`main.py` 在构建 UI 之前写回 config，所以重启仍在。**These four mutable vars are the single sync point between frontend and backend**: the UI writes them (InputArea/ModelSelector → `SettingsController`) and Core/Adapters read them fresh on each call. In particular, `DeepSeekClient._build_payload` honors `thinking_enabled` for **both** `deepseek-v4-pro` and `deepseek-v4-flash` (treated equally): when enabled it sends `thinking: {type: enabled}` plus `reasoning_effort` (`config.reasoning_effort`, one of `low|high|max`); when disabled it sends `thinking: {type: disabled}` and **must not** include `reasoning_effort` (the API rejects it). `SearchService` gates on `search_enabled`，网页抓取工具 gates on `web_fetch_enabled`（两者都能在「设置 → 应用配置」里改）。
+**Config is a global mutable module (`config.py`).** Every layer imports `config` directly. Static values (API key, DB path) are loaded from `.env` at import time. Mutable values (`model_type`, `thinking_enabled`, `reasoning_effort`, `search_enabled`) are written by the UI and read by Core/Adapters — no dependency injection for config. 用户在「设置 → 应用配置」里改的值存进 `data/app_settings.json`（`app/utils/app_settings.py`），`main.py` 在构建 UI 之前写回 config，所以重启仍在。**These four mutable vars are the single sync point between frontend and backend**: the UI writes them (InputArea/ModelSelector → `SettingsController`) and Core/Adapters read them fresh on each call. In particular, `DeepSeekClient._build_payload` honors `thinking_enabled` for **all** models (treated equally, no per-model branching): when enabled it sends `thinking: {type: enabled}` plus `reasoning_effort` (`config.reasoning_effort`, one of `low|high|max`); when disabled it sends `thinking: {type: disabled}` and **must not** include `reasoning_effort` (the API rejects it). `SearchService` gates on `search_enabled`，网页抓取工具 gates on `web_fetch_enabled`（两者都能在「设置 → 应用配置」里改）。
+
+**模型清单只有一处（`config.MODEL_OPTIONS`）。** 官方改名/新模型上线时只改这张表（`(模型 ID, 下拉显示名, 能否看图)`），`.env` 的 `DEFAULT_MODEL` 只负责选哪一个。工具栏下拉、"只读 · 部署配置"里展示的值、图片能力判断全部从它派生，业务代码里不允许再写死模型名。两个连带决定：
+
+- **`model_type` 不进 `app_settings.EDITABLE`**（只在 `READONLY` 里展示）。它一旦被存进 `data/app_settings.json`，启动时的 `apply_to_config()` 就会盖掉 `.env` —— 表现成「改了 .env 没生效，界面上还看不出来」。工具栏下拉仍可临时切，只是不跨重启记住。
+- **清单外的模型按"不能看图"处理**：下拉显示「xxx（清单外）」、面板给 warning，请求体仍原样透传（服务端可能认）。宁可多问一句，也不要把图静默丢掉。
 
 **Protocol-based dependency inversion (`app/core/protocols.py`).** Core services depend on `typing.Protocol` classes (`LLMClientProtocol`, `SearchAdapterProtocol`, `FileParserProtocol`, `MessageRepoProtocol`, `ContextStoreProtocol`, `TreeStoreProtocol`), not concrete implementations. Adapters and Storage implement these protocols. This means you can swap the LLM backend or search provider by writing a new adapter — no Core changes needed.
 
@@ -121,8 +126,10 @@ Dependencies flow one way: `Storage → Adapters → Core → Controllers → UI
   表单由 `app/utils/app_settings.py` 的 `EDITABLE` 表生成（类型与范围写在一处，
   免得 SpinBox 允许 999999、后端其实只认 64..65536）。保存走
   `SettingsController.on_apply_app_settings`（校验 → 落盘 → 写回 config），再
-  `InputArea.sync_from_config()` 把工具栏拉回一致 —— 模型/思考/搜索在工具栏上也有，
+  `InputArea.sync_from_config()` 把工具栏拉回一致 —— 思考/搜索在工具栏上也有，
   不同步就会「设置里改完、工具栏还是旧值，碰一下又写回去」。
+  模型不在这张表单里：它属于部署配置（`.env` 的 `DEFAULT_MODEL` / `MODEL_OPTIONS`），
+  只在「只读 · 部署配置」里展示当前值。
 - 静态部署项（API 地址、各数据目录）只读展示：运行时换 `DB_PATH` 等于换一个空库，
   表现成「数据凭空消失」；这类迁移必须由人显式决定。
 - 偏好存 `data/app_settings.json`（与 `file_access.json` 同一套做法）。`main.py` 在
@@ -307,9 +314,9 @@ Design spec: `分支功能设计说明.md` (project root, Chinese). Conflict pri
 按网格重复返回同一个 tc），嵌套表格递归成独立块，首行只有带 `w:tblHeader` 才补分隔行。
 页眉/页脚追加在文末并丢掉纯页码行，覆盖普通/首页/偶数页三种变体（按文本去重，变体没定义时自动回落）以及页眉里的表格；文本框单独成 "[文本框]" 段；脚注/尾注在正文原位留"[脚注 N]" 标记、正文之后按 id 附上正文（`word/footnotes.xml`、`word/endnotes.xml` 只能自己解 zip，其中 `w:type="separator"` 的分隔条目必须跳过）；图片在正文原位留 "[图片 N]" 占位，结尾只报事实 "[备注] 文档含 N 张图片]"——**不要**再写"未做文字识别"：文档作为消息附件时图片是会发出去的，那句话会反过来让模型声称自己看不到图。挂载缓存**不写失败结果**，否则一次偶发失败会被永久固定。
 
-**图片输入（视觉）**。只有 `deepseek-v4-flash` 真的能看图；`deepseek-v4-pro` 收到图片
+**图片输入（视觉）**。能力由 `config.MODEL_OPTIONS` 的第三列决定（`supports_images()` 先过一遍 `MODEL_ALIASES`，再查清单；清单外一律按不支持）。实测只有 flash 系列真的能看图，pro 收到图片
 **不报错也不生效**——实测返回 200，但 prompt_tokens 里没有图片那部分，问颜色答成"白色"
-（图是红的）。这种沉默失败最难查，所以 `image_attachments.supports_images()` 按模型名硬拦，
+（图是红的）。这种沉默失败最难查，所以 `image_attachments.supports_images()` 按清单能力硬拦，
 UI 在发送前弹一次确认，`expand()` 也会在标注里写"当前模型不支持图片，未发送"。
 
 - **入口只有消息附件**。字节存 `data/files/<sha256>`（`FileBlobStore.put_bytes`），消息里

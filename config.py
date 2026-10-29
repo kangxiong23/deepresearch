@@ -37,6 +37,51 @@ REASONING_EFFORTS: tuple[str, ...] = ("low", "high", "max")
 
 
 # ──────────────────────────────────────────────
+# 模型清单（部署配置）
+#
+# 官方改名/新模型上线时，**只改这张表**（或者只改 .env 的 DEFAULT_MODEL 指向表里
+# 已有的一项）。工具栏下拉、设置面板的选项、图片能力判断都从这里派生——业务代码里
+# 不允许再写死模型名。
+#
+# 三元组 = (模型 ID, 下拉显示名, 是否真的能看图)。
+# 加能看图的模型时第三项写 True；写错的代价不对称：漏写只会被拦下并提示，
+# 多写则会静默丢图（实测 pro 收到图片返回 200 但图根本没进模型），所以拿不准就写 False。
+# ──────────────────────────────────────────────
+
+MODEL_OPTIONS: tuple[tuple[str, str, bool], ...] = (
+    ("deepseek-flash", "Flash", True),
+    ("deepseek-v4-pro", "Pro", False),
+)
+
+# 旧模型名 → 现役名。只用于能力判断与提示，请求里仍原样发送（服务端会自动路由）。
+# 官方下线某个名字时把它加到这里，老 .env 就不会突然失去对应能力。
+MODEL_ALIASES: dict[str, str] = {
+    "deepseek-v4-flash": "deepseek-flash",
+}
+
+
+def model_ids() -> tuple[str, ...]:
+    """清单里可选的模型 ID。"""
+    return tuple(item[0] for item in MODEL_OPTIONS)
+
+
+def model_labels() -> tuple[tuple[str, str], ...]:
+    """(模型 ID, 下拉显示名) —— 界面下拉直接用这个。"""
+    return tuple((item[0], item[1]) for item in MODEL_OPTIONS)
+
+
+def vision_model_ids() -> tuple[str, ...]:
+    """清单里"真的能看图"的模型 ID。"""
+    return tuple(item[0] for item in MODEL_OPTIONS if item[2])
+
+
+def resolve_model(name: str) -> str:
+    """旧模型名 → 现役名；未知/空值原样返回。"""
+    key = str(name or "").strip()
+    return MODEL_ALIASES.get(key, key)
+
+
+# ──────────────────────────────────────────────
 # 可变配置默认值（可被 ConfigScope 覆盖）
 # ──────────────────────────────────────────────
 
@@ -67,10 +112,12 @@ _defaults: dict = {
         str(Path(__file__).parent / "data" / "files"),
     ),
     # 当前使用的模型 ID
-    # UI 写入：app_config.model_type = "deepseek-v4-pro"
-    # 后端读取：model = app_config.model_type
-    "model_type": os.getenv("DEFAULT_MODEL", "deepseek-v4-pro"),
-    # 思考模式开关（flash / pro 均支持）
+    # UI 写入：app_config.model_type = "deepseek-flash"
+    # 后端读取：model = app_config.model_type（原样透传，不做名字校验）
+    # 默认值优先取 .env 的 DEFAULT_MODEL；没配就用清单第一项（通常是便宜的 flash）。
+    # 换模型：改 .env 的 DEFAULT_MODEL，或改上面 MODEL_OPTIONS。
+    "model_type": os.getenv("DEFAULT_MODEL") or model_ids()[0],
+    # 思考模式开关（各模型一致）
     "thinking_enabled": False,
     # 思考强度（仅 thinking_enabled=True 时生效；API 要求 thinking 未启用时不得传）
     "reasoning_effort": "high",
@@ -95,6 +142,9 @@ _defaults: dict = {
     "kg_max_inject": int(os.getenv("KG_MAX_INJECT", "10")),
     # 知识提取时分析的最近消息条数
     "kg_extract_recent_n": int(os.getenv("KG_EXTRACT_RECENT_N", "6")),
+    # 知识提取固定使用的模型：不受当前对话选了什么模型影响（省 token）。
+    # 默认清单第一项；.env 的 KG_MODEL 可覆盖。
+    "kg_model": os.getenv("KG_MODEL") or model_ids()[0],
     # ── 本地文件只读访问（工具调用）──
     # 全局授权开关：只管下面这一组全局目录。节点级授权（tree.json 里的
     # local_roots）不受它影响；两者叠加成"当前对话可见的目录"。
@@ -128,9 +178,9 @@ class ConfigScope:
     config 隔离作用域上下文管理器。
 
     用法:
-        with ConfigScope(DB_PATH="/tmp/test.db", model_type="deepseek-v4-flash"):
+        with ConfigScope(DB_PATH="/tmp/test.db", model_type="deepseek-flash"):
             # 作用域内 app_config.DB_PATH → "/tmp/test.db"
-            #        app_config.model_type → "deepseek-v4-flash"
+            #        app_config.model_type → "deepseek-flash"
             ...
         # 退出后自动恢复之前的配置
 
