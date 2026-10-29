@@ -482,3 +482,6 @@ def show_file_access_dialog(
         parent, fetch, on_global, on_add_node_root, on_remove_node_root
     )
     dialog.exec()
+    # exec() 返回后只丢 Python 引用的话，C++ 对象会被 parent 收养而永不释放
+    # （整页控件 + 全局样式注册）。显式销毁，反复开关不占内存。
+    dialog.deleteLater()

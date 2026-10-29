@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 import config as app_config  # 集中配置，直接读写
+from app.utils.app_settings import AppSettings
 
 
 class SettingsController:
@@ -57,6 +58,34 @@ class SettingsController:
             effort: 取值 "low" / "high" / "max"
         """
         app_config.reasoning_effort = effort
+
+    # ── 设置面板：一次性保存多项 ──────────────
+
+    def on_apply_app_settings(self, values: dict) -> dict:
+        """
+        设置面板点"保存"时调用：校验 → 落盘 → 写回 config。
+
+        只接受 app/utils/app_settings.py 白名单里的键（越界钳制、未知键丢弃），
+        返回实际生效的值——面板拿它回填，用户看到的就是真正生效的数字。
+
+        Args:
+            values: {config 键: 新值}
+
+        Returns:
+            dict — 落盘后的完整偏好（只含白名单键）
+        """
+        store = AppSettings()
+        applied = store.merge_and_save(values or {})
+        store.apply_to_config()
+        return applied
+
+    def on_get_app_settings(self) -> dict:
+        """当前生效的偏好（设置面板打开时用它回填）。"""
+        return AppSettings().current()
+
+    def on_get_app_settings_defaults(self) -> dict:
+        """出厂默认偏好（"恢复默认"用）。"""
+        return AppSettings.factory_defaults()
 
     # ── 搜索开关 ──────────────────────────────
 

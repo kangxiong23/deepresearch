@@ -1011,6 +1011,34 @@ class InputArea(QFrame):
         self._thinking_chip.refresh_theme()
         self._search_chip.refresh_theme()
 
+    def sync_from_config(self) -> None:
+        """
+        设置面板改了 config 之后，把工具栏控件拉回一致状态。
+
+        必须 blockSignals：这些控件一改就回写 config 并发信号。不同步的话，
+        设置里改完工具栏还显示旧值，用户下次碰一下工具栏又把旧值写回去。
+        """
+        index = self._model_selector.findData(getattr(app_config, "model_type", ""))
+        if index >= 0:
+            self._model_selector.blockSignals(True)
+            self._model_selector.setCurrentIndex(index)
+            self._model_selector.blockSignals(False)
+
+        thinking = bool(getattr(app_config, "thinking_enabled", False))
+        self._thinking_chip.set_value(thinking)
+        # 思考关闭时禁用心智强度：API 要求 thinking 启用才可传 reasoning_effort
+        self._effort_selector.setEnabled(thinking)
+
+        index = self._effort_selector.findData(
+            getattr(app_config, "reasoning_effort", "")
+        )
+        if index >= 0:
+            self._effort_selector.blockSignals(True)
+            self._effort_selector.setCurrentIndex(index)
+            self._effort_selector.blockSignals(False)
+
+        self._search_chip.set_value(bool(getattr(app_config, "search_enabled", False)))
+
     # ── 输入内容 / 草稿上报 ──────────────────
 
     def text(self) -> str:

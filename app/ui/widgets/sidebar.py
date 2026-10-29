@@ -15,57 +15,86 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSizePolicy,
+    QStackedWidget,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QIcon
 
 from app.ui.theme import apply_style, Colors, Fonts, Spacing, Radius
 from app.ui.widgets.tree_panel import TreePanel
+from app.ui.widgets.settings_panel import SettingsPanel
 
 
 class Sidebar(QWidget):
     """
     左侧边栏（Phase 3 — 完整树形面板替代占位符）。
 
-    结构（从上到下）：
-        ┌──────────────────────┐
-        │  [DR] DeepResearch   │  ← 头部
-        ├──────────────────────┤
-        │  [＋对话] [📁文件夹]│  ← 操作按钮行
-        ├──────────────────────┤
-        │  对话历史             │  ← 节标签
-        ├──────────────────────┤
-        │                      │
-        │  TreePanel (expand)  │  ← 树形面板
-        │                      │
-        ├──────────────────────┤
-        │  🗑️ 回收站           │  ← 底部入口
-        │  上下文管理           │
-        │  知识图谱             │
-        └──────────────────────┘
+    结构（两页栈，整块切换）：
+        ┌──────────────────────┐      ┌──────────────────────┐
+        │  [DR] DeepResearch   │      │  ←  设置             │
+        ├──────────────────────┤      ├──────────────────────┤
+        │  [＋对话] [📁文件夹]│      │  🗑️ 回收站           │
+        ├──────────────────────┤      │  📁 本地文件          │
+        │  对话历史             │  ⇄   │  📚 上下文管理        │
+        ├──────────────────────┤      │  🔗 知识图谱          │
+        │  TreePanel (expand)  │      │  🎨 主题风格          │
+        │                      │      │  ⚙️ 应用配置          │
+        ├──────────────────────┤      │                      │
+        │  ⚙️ 设置             │      │                      │
+        └──────────────────────┘      └──────────────────────┘
+
+    设置页是按需创建、关闭即销毁的（open_settings / close_settings）——
+    反复开关不会累积控件与信号连接。
 
     公开接口：
         load_tree(nodes) → None
         set_active(node_id) → None
         tree_panel → TreePanel (供 ChatApp 直接连接信号)
+        open_settings() / close_settings() → 侧栏整块切到设置页 / 切回对话页
     """
 
     # ── Sidebar 级别信号（顶部按钮 + 底部入口）──
     new_conversation_clicked = Signal()
     new_folder_clicked = Signal()
-    open_trash_clicked = Signal()
-    open_context_panel_clicked = Signal()
-    open_kg_panel_clicked = Signal()
     search_requested = Signal(str)  # 携带搜索关键词（去抖后）
     multi_select_toggled = Signal(bool)  # True=进入多选, False=退出多选
     refresh_requested = Signal()    # 刷新整个对话树界面与对话界面
-    open_theme_clicked = Signal()   # 打开主题风格选择对话框
-    open_file_access_clicked = Signal()  # 打开本地文件访问授权
+    open_settings_clicked = Signal()        # 底部「设置」入口
+    settings_item_clicked = Signal(str)     # 设置页里点了某一项（item_id）
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("sidebar")
         self.setFixedWidth(260)
+
+        # 设置页按需创建、关闭即销毁（见 close_settings）
+        self._settings_panel: SettingsPanel | None = None
+
+        # 整块侧栏是一个两页的栈：对话页 ↔ 设置页
+        self._stack = QStackedWidget()
+        apply_style(self._stack, lambda: (
+            "QStackedWidget { background-color: transparent; border: none; }"
+        ))
+        self._main_page = self._build_main_page()
+        self._stack.addWidget(self._main_page)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._stack)
+
+        # ── 整体边框 ──────────────────────────────
+        apply_style(self, lambda: f"""
+            Sidebar {{
+                background-color: {Colors.BG_SURFACE};
+                border-right: 1px solid {Colors.BORDER};
+            }}
+        """)
+
+    def _build_main_page(self) -> QWidget:
+        """对话页：头部 + 操作按钮 + 搜索 + 树 + 底部「设置」入口。"""
+        page = QWidget()
+        page.setObjectName("sidebarMainPage")
 
         # ── 头部 ──────────────────────────────────
         header = self._build_header()
@@ -97,10 +126,10 @@ class Sidebar(QWidget):
         self._tree_panel = TreePanel()
 
         # ── 底部入口 ──────────────────────────────
-        bottom_widget = self._build_bottom_entries()
+        bottom_widget = self._build_bottom_entry()
 
         # ── 组装 ──────────────────────────────────
-        layout = QVBoxLayout(self)
+        layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(header)
@@ -110,13 +139,10 @@ class Sidebar(QWidget):
         layout.addWidget(self._tree_panel, stretch=1)
         layout.addWidget(bottom_widget)
 
-        # ── 整体边框 ──────────────────────────────
-        apply_style(self, lambda: f"""
-            Sidebar {{
-                background-color: {Colors.BG_SURFACE};
-                border-right: 1px solid {Colors.BORDER};
-            }}
-        """)
+        apply_style(page, lambda: (
+            "QWidget#sidebarMainPage { background-color: transparent; border: none; }"
+        ))
+        return page
 
     # ── 头部 ──────────────────────────────────────
 
@@ -318,8 +344,8 @@ class Sidebar(QWidget):
 
     # ── 底部入口 ──────────────────────────────────
 
-    def _build_bottom_entries(self) -> QWidget:
-        """构建底部三个入口：回收站、上下文管理、知识图谱。"""
+    def _build_bottom_entry(self) -> QWidget:
+        """底部只有一个入口：「设置」。回收站/本地文件/上下文/图谱/主题都收进去。"""
         container = QWidget()
         container.setStyleSheet("""
             QWidget {
@@ -331,48 +357,13 @@ class Sidebar(QWidget):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
-        # 回收站入口
-        trash_entry = self._make_bottom_entry(
-            icon_text="🗑️",
-            label="回收站",
-            on_click=lambda: self.open_trash_clicked.emit(),
+        layout.addWidget(
+            self._make_bottom_entry(
+                icon_text="⚙️",
+                label="设置",
+                on_click=lambda: self.open_settings_clicked.emit(),
+            )
         )
-
-        # 上下文管理入口
-        context_entry = self._make_bottom_entry(
-            icon_text="📚",
-            label="上下文管理",
-            on_click=lambda: self.open_context_panel_clicked.emit(),
-        )
-
-        # 知识图谱入口
-        kg_entry = self._make_bottom_entry(
-            icon_text="🔗",
-            label="知识图谱",
-            on_click=lambda: self.open_kg_panel_clicked.emit(),
-        )
-
-        # 本地文件访问入口
-        file_entry = self._make_bottom_entry(
-            icon_text="📁",
-            label="本地文件",
-            on_click=lambda: self.open_file_access_clicked.emit(),
-        )
-
-        # 主题风格入口
-        theme_entry = self._make_bottom_entry(
-            icon_text="🎨",
-            label="主题风格",
-            on_click=lambda: self.open_theme_clicked.emit(),
-        )
-
-        layout.addWidget(trash_entry)
-        layout.addWidget(context_entry)
-        layout.addWidget(kg_entry)
-        layout.addWidget(file_entry)
-        layout.addWidget(theme_entry)
-
         return container
 
     def _make_bottom_entry(
@@ -453,6 +444,43 @@ class Sidebar(QWidget):
         return row_widget
 
     # ──────────────────────────────────────────────
+    # 设置页（整个侧栏切换过去）
+    # ──────────────────────────────────────────────
+
+    def open_settings(self) -> None:
+        """把整个侧栏切到设置页（首次打开时创建，之后复用）。"""
+        if self._settings_panel is None:
+            panel = SettingsPanel()
+            panel.back_requested.connect(self.close_settings)
+            panel.item_clicked.connect(self.settings_item_clicked)
+            self._settings_panel = panel
+            self._stack.addWidget(panel)
+        self._stack.setCurrentWidget(self._settings_panel)
+
+    def close_settings(self) -> None:
+        """回到对话页，并立即销毁设置页。"""
+        if not self._settings_panel:
+            self._stack.setCurrentIndex(0)
+            return
+
+        panel = self._settings_panel
+        self._settings_panel = None
+        self._stack.setCurrentIndex(0)
+        self._stack.removeWidget(panel)
+        # 显式销毁：只丢 Python 引用的话 C++ 对象仍被栈收养，反复开关会累积
+        # 整页控件与信号连接（和主题对话框当年那个泄漏同一个原因）。
+        panel.deleteLater()
+
+    @property
+    def settings_panel(self) -> SettingsPanel | None:
+        """当前设置页实例（未打开时 None）。"""
+        return self._settings_panel
+
+    def is_settings_open(self) -> bool:
+        """侧栏是否处于设置页。"""
+        return self._settings_panel is not None
+
+    # ──────────────────────────────────────────────
     # ──────────────────────────────────────────────
     # 搜索框
     # ──────────────────────────────────────────────
@@ -506,7 +534,9 @@ class Sidebar(QWidget):
         return self._search_box
 
     def focus_search(self) -> None:
-        """聚焦搜索框并选中全部文本。"""
+        """聚焦搜索框并选中全部文本（在设置页里按 Ctrl+F 先退回对话页）。"""
+        if self._settings_panel is not None:
+            self.close_settings()
         self._search_box.setFocus()
         self._search_box.selectAll()
 

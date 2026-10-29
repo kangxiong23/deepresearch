@@ -342,3 +342,5 @@ def show_attachment_dialog(
     """弹出节点附件管理对话框。"""
     dialog = _AttachmentDialog(parent, node_id, fetch, on_add, on_remove, on_convert)
     dialog.exec()
+    # 同上：不让父窗口收养一整套用完的控件
+    dialog.deleteLater()

@@ -52,6 +52,7 @@ from app.ui.theme import get_theme_manager
 # ── 日志 ─────────────────────────────────────
 from app.utils.async_utils import get_logger
 from app.utils.run_marker import RunMarker, describe
+from app.utils.app_settings import AppSettings
 from app.utils.file_access_settings import FileAccessSettings
 
 logger = get_logger("MAIN", "main")
@@ -71,6 +72,11 @@ def assemble_app() -> ChatApp:
     logger.info("=== DeepResearch starting ===")
 
     # ── 0. 读回持久化的用户设置 ───────────────
+    # 先后顺序有讲究：应用偏好（模型/温度/预算）必须在 UI 构建前写回 config，
+    # 因为 ModelSelector 等控件在 __init__ 里就直接读 config 决定初始状态。
+    preferences = AppSettings().apply_to_config()
+    logger.info("app settings: %d 项已应用", len(preferences))
+
     # 本地文件访问的开关与授权目录存在 data/file_access.json，
     # 必须在 Core 服务构建前写回 config（FileToolService 在调用时读 config）。
     access = FileAccessSettings().apply_to_config()

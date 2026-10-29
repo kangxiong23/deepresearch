@@ -76,7 +76,7 @@ Dependencies flow one way: `Storage → Adapters → Core → Controllers → UI
 
 ### Key architectural decisions
 
-**Config is a global mutable module (`config.py`).** Every layer imports `config` directly. Static values (API key, DB path) are loaded from `.env` at import time. Mutable values (`model_type`, `thinking_enabled`, `reasoning_effort`, `search_enabled`) are written by the UI and read by Core/Adapters — no dependency injection for config. **These four mutable vars are the single sync point between frontend and backend**: the UI writes them (InputArea/ModelSelector → `SettingsController`) and Core/Adapters read them fresh on each call. In particular, `DeepSeekClient._build_payload` honors `thinking_enabled` for **both** `deepseek-v4-pro` and `deepseek-v4-flash` (treated equally): when enabled it sends `thinking: {type: enabled}` plus `reasoning_effort` (`config.reasoning_effort`, one of `low|high|max`); when disabled it sends `thinking: {type: disabled}` and **must not** include `reasoning_effort` (the API rejects it). `SearchService` gates on `search_enabled`.
+**Config is a global mutable module (`config.py`).** Every layer imports `config` directly. Static values (API key, DB path) are loaded from `.env` at import time. Mutable values (`model_type`, `thinking_enabled`, `reasoning_effort`, `search_enabled`) are written by the UI and read by Core/Adapters — no dependency injection for config. 用户在「设置 → 应用配置」里改的值存进 `data/app_settings.json`（`app/utils/app_settings.py`），`main.py` 在构建 UI 之前写回 config，所以重启仍在。**These four mutable vars are the single sync point between frontend and backend**: the UI writes them (InputArea/ModelSelector → `SettingsController`) and Core/Adapters read them fresh on each call. In particular, `DeepSeekClient._build_payload` honors `thinking_enabled` for **both** `deepseek-v4-pro` and `deepseek-v4-flash` (treated equally): when enabled it sends `thinking: {type: enabled}` plus `reasoning_effort` (`config.reasoning_effort`, one of `low|high|max`); when disabled it sends `thinking: {type: disabled}` and **must not** include `reasoning_effort` (the API rejects it). `SearchService` gates on `search_enabled`.
 
 **Protocol-based dependency inversion (`app/core/protocols.py`).** Core services depend on `typing.Protocol` classes (`LLMClientProtocol`, `SearchAdapterProtocol`, `FileParserProtocol`, `MessageRepoProtocol`, `ContextStoreProtocol`, `TreeStoreProtocol`), not concrete implementations. Adapters and Storage implement these protocols. This means you can swap the LLM backend or search provider by writing a new adapter — no Core changes needed.
 
@@ -97,9 +97,31 @@ Dependencies flow one way: `Storage → Adapters → Core → Controllers → UI
 **Search backends.** Two adapters with no API keys needed: `DuckDuckGoSearchAdapter` (tries Bing first, falls back to DuckDuckGo Lite) and `ArxivSearchAdapter` (academic papers via Arxiv Atom Feed API).
 
 **UI layout (PySide6).** Three-column layout in `MainWindow`:
-- **Sidebar (260px)** — header + action buttons + `TreePanel` (QTreeView-based conversation tree) + bottom entries (trash, context, KG)
+- **Sidebar (260px)** — header + action buttons + `TreePanel` (QTreeView-based conversation tree) + 底部「⚙️ 设置」入口；点开后整块换成设置页（回收站 / 本地文件 / 上下文管理 / 知识图谱 / 主题风格 / 应用配置）
 - **Chat Area (stretch)** — `MessageListView` (QScrollArea with ChatMessage widgets) + `InputArea` (text input, model selector, toggle chips)
 - **Right Panel (0/380px)** — `QStackedWidget` switching between `ContextPanel` (index 0) and `KGPanel` (index 1)
+
+**设置页（`SettingsPanel`）**。侧栏底部只剩一个「⚙️ 设置」——回收站、本地文件、
+上下文管理、知识图谱、主题风格、应用配置全部收进设置页。点开后**整个左侧边栏**换成
+设置页（`Sidebar` 里是 `QStackedWidget` 两页，不是浮层），「←」返回对话页。
+
+- 页面按需创建、关闭**立即销毁**（`close_settings()` 里 `removeWidget` + `deleteLater`）。
+  只丢 Python 引用的话 C++ 对象仍被栈收养，反复开关会累积整页控件与信号连接 ——
+  和主题对话框当年那个泄漏同一个原因。对话框同理：`show_*_dialog` 结尾统一 `deleteLater`。
+- 分发在 `ChatApp._on_settings_item(item_id)`。上下文管理 / 知识图谱要配合对话树看
+  （右侧面板），所以先退回对话页再打开；其余三项弹对话框，留在设置页里方便接着开别的。
+- 「应用配置」= `config.py` 可变项的编辑面板（`app/ui/widgets/config_dialog.py`）。
+  表单由 `app/utils/app_settings.py` 的 `EDITABLE` 表生成（类型与范围写在一处，
+  免得 SpinBox 允许 999999、后端其实只认 64..65536）。保存走
+  `SettingsController.on_apply_app_settings`（校验 → 落盘 → 写回 config），再
+  `InputArea.sync_from_config()` 把工具栏拉回一致 —— 模型/思考/搜索在工具栏上也有，
+  不同步就会「设置里改完、工具栏还是旧值，碰一下又写回去」。
+- 静态部署项（API 地址、各数据目录）只读展示：运行时换 `DB_PATH` 等于换一个空库，
+  表现成「数据凭空消失」；这类迁移必须由人显式决定。
+- 偏好存 `data/app_settings.json`（与 `file_access.json` 同一套做法）。`main.py` 在
+  **构建 UI 之前** `AppSettings().apply_to_config()` —— `ModelSelector` 等控件在
+  `__init__` 里就直接读 config 定初始状态。「恢复默认」回到 `config._factory_defaults`
+  快照，不是 `_defaults`（后者已被启动时的 apply 就地改写）。
 
 **Theme.** `QApplication.setStyle("Fusion")` + dark `QPalette` for cross-platform consistent rendering. Global stylesheet built by `build_global_stylesheet()` in `app/ui/theme.py`. Color constants in `Colors` class match the original Flet design.
 
@@ -345,18 +367,21 @@ UI 在发送前弹一次确认，`expand()` 也会在标注里写"当前模型�
 | `app/adapters/file_parsers.py` | File parsers (txt, md, json, docx, pdf)；docx 保序 / 保留修订与内容控件 / 失败可见；`unsupported_hints()` |
 | `app/controllers/app_controller.py` | Main controller — maps UI events → Core calls → ViewModels |
 | `app/controllers/view_models.py` | ViewModel dataclasses (`TreeNodeVM`, `MessageVM`, `StreamChunkVM`, etc.) |
-| `app/controllers/settings_controller.py` | Settings controller (model, thinking, search toggles) |
+| `app/controllers/settings_controller.py` | Settings controller（模型/思考/搜索开关 + 应用配置的校验落盘） |
 | `app/controllers/command_builder.py` | Parameter packing for Core service calls |
 | `app/ui/app.py` | ChatApp — main application class, holds MainWindow, manages conversation lifecycle, streaming, signal wiring |
 | `app/ui/main_window.py` | MainWindow — 3-column QHBoxLayout, MessageListView with scroll tracking, right panel QStackedWidget |
 | `app/ui/async_bridge.py` | AsyncStreamWorker, StopGenerationWorker, AsyncTaskRunner — bridge asyncio → Qt signals |
 | `app/ui/theme.py` | Colors, Fonts, Spacing, Radius constants + `build_global_stylesheet()` |
 | `app/ui/widgets/tree_panel.py` | TreePanel — QTreeView + QStandardItemModel, _TreeStyle (custom checkboxes/arrows), right-click menus, drag-drop |
-| `app/ui/widgets/sidebar.py` | Sidebar — header + action buttons + TreePanel + bottom entries |
+| `app/ui/widgets/sidebar.py` | Sidebar — 两页栈：对话页（头部/按钮/TreePanel）+ 底部「设置」入口；设置页按需创建、关闭即销毁 |
 | `app/ui/widgets/chat_message.py` | ChatMessage — role-styled message bubble, Markdown rendering, 附件缩略图行, copy/regenerate/remember buttons |
 | `app/ui/widgets/image_preview.py` | 图片预览：气泡缩略图（ImageTile）、原图查看器（ImageViewer，缩放/平移/另存） |
 | `app/ui/widgets/file_drop.py` | 聊天区拖放：文件/文件夹 → 附件条，纯文字 → 输入框，拖拽遮罩 |
 | `app/ui/widgets/input_area.py` | InputArea — text input, ModelSelector, ToggleChip (thinking/search), AttachmentBar, send/stop buttons |
+| `app/ui/widgets/settings_panel.py` | SettingsPanel — 设置页：六项导航（回收站/本地文件/上下文/知识图谱/主题/应用配置） |
+| `app/ui/widgets/config_dialog.py` | 应用配置面板：config.py 可变项表单 + 只读部署项 + 恢复默认 |
+| `app/utils/app_settings.py` | 用户偏好持久化（`data/app_settings.json`）：白名单、类型/范围收敛、启动回填 |
 | `app/ui/widgets/context_panel.py` | ContextPanel — context block list, preview, template management |
 | `app/ui/widgets/kg_panel.py` | KGPanel — knowledge graph entity/relation viewer |
 | `app/ui/widgets/dialogs.py` | Reusable dialogs (rename, new folder, confirm, context block manager, recycle bin) |

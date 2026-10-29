@@ -11,6 +11,7 @@ from app.ui.widgets.image_preview import (
 )
 from app.ui.widgets.input_area import InputArea, ToggleChip, ModelSelector, AttachmentBar
 from app.ui.widgets.tree_panel import TreePanel
+from app.ui.widgets.settings_panel import SettingsPanel
 from app.ui.widgets.sidebar import Sidebar
 from app.ui.widgets.context_panel import ContextPanel
 from app.ui.widgets.kg_panel import KGPanel
@@ -37,6 +38,7 @@ __all__ = [
     "ModelSelector",
     "AttachmentBar",
     "TreePanel",
+    "SettingsPanel",
     "Sidebar",
     "ContextPanel",
     "KGPanel",

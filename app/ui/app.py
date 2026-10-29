@@ -31,12 +31,14 @@ from app.ui.widgets import image_preview
 from app.ui.widgets.file_drop import MAX_DROP_FILES, collect_files
 from app.ui.widgets.file_access_dialog import show_file_access_dialog
 from app.ui.widgets.attachment_dialog import show_attachment_dialog
+from app.ui.widgets.config_dialog import show_config_dialog
 from app.ui.async_bridge import (
     AsyncStreamWorker,
     StreamRelay,
     run_async_in_thread,
 )
 from app.utils.draft_store import DraftStore
+from app.utils.app_settings import READONLY
 from app.utils.file_access_settings import FileAccessSettings
 
 
@@ -192,14 +194,12 @@ class ChatApp:
         sidebar = self._window.sidebar
         sidebar.new_conversation_clicked.connect(self._handle_new_conversation)
         sidebar.new_folder_clicked.connect(self._handle_new_root_folder)
-        sidebar.open_trash_clicked.connect(self._handle_open_trash)
-        sidebar.open_context_panel_clicked.connect(self._handle_open_context_panel)
-        sidebar.open_kg_panel_clicked.connect(self._handle_open_kg_panel)
         sidebar.search_requested.connect(self._on_search)
         sidebar.multi_select_toggled.connect(self._on_multi_select_toggled)
         sidebar.refresh_requested.connect(self._handle_refresh)
-        sidebar.open_theme_clicked.connect(self._handle_open_theme)
-        sidebar.open_file_access_clicked.connect(self._handle_open_file_access)
+        # 底部「设置」→ 整个侧栏切成设置页；页里点哪一项由这里分发
+        sidebar.open_settings_clicked.connect(self._handle_open_settings)
+        sidebar.settings_item_clicked.connect(self._on_settings_item)
 
         # ── TreePanel 信号 ────────────────────────
         tree = sidebar.tree_panel
@@ -2279,9 +2279,63 @@ class ChatApp:
 
     # ── Sidebar 底部入口 ─────────────────────
 
+    def _handle_open_settings(self) -> None:
+        """底部「设置」→ 把整个侧栏切成设置页。"""
+        self._window.sidebar.open_settings()
+
+    def _on_settings_item(self, item_id: str) -> None:
+        """
+        设置页里的六项导航。
+
+        上下文管理 / 知识图谱要配合对话树一起看（右侧面板），所以先把侧栏
+        切回对话页；其余三项弹对话框，留在设置页里方便接着开别的。
+        """
+        if item_id == "trash":
+            self._handle_open_trash()
+        elif item_id == "file_access":
+            self._handle_open_file_access()
+        elif item_id == "theme":
+            self._handle_open_theme()
+        elif item_id == "config":
+            self._handle_open_config()
+        elif item_id == "context":
+            self._window.sidebar.close_settings()
+            self._handle_open_context_panel()
+        elif item_id == "kg":
+            self._window.sidebar.close_settings()
+            self._handle_open_kg_panel()
+        else:
+            print(f"[UI] 未知的设置项: {item_id}")
+
+    # ── 应用配置 ────────────────────────────
+
+    def _handle_open_config(self) -> None:
+        """
+        设置 → 应用配置：改 config.py 里的可变项。
+
+        面板只管表单；校验、落盘、写回 config 全在 SettingsController，
+        保存后还要把工具栏控件同步过去（否则界面上显示的还是旧模型）。
+        """
+        readonly = [
+            (name, str(getattr(app_config, name, ""))) for name in READONLY
+        ]
+        show_config_dialog(
+            self._window,
+            values=self._settings_ctrl.on_get_app_settings(),
+            factory=self._settings_ctrl.on_get_app_settings_defaults(),
+            readonly=readonly,
+            on_apply=self._on_apply_app_settings,
+        )
+
+    def _on_apply_app_settings(self, values: dict) -> dict:
+        """保存配置：写 config → 同步输入区控件。返回值用于关闭对话框。"""
+        applied = self._settings_ctrl.on_apply_app_settings(values)
+        self._window.input_area.sync_from_config()
+        return applied
+
     def _handle_open_trash(self) -> None:
         """
-        Sidebar 底部"回收站"入口。
+        设置 → 回收站。
         弹出回收站对话框，列出所有已删除条目，
         支持恢复、彻底删除和清空。
         """
@@ -2325,7 +2379,7 @@ class ChatApp:
 
     def _handle_open_context_panel(self) -> None:
         """
-        Sidebar 底部"上下文管理"入口。
+        设置 → 上下文管理。
         若节点模式有未应用修改先确认；退出节点模式后显示全局上下文管理面板。
         """
         if not self._resolve_pending_node_changes():
@@ -2336,7 +2390,7 @@ class ChatApp:
 
     def _handle_open_kg_panel(self) -> None:
         """
-        Sidebar 底部"知识图谱"入口。
+        设置 → 知识图谱。
         显示右侧知识图谱面板并刷新数据。
         """
         self._refresh_kg_panel()
@@ -2346,7 +2400,7 @@ class ChatApp:
 
     def _handle_open_file_access(self) -> None:
         """
-        侧栏 → 本地文件：统一管理所有本地文件夹授权（全局 + 文件夹节点 + 对话节点）。
+        设置 → 本地文件：统一管理所有本地文件夹授权（全局 + 文件夹节点 + 对话节点）。
         改动即时落盘/落树并重载（清空索引），没有"取消"。
         """
         def on_global(enabled: bool, roots: list[str]) -> None:
@@ -2382,7 +2436,7 @@ class ChatApp:
         return err
 
     def _handle_open_theme(self) -> None:
-        """Sidebar 底部"主题风格"入口：打开主题选择对话框。"""
+        """设置 → 主题风格：打开主题选择对话框。"""
         from app.ui.widgets.theme_dialog import ThemeDialog
         dialog = ThemeDialog(self._window)
         dialog.exec()
