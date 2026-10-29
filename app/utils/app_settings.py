@@ -41,6 +41,7 @@ EDITABLE: dict[str, Field] = {
     "max_history_tokens": Field("int", 1000, 2_000_000),
     "search_enabled": Field("bool"),
     "search_max_results": Field("int", 1, 20),
+    "web_fetch_enabled": Field("bool"),
     "kg_injection_enabled": Field("bool"),
     "kg_max_inject": Field("int", 1, 50),
     "kg_extract_recent_n": Field("int", 2, 50),

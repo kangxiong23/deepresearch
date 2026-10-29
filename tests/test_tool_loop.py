@@ -73,12 +73,34 @@ class FakeTools:
         return json.dumps({"tool": name, "ok": True}, ensure_ascii=False)
 
 
-def make_service(llm, tools=None) -> ConversationService:
+class FakeWebTools:
+    """联网工具：execute 是 async 的（要发 HTTP），与文件工具的同步接口不同。"""
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, str]] = []
+        self.begin_count = 0
+
+    def begin_turn(self) -> None:
+        self.begin_count += 1
+
+    def supports(self, name: str) -> bool:
+        return name == "fetch_url"
+
+    async def execute(self, name: str, arguments: str, should_stop=None) -> str:
+        self.executed.append((name, arguments))
+        return json.dumps(
+            {"url": "https://example.com/a", "title": "示例", "content": "网页正文"},
+            ensure_ascii=False,
+        )
+
+
+def make_service(llm, tools=None, web=None) -> ConversationService:
     """只装配 _run_turn 需要的三个属性，避免拉起数据库。"""
     svc = ConversationService.__new__(ConversationService)
     svc._llm = llm
     svc._stop_event = asyncio.Event()
     svc._file_tools = tools
+    svc._web_tools = web
     svc._read_log = None
     svc._memory_reads = {}
     svc._blobs = None
@@ -333,6 +355,48 @@ class TestSendMessageWiring(unittest.IsolatedAsyncioTestCase):
         names = [t["function"]["name"] for t in svc._context_svc.kw["tools"]]
         self.assertEqual(names, ["search_files", "read_file"])
 
+    async def test_fetch_tool_listed_when_enabled(self) -> None:
+        from app.core.web_tool_service import WebToolService
+
+        svc = self.make(FakeLLM([[text("hi", done=True)]]))
+        svc._web_tools = WebToolService(fetcher=object())   # 只要装配了就会下发
+        with ConfigScope(file_access_enabled=False, file_access_roots=[],
+                         web_fetch_enabled=True):
+            await self.run_send(svc)
+
+        names = [t["function"]["name"] for t in svc._context_svc.kw["tools"]]
+        self.assertEqual(names, ["fetch_url"])
+
+    async def test_fetch_tool_absent_when_disabled(self) -> None:
+        from app.core.web_tool_service import WebToolService
+
+        svc = self.make(FakeLLM([[text("hi", done=True)]]))
+        svc._web_tools = WebToolService(fetcher=object())
+        with ConfigScope(file_access_enabled=False, file_access_roots=[],
+                         web_fetch_enabled=False):
+            await self.run_send(svc)
+
+        self.assertEqual(svc._context_svc.kw["tools"], [])
+
+    async def test_file_and_web_tools_coexist(self) -> None:
+        from app.core.web_tool_service import WebToolService
+
+        root = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "logs", "_test_tool_wiring_web",
+        )
+        os.makedirs(root, exist_ok=True)
+        self.addCleanup(shutil.rmtree, root, True)
+
+        svc = self.make(FakeLLM([[text("hi", done=True)]]))
+        svc._web_tools = WebToolService(fetcher=object())
+        with ConfigScope(file_access_enabled=True, file_access_roots=[root],
+                         web_fetch_enabled=True):
+            await self.run_send(svc)
+
+        names = [t["function"]["name"] for t in svc._context_svc.kw["tools"]]
+        self.assertEqual(names, ["search_files", "read_file", "fetch_url"])
+
     async def test_breadcrumb_prepended_to_user_message(self) -> None:
         svc = self.make(FakeLLM([[text("hi", done=True)]]))
         svc._memory_reads["conv-1"] = [
@@ -360,6 +424,70 @@ class TestSendMessageWiring(unittest.IsolatedAsyncioTestCase):
         text_out = svc._breadcrumb_for("conv-1")
         # 最多 6 条
         self.assertEqual(text_out.count("f"), 6)
+
+
+class TestWebToolRound(unittest.IsolatedAsyncioTestCase):
+    """联网抓取走 async 工具服务：按名字路由，不能被交给同步文件工具。"""
+
+    async def test_fetch_url_routed_to_web_tools(self) -> None:
+        llm = FakeLLM([
+            [tool_call("call_a", "fetch_url", {"url": "https://example.com/a"})],
+            [text("读完了", done=True)],
+        ])
+        files = FakeTools()
+        web = FakeWebTools()
+        svc = make_service(llm, files, web=web)
+        buf = _TurnBuffer()
+
+        await drain(svc, ctx([{"type": "function"}]), buf)
+
+        self.assertEqual([c[0] for c in web.executed], ["fetch_url"])
+        self.assertEqual(files.executed, [], "联网工具不该落到文件工具上")
+        self.assertEqual(web.begin_count, 1)
+
+        tool_msg = [m for m in llm.calls[1] if m.get("role") == "tool"][0]
+        self.assertIn("网页正文", tool_msg["content"])
+        self.assertEqual(len(buf.tool_events), 1)
+        self.assertEqual(buf.tool_events[0]["name"], "fetch_url")
+
+    async def test_file_tool_still_goes_to_file_tools(self) -> None:
+        llm = FakeLLM([
+            [tool_call("call_a", "search_files", {"query": "预算"})],
+            [text("好", done=True)],
+        ])
+        files = FakeTools()
+        web = FakeWebTools()
+        svc = make_service(llm, files, web=web)
+
+        await drain(svc, ctx([{"type": "function"}]), _TurnBuffer())
+
+        self.assertEqual([c[0] for c in files.executed], ["search_files"])
+        self.assertEqual(web.executed, [])
+
+    async def test_both_services_begin_turn(self) -> None:
+        llm = FakeLLM([[text("hi", done=True)]])
+        files = FakeTools()
+        web = FakeWebTools()
+        svc = make_service(llm, files, web=web)
+
+        await drain(svc, ctx([{"type": "function"}]), _TurnBuffer())
+
+        self.assertEqual(files.begin_count, 1)
+        self.assertEqual(web.begin_count, 1)
+
+    async def test_fetch_status_line_hides_full_url(self) -> None:
+        llm = FakeLLM([
+            [tool_call("call_a", "fetch_url", {"url": "https://secret.example/dir/page"})],
+            [text("好了", done=True)],
+        ])
+        svc = make_service(llm, FakeTools(), web=FakeWebTools())
+
+        chunks = await drain(svc, ctx([{"type": "function"}]), _TurnBuffer())
+        status = [c for c in chunks if c.chunk_type == ChunkType.TOOL_CALL][0]
+
+        self.assertIn("抓取", status.delta)
+        self.assertIn("secret.example", status.delta)
+        self.assertNotIn("dir/page", status.delta, "状态行只报域名")
 
 
 class TestToolStatusChunks(unittest.IsolatedAsyncioTestCase):

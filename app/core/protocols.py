@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import AsyncGenerator, Protocol, runtime_checkable
 
 from app.storage.models import (
+    FetchResult,
     Message,
     MessageChunk,
     LLMContext,
@@ -82,7 +83,7 @@ class LLMClientProtocol(Protocol):
 class SearchAdapterProtocol(Protocol):
     """
     搜索后端抽象。
-    实现者：app/adapters/search_adapters/arxiv.py 等
+    实现者：app/adapters/search_adapters/deepseek_search.py、arxiv.py
     """
 
     async def search(
@@ -98,7 +99,24 @@ class SearchAdapterProtocol(Protocol):
             max_results: 最多返回条目数
 
         Returns:
-            SearchResults
+            SearchResults —— 失败时 results 为空且 error 写明原因，不抛异常
+        """
+        ...
+
+
+@runtime_checkable
+class WebFetchProtocol(Protocol):
+    """
+    网页抓取后端抽象（模型工具 fetch_url 的落地实现）。
+    实现者：app/adapters/search_adapters/deepseek_search.py: DeepSeekFetchAdapter
+    """
+
+    async def fetch(self, url: str) -> FetchResult:
+        """
+        抓取单个网页，返回标题与 Markdown 正文。
+
+        Returns:
+            FetchResult —— 失败时 content 为空且 error 写明原因，不抛异常
         """
         ...
 

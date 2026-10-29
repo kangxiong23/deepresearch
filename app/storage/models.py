@@ -168,7 +168,14 @@ class SearchResult:
     title: str
     url: str
     snippet: str
-    source: str = ""              # "arxiv" | "web" 等
+    source: str = ""              # 适配器标识："deepseek" | "arxiv"
+    # 富字段（只有 DeepSeek 搜索接口会填，其他适配器留空）：
+    # summary 是"给模型读"的长摘要（600~1800 字），信息量远大于 snippet；
+    # content 是网页正文，只在显式要求正文时才有值（当前不请求，省上下文）。
+    summary: str = ""
+    content: str = ""
+    published: str = ""           # 发布时间，UTC RFC 3339；未知为空
+    site: str = ""                # 站点名称；未知为空
 
 
 @dataclass
@@ -177,6 +184,18 @@ class SearchResults:
     query: str
     results: list[SearchResult] = field(default_factory=list)
     total: int = 0
+    # 适配器侧的失败原因（成功时为空串）。Core 据此区分"没搜到"与"没搜成"：
+    # 前者结果是空的，后者要让模型知道本轮根本没拿到实时资料。
+    error: str = ""
+
+
+@dataclass
+class FetchResult:
+    """单次网页抓取结果（DeepSeek Fetch 接口）。"""
+    url: str = ""
+    title: str = ""
+    content: str = ""             # Markdown 正文
+    error: str = ""
 
 
 # ──────────────────────────────────────────────

@@ -1,7 +1,7 @@
 # Layer: Adapter
 # File: app/adapters/search_adapters/base.py
 # Responsibility: 定义搜索适配器的抽象基类（ABC）。
-#                 所有具体搜索适配器（DuckDuckGo、Arxiv 等）继承此类，
+#                 所有具体搜索适配器（DeepSeek、Arxiv 等）继承此类，
 #                 保证接口统一，便于 SearchService 多源聚合。
 # Input:  query: str, max_results: int
 # Output: SearchResults

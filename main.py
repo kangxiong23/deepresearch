@@ -27,7 +27,11 @@ from app.storage.blob_store import FileBlobStore
 # ── 适配器 ────────────────────────────────────
 from app.adapters.deepseek_client import DeepSeekClient
 from app.adapters.file_parsers import default_parsers, unsupported_hints
-from app.adapters.search_adapters import DuckDuckGoSearchAdapter, ArxivSearchAdapter
+from app.adapters.search_adapters import (
+    ArxivSearchAdapter,
+    DeepSeekFetchAdapter,
+    DeepSeekSearchAdapter,
+)
 
 # ── Core 服务 ─────────────────────────────────
 from app.core.conversation_service import ConversationService
@@ -35,6 +39,7 @@ from app.core.context_service import ContextService
 from app.core.search_service import SearchService
 from app.core.file_service import FileService
 from app.core.file_tool_service import FileToolService
+from app.core.web_tool_service import WebToolService
 from app.core.knowledge_service import KnowledgeService
 from app.core.branch_service import BranchService
 
@@ -101,10 +106,14 @@ def assemble_app() -> ChatApp:
     # ── 3. Adapter 层 ─────────────────────────
     llm_client      = DeepSeekClient()
     file_parsers    = default_parsers()
+    # 联网检索：DeepSeek 官方 Search 接口为主，Arxiv 只在网页结果不够时补位
+    # （SearchService 凑够条数就停，所以正常情况下 Arxiv 不会被请求）。
     search_adapters = [
-        DuckDuckGoSearchAdapter(),   # 通用网页搜索（无需 API Key）
-        ArxivSearchAdapter(),         # 学术论文搜索（无需 API Key）
+        DeepSeekSearchAdapter(),
+        ArxivSearchAdapter(),
     ]
+    # 网页抓取（模型工具 fetch_url）：用户贴链接时让模型自己打开那一页
+    fetch_adapter = DeepSeekFetchAdapter()
 
     # ── 4. Core 服务层 ────────────────────────
     # file_service 与 blob_store 在下面构造，先组装再回填到 ContextService
@@ -125,8 +134,10 @@ def assemble_app() -> ChatApp:
     )
     context_service.set_file_service(file_service)
     # 本地文件只读访问（工具调用）。默认关闭：config.file_access_enabled=False
-    # 与空授权目录共同保证"未启用时请求体里不出现 tools"。
+    # 与空授权目录共同保证"未授权时不下发文件工具"。
     file_tool_service = FileToolService()
+    # 联网工具：与文件工具分开装配——可用条件不同（一个看授权目录，一个看开关）
+    web_tool_service = WebToolService(fetcher=fetch_adapter)
     branch_service = BranchService(
         tree_store=tree_store,
         branch_store=branch_store,
@@ -143,6 +154,7 @@ def assemble_app() -> ChatApp:
         file_tools=file_tool_service,
         read_log=read_log,
         blob_store=blob_store,
+        web_tools=web_tool_service,
     )
 
     # ── 4b. 知识图谱服务 ──────────────────────

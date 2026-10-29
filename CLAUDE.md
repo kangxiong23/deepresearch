@@ -76,7 +76,7 @@ Dependencies flow one way: `Storage → Adapters → Core → Controllers → UI
 
 ### Key architectural decisions
 
-**Config is a global mutable module (`config.py`).** Every layer imports `config` directly. Static values (API key, DB path) are loaded from `.env` at import time. Mutable values (`model_type`, `thinking_enabled`, `reasoning_effort`, `search_enabled`) are written by the UI and read by Core/Adapters — no dependency injection for config. 用户在「设置 → 应用配置」里改的值存进 `data/app_settings.json`（`app/utils/app_settings.py`），`main.py` 在构建 UI 之前写回 config，所以重启仍在。**These four mutable vars are the single sync point between frontend and backend**: the UI writes them (InputArea/ModelSelector → `SettingsController`) and Core/Adapters read them fresh on each call. In particular, `DeepSeekClient._build_payload` honors `thinking_enabled` for **both** `deepseek-v4-pro` and `deepseek-v4-flash` (treated equally): when enabled it sends `thinking: {type: enabled}` plus `reasoning_effort` (`config.reasoning_effort`, one of `low|high|max`); when disabled it sends `thinking: {type: disabled}` and **must not** include `reasoning_effort` (the API rejects it). `SearchService` gates on `search_enabled`.
+**Config is a global mutable module (`config.py`).** Every layer imports `config` directly. Static values (API key, DB path) are loaded from `.env` at import time. Mutable values (`model_type`, `thinking_enabled`, `reasoning_effort`, `search_enabled`) are written by the UI and read by Core/Adapters — no dependency injection for config. 用户在「设置 → 应用配置」里改的值存进 `data/app_settings.json`（`app/utils/app_settings.py`），`main.py` 在构建 UI 之前写回 config，所以重启仍在。**These four mutable vars are the single sync point between frontend and backend**: the UI writes them (InputArea/ModelSelector → `SettingsController`) and Core/Adapters read them fresh on each call. In particular, `DeepSeekClient._build_payload` honors `thinking_enabled` for **both** `deepseek-v4-pro` and `deepseek-v4-flash` (treated equally): when enabled it sends `thinking: {type: enabled}` plus `reasoning_effort` (`config.reasoning_effort`, one of `low|high|max`); when disabled it sends `thinking: {type: disabled}` and **must not** include `reasoning_effort` (the API rejects it). `SearchService` gates on `search_enabled`，网页抓取工具 gates on `web_fetch_enabled`（两者都能在「设置 → 应用配置」里改）。
 
 **Protocol-based dependency inversion (`app/core/protocols.py`).** Core services depend on `typing.Protocol` classes (`LLMClientProtocol`, `SearchAdapterProtocol`, `FileParserProtocol`, `MessageRepoProtocol`, `ContextStoreProtocol`, `TreeStoreProtocol`), not concrete implementations. Adapters and Storage implement these protocols. This means you can swap the LLM backend or search provider by writing a new adapter — no Core changes needed.
 
@@ -94,7 +94,14 @@ Dependencies flow one way: `Storage → Adapters → Core → Controllers → UI
 
 **Knowledge graph.** After each assistant reply, the UI can trigger `KnowledgeService` to extract entities and relations from recent messages via LLM call. On subsequent messages, matching KG entries are injected into the system prompt (`config.kg_injection_enabled` controls this).
 
-**Search backends.** Two adapters with no API keys needed: `DuckDuckGoSearchAdapter` (tries Bing first, falls back to DuckDuckGo Lite) and `ArxivSearchAdapter` (academic papers via Arxiv Atom Feed API).
+**搜索与抓取（联网）。** 两个能力都走 DeepSeek 官方接口（同一个 base、同一套 Bearer 鉴权，见 `app/adapters/search_adapters/deepseek_search.py`）：
+
+- **Search**（`POST /v1/tools/search`）= 联网搜索功能本身，`DeepSeekSearchAdapter` 实现。它取代了早年抓 Bing / DuckDuckGo 页面的做法——那种解析一遇到改版就静默返回空列表，界面上看不出任何异常。结构化结果里 `summary` 是"给模型读"的长摘要（600~1800 字），比 100~200 字的 snippet 有用得多，注入上下文的就是它（没有 summary 才退回 snippet）。
+- **`need_content` 固定为 false**：单条正文一万字上下，5 条就能把上下文撑到三万 token。要读全文时由模型调 `fetch_url` 单独抓那一页。
+- **`fetch_url` 工具**（`POST /v1/tools/fetch`）= 模型自己打开网页读 Markdown 正文（`WebToolService` + `DeepSeekFetchAdapter`）。用户贴链接、或模型想读某个结果页全文时用得上。受 `config.web_fetch_enabled` 控制，关掉即连工具定义都不下发。
+- **别名要求**：`ArxivSearchAdapter` 作为学术来源仍注册在后面，但 `SearchService` 凑够 `search_max_results` 就停，所以正常情况根本不会请求它（只在网页结果不够时补位）。
+- **失败必须可见**：接口 401/402/429/5xx 时适配器**不抛异常**，把原因写进 `SearchResults.error`，`SearchService` 往注入文本里放一句"联网搜索未成功：…，不要编造引用"。静默返回空串的后果是：用户开着联网搜索却拿到纯记忆回答，界面上毫无痕迹，模型也以为自己拿到了资料。重试只对 408/429/5xx 做（文档明确可重试），其它 4xx 重发只会再失败一次。
+- **两个踩过的坑**：① `site_name` 偶尔返回 UTF-8 字节的**十六进制串**（`e5a4aee5b9bfe7bd91` = 央广网，`58696e687561` = Xinhua），适配器按"全十六进制 + 偶数长度 + 能解成无控制字符的 UTF-8"还原；② `ConfigScope` 盖不住 `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL`（它们是模块全局，属性查找不走 `__getattr__`），测适配器要靠 `_DeepSeekWebApi(api_key=..., base_url=...)` 注入。
 
 **UI layout (PySide6).** Three-column layout in `MainWindow`:
 - **Sidebar (260px)** — header + action buttons + `TreePanel` (QTreeView-based conversation tree) + 底部「⚙️ 设置」入口；点开后整块换成设置页（回收站 / 本地文件 / 上下文管理 / 知识图谱 / 主题风格 / 应用配置）
@@ -353,9 +360,11 @@ UI 在发送前弹一次确认，`expand()` 也会在标注里写"当前模型�
 | `app/storage/blob_store.py` | 节点挂载的内容寻址快照仓库（`data/files/<sha256>`） |
 | `app/storage/read_log_store.py` | `file_reads` 表读写（工具读取记录） |
 | `app/core/file_tool_service.py` | 本地文件只读工具（search_files / read_file） |
+| `app/core/web_tool_service.py` | 联网工具（fetch_url）：参数校验、单轮预算、结果 JSON |
+| `app/adapters/search_adapters/deepseek_search.py` | DeepSeek 官方 Search / Fetch 接口（含重试与编码修复） |
 | `app/ui/widgets/file_access_dialog.py` | 本地文件夹权限统一管理面板（全局 + 文件夹节点 + 对话节点） |
 | `app/ui/widgets/attachment_dialog.py` | 节点附件管理面板（列出/添加/移除/旧式转快照，继承项只读） |
-| `app/core/search_service.py` | Search adapter orchestration |
+| `app/core/search_service.py` | 搜索编排：多适配器补齐、注入文本格式化、失败可见 |
 | `app/storage/tree_store.py` | Tree JSON persistence + recycle bin (`tree.json`, `recycle_bin.json`) |
 | `app/storage/message_repo.py` | SQLite message persistence (`messages` table) |
 | `app/storage/database.py` | SQLite DDL + migration from old `conversations` table |
@@ -363,7 +372,7 @@ UI 在发送前弹一次确认，`expand()` 也会在标注里写"当前模型�
 | `app/storage/kg_store.py` | Knowledge graph SQLite persistence |
 | `app/storage/models.py` | Domain data classes shared across all layers |
 | `app/adapters/deepseek_client.py` | DeepSeek API HTTP client with SSE streaming |
-| `app/adapters/search_adapters/` | Web search (DuckDuckGo) + Arxiv adapters |
+| `app/adapters/search_adapters/` | DeepSeek 官方 Search / Fetch + Arxiv 适配器 |
 | `app/adapters/file_parsers.py` | File parsers (txt, md, json, docx, pdf)；docx 保序 / 保留修订与内容控件 / 失败可见；`unsupported_hints()` |
 | `app/controllers/app_controller.py` | Main controller — maps UI events → Core calls → ViewModels |
 | `app/controllers/view_models.py` | ViewModel dataclasses (`TreeNodeVM`, `MessageVM`, `StreamChunkVM`, etc.) |

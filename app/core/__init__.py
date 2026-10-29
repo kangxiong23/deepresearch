@@ -6,9 +6,11 @@ from app.core.conversation_service import ConversationService, ConversationNotFo
 from app.core.context_service import ContextService
 from app.core.search_service import SearchService
 from app.core.file_service import FileService
+from app.core.web_tool_service import WebToolService
 from app.core.protocols import (
     LLMClientProtocol,
     SearchAdapterProtocol,
+    WebFetchProtocol,
     FileParserProtocol,
     MessageRepoProtocol,
     ContextStoreProtocol,
@@ -21,8 +23,10 @@ __all__ = [
     "ContextService",
     "SearchService",
     "FileService",
+    "WebToolService",
     "LLMClientProtocol",
     "SearchAdapterProtocol",
+    "WebFetchProtocol",
     "FileParserProtocol",
     "MessageRepoProtocol",
     "ContextStoreProtocol",

@@ -3,11 +3,11 @@
 
 from app.adapters.deepseek_client import DeepSeekClient, LLMAPIError
 from app.adapters.file_parsers import default_parsers
-from app.adapters.search_adapters import DuckDuckGoSearchAdapter
+from app.adapters.search_adapters import DeepSeekSearchAdapter
 
 __all__ = [
     "DeepSeekClient",
     "LLMAPIError",
     "default_parsers",
-    "DuckDuckGoSearchAdapter",
+    "DeepSeekSearchAdapter",
 ]

@@ -48,7 +48,9 @@ _GROUPS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
     )),
     ("搜索", (
         ("search_enabled", "联网搜索", "输入框下方也能切；这里改完会同步过去"),
-        ("search_max_results", "每次结果条数", "注入上下文的最大搜索结果数"),
+        ("search_max_results", "每次结果条数", "注入上下文的最大搜索结果数（接口上限 50）"),
+        ("web_fetch_enabled", "网页抓取工具",
+         "允许模型自己打开网页读正文（用户贴链接时用得上，按次计费）"),
     )),
     ("知识图谱", (
         ("kg_injection_enabled", "自动注入相关知识", "发消息时按当前问题查图谱并注入"),

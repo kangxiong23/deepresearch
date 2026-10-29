@@ -17,6 +17,7 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from typing import AsyncGenerator
+from urllib.parse import urlsplit
 
 import config as app_config
 from app.core.branch_service import BranchService
@@ -111,6 +112,10 @@ def _describe_tool_call(call: dict) -> str:
     if name == "read_file":
         path = str(args.get("path") or "")
         return f"📄 读取 {os.path.basename(path)}" if path else "📄 读取文件"
+    if name == "fetch_url":
+        url = str(args.get("url") or "")
+        host = urlsplit(url).netloc or url
+        return f"🌐 抓取 {host}" if host else "🌐 抓取网页"
     return f"🔧 {name or '工具调用'}"
 
 
@@ -156,6 +161,7 @@ class ConversationService:
         file_tools=None,
         read_log=None,
         blob_store=None,
+        web_tools=None,
     ) -> None:
         self._msg_repo = message_repo
         self._tree = tree_store
@@ -164,6 +170,10 @@ class ConversationService:
         self._search_svc = search_service
         self._file_svc = file_service
         self._file_tools = file_tools      # FileToolService | None（未装配则无工具能力）
+        # 联网工具（WebToolService | None）：目前只有 fetch_url。与文件工具分开
+        # 装配是刻意的——两者的可用条件不同（一个看授权目录，一个看开关），
+        # 混在一个服务里就会出现"没授权目录就连网页也不让读"。
+        self._web_tools = web_tools
         # 工具读取记录（D3）：落 SQLite，重启后仍在。未装配时退化为内存列表，
         # 保证只装配部分依赖的测试仍能跑。
         self._read_log = read_log
@@ -1629,20 +1639,28 @@ class ConversationService:
 
     def _tool_schemas(self, session_id: str) -> list[dict]:
         """
-        按当前对话的授权范围决定下不下发文件工具。
+        汇总本轮要下发的工具：文件工具（看授权范围）+ 联网抓取（看开关）。
 
-        范围在这里算、在这里交给 FileToolService —— 工具服务本身不读全局配置，
-        否则同一进程里两个对话会互相串权限。
+        文件授权范围在这里算、在这里交给 FileToolService —— 工具服务本身不读
+        全局配置，否则同一进程里两个对话会互相串权限。
+        两者都为空时请求体里没有 tools，模型无从得知这些能力存在。
         """
-        if self._file_tools is None:
-            return []
-        try:
-            roots = self.effective_file_roots(session_id)
-        except Exception as exc:      # 树异常不能把整轮对话打死
-            print(f"[CORE] 解析授权范围失败，本轮按无授权处理: {exc}")
-            roots = []
-        self._file_tools.set_scope(roots)
-        return self._file_tools.schemas()
+        schemas: list[dict] = []
+
+        if self._file_tools is not None:
+            try:
+                roots = self.effective_file_roots(session_id)
+            except Exception as exc:      # 树异常不能把整轮对话打死
+                print(f"[CORE] 解析授权范围失败，本轮按无授权处理: {exc}")
+                roots = []
+            self._file_tools.set_scope(roots)
+            schemas.extend(self._file_tools.schemas())
+
+        web_tools = getattr(self, "_web_tools", None)
+        if web_tools is not None:
+            schemas.extend(web_tools.schemas())
+
+        return schemas
 
     def reload_file_access(self) -> None:
         """
@@ -1947,8 +1965,12 @@ class ConversationService:
         is_done 时数据已经落库（既有行为，不能颠倒）。
         """
         tools_enabled = bool(getattr(llm_context, "tools", None))
-        if self._file_tools is not None and tools_enabled:
-            self._file_tools.begin_turn()
+        if tools_enabled:
+            if self._file_tools is not None:
+                self._file_tools.begin_turn()
+            web_tools = getattr(self, "_web_tools", None)
+            if web_tools is not None:
+                web_tools.begin_turn()
 
         rounds = 0
         nudge_sent = False
@@ -2027,7 +2049,7 @@ class ConversationService:
             self._append_tool_round(
                 llm_context, pending_calls, round_content, round_thinking
             )
-            self._execute_tools(llm_context, pending_calls, buf)
+            await self._execute_tools(llm_context, pending_calls, buf)
             continue
 
     def _append_tool_round(
@@ -2061,23 +2083,42 @@ class ConversationService:
         }
         llm_context.messages.append(message)
 
-    def _execute_tools(
+    async def _execute_tools(
         self,
         llm_context: LLMContext,
         calls: list[dict],
         buf: _TurnBuffer,
     ) -> None:
-        """逐个执行工具调用，把结果作为 role="tool" 追加（永不抛异常）。"""
+        """
+        逐个执行工具调用，把结果作为 role="tool" 追加（永不抛异常）。
+
+        是 async 的：联网抓取要走 HTTP，而文件工具是本地同步 I/O（内含索引缓存，
+        本来就快）。按名字路由到各自的服务，不把两种能力塞进一个类。
+        """
         for call in calls:
             fn = call.get("function") or {}
             name = fn.get("name") or ""
             args = fn.get("arguments") or ""
 
-            if self._file_tools is None:
-                result = json.dumps({"error": "工具层未装配"}, ensure_ascii=False)
-            else:
-                result = self._file_tools.execute(
-                    name, args, should_stop=self._stop_event.is_set
+            web_tools = getattr(self, "_web_tools", None)
+            try:
+                if web_tools is not None and web_tools.supports(name):
+                    result = await web_tools.execute(
+                        name, args, should_stop=self._stop_event.is_set
+                    )
+                elif self._file_tools is not None:
+                    result = self._file_tools.execute(
+                        name, args, should_stop=self._stop_event.is_set
+                    )
+                elif web_tools is not None:
+                    # 装配了联网工具却没匹配上：是模型编了个不存在的工具名
+                    result = json.dumps({"error": f"未知工具：{name}"}, ensure_ascii=False)
+                else:
+                    result = json.dumps({"error": "工具层未装配"}, ensure_ascii=False)
+            except Exception as exc:      # 工具层违约抛异常也不能打断对话
+                result = json.dumps(
+                    {"error": f"工具执行失败：{type(exc).__name__}: {exc}"},
+                    ensure_ascii=False,
                 )
 
             llm_context.messages.append({
